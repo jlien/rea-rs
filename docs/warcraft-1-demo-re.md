@@ -51,20 +51,40 @@ data), and `push ebp; mov ebp, esp` prologues.
 Structure recovered by value archaeology (arrays appear exactly once each;
 human/orc mirror units share values and sound callbacks):
 
-- A u32 array of code addresses (`0x10000 + off`, e.g. `0xe0c8 → 0x1e0c8`,
-  which disassembles to real function starts) — per-unit sound/voice
-  handlers, mirrored units share the same pointer.
+- A u32 array of code addresses (`0x10000 + off`, e.g. `0xe0c8 → 0x1e0c8`) —
+  per-unit sound/voice handlers, mirrored units share the same pointer.
 - u16 HP array (mirror-paired): 60/60 Footman-Grunt, 40/40 Peasant-Peon,
   120/120 Catapult, 90/90 Knight-Raider, … matching WC1 published stats.
 - u16 damage and gold-cost arrays: 300/250 … 400/400, 800/800, 700/700,
   900/900, 2500/2500, 5000/5000 (the 5000 pair is the demo's endpoint boss
   unit), plus build-time arrays.
 
+**Access-path caveat (2026-10 re-scan):** scanning all 742 validated function
+bodies for immediates or displacements landing in `0x3e000–0x42000` finds
+**zero** data references into `0x40000+` (the only hits are branch targets
+inside the last code functions, which end near `0x3f0b0`). Raw u32 searches
+across the whole file likewise find no pointer to `0x40d00–0x40f90`. The
+table is therefore reached either via a computed base+index from a pointer
+stored elsewhere, or it is unreferenced demo cut-content. The array layout
+above remains a value-archaeology inference, not a decoded accessor.
+
 ## 4. Command records (`0x51df0`, 14-byte stride)
 
 `{u16 cmd_class, u16 index, u16 param, u32 callback (=0x17488), u16 pad}` —
 the build/train menu entries, human/orc pairs `(1,1) (4,6) (5,5)`, each
 pointing at the same dispatcher with an index into a string/behavior table.
+
+**Callback 0x17488 decoded (2026-10):** it is a three-instruction no-op
+thunk — `pop edx; pop ecx; ret` — i.e. "discard the two stacked arguments
+and return". Command records that need no per-item action share it.
+
+**Related 28-byte-stride records (obj1, ~`0x51b0c`):** dense record array
+whose u16 view reads `{u16 type=7, u16 idA, u16 0, u16 0x7488, u16 1,
+u16 0, u16 0, u16 type=7, u16 idB, u16 0x7488, u16 1, u16 0, u16 0}`.
+The `0x17488` constant (and `0x7488` = its low half) recurs in every record;
+`idA`/`idB` differ per record (0x3698/0x3724, 0x3990/0x3a1c, …). These look
+like resource-reference pairs (id, id+0x10000 pattern in the u32 view) —
+layout not fully pinned; listed for the next pass.
 
 ## 5. DATA.WAR archive format
 
@@ -101,14 +121,37 @@ decoded to PNG successfully (`/tmp/warblocks/orc_resource_bar.png`).
   prologue scan), 32-bit data xrefs, string xref annotation.
 - `rea xrefs`, `rea funcs`, `rea strings --xrefs` CLI commands.
 - Hex address parsing (`0x…`) for `xrefs` and `disasm`.
+- **LE fixup engine** (`rea-core::le`): parses the fixup page table
+  (LE header +`0x68`, header-relative) and record table (LE +`0x6C`);
+  record = `[src_flags u8][trg_flags u8][src_off u16|list][ordinal][target
+  off][addend]`. Source types 5/7 (16/32-bit offset) targeting internal
+  objects are resolved and patched into a copy of the image at load time
+  (constants cross-checked against rizin `le_specs.h`). Verified
+  empirically on WAR.EXE: 8,457 fixups; the first record
+  `07 00 eb 09 02 58 1b` writes obj2-base+0x1b58 at page1+0x9eb, and the
+  patched bytes read back exactly that. `examples/le_fixup_stats.rs`
+  prints the stats for any LE file.
+- **Control-flow function bodies**: discovery now walks real control flow
+  (visited-set BFS over disassembled instructions) instead of linear runs,
+  so functions no longer bleed past forward jumps, jump tables, or padding.
+  WAR.EXE: 742 functions / 2,386 call edges (was 932 over-long runs).
 
-## 7. Known gaps
+## 7. Icon/number strip blocks (218, 222, 223)
 
-- LE fixup records are not applied (identity page map makes this mostly
-  moot for this binary).
-- Function bodies are linear runs to `ret`/`jmp`; overlapping/chunked
-  functions will merge.
+All three are 0x20-flagged (LZ77) 2,884-byte blocks. 222 and 223 share an
+identical ~29-byte directory (rows of `f0 <u8>` pairs stepping by 0x12 —
+a 0x12-byte row-stride table, 10 entries ≈ digit glyphs) and diverge in tile
+data (2,815 of 2,884 bytes differ) — same UI number set, two variants
+(human/orc). Not yet decoded to pixels; the directory/stride observation is
+the entry point for a decoder.
+
+## 8. Known gaps
+
 - Stat-table field boundaries (where HP ends and damage starts) are
   inferred from value archaeology, not from a decoded accessor function —
-  the next step would be decompiling the reader at the call site that
-  indexes the table with a unit ID.
+  and see the access-path caveat in §3: no referencing code was found.
+- The 28-byte-stride obj1 records (§4) are described but not decoded.
+- Icon strip blocks 218/222/223 (§7) not decoded to pixels.
+- Entry-point `e32_eip` handling: DOS/4GW writes it absolute but below the
+  start-object base; rea-rs treats it as object-relative. Works for this
+  binary; other LEs may differ.
