@@ -103,37 +103,73 @@ fn prologue_starts(target: &Target, sec: &crate::Section) -> Vec<u64> {
     out
 }
 
-/// Disassemble one linear run from `start`, returning (length, call targets).
-fn linear_run(target: &Target, start: u64, max: u64) -> (u64, Vec<u64>) {
-    let Ok(insns) = disasm::disassemble(target, start, 4096) else {
-        return (0, Vec::new());
-    };
-    let mut calls = Vec::new();
+/// Follow control flow from `start`, returning (body extent, call targets).
+/// Unlike a plain linear run this handles forward `jmp`s (chunks), stops at
+/// `ret`, indirect jumps (jump tables), and invalid bytes — so functions no
+/// longer bleed into padding or the next function.
+fn function_body(target: &Target, start: u64, max: u64) -> (u64, Vec<u64>) {
+    let mut visited: BTreeSet<u64> = BTreeSet::new();
+    let mut calls: Vec<u64> = Vec::new();
+    let mut work = vec![start];
     let mut end = start;
-    for ins in insns {
-        if ins.addr - start >= max {
-            break;
+    while let Some(addr) = work.pop() {
+        if addr < start || addr >= start + max || !visited.insert(addr) {
+            continue;
         }
-        end = ins.addr + ins.size as u64;
-        if ins.mnemonic == "call" {
-            if let Some(t) = ins.operands.strip_prefix("0x") {
-                if let Ok(t) = u64::from_str_radix(t, 16) {
-                    calls.push(t);
+        let Ok(insns) = disasm::disassemble(target, addr, 64) else {
+            continue;
+        };
+        if insns.is_empty() {
+            continue;
+        }
+        let mut jumped = false;
+        for ins in &insns {
+            visited.insert(ins.addr);
+            end = end.max(ins.addr + ins.size as u64);
+            match ins.mnemonic.as_str() {
+                "call" => {
+                    if let Some(t) = direct_target(&ins.operands) {
+                        calls.push(t);
+                    }
+                }
+                "ret" | "retf" => {
+                    jumped = false;
+                    break;
+                }
+                "jmp" => {
+                    jumped = false;
+                    if let Some(t) = direct_target(&ins.operands) {
+                        if t > ins.addr && t < start + max {
+                            // forward jump inside the body: continue there
+                            work.push(t);
+                            jumped = true;
+                        }
+                    }
+                    break; // indirect/backward/outside: body ends here
+                }
+                m if m.starts_with("invalid") => break,
+                _ => {}
+            }
+        }
+        if !jumped {
+            // chunk ran out without a terminator: keep going linearly
+            if let Some(last) = insns.last() {
+                let next = last.addr + last.size as u64;
+                if next < start + max {
+                    work.push(next);
                 }
             }
         }
-        if ins.mnemonic == "ret" || ins.mnemonic == "retf" {
-            break;
-        }
-        if ins.mnemonic == "jmp" && ins.operands.starts_with("0x") {
-            break; // tail call / jump table: stop the linear run here
-        }
-        if ins.mnemonic.starts_with("invalid") {
-            break;
-        }
     }
-    let size = end.saturating_sub(start);
-    (size.min(max), calls)
+    calls.sort_unstable();
+    calls.dedup();
+    (end.saturating_sub(start).min(max), calls)
+}
+
+fn direct_target(operands: &str) -> Option<u64> {
+    operands
+        .strip_prefix("0x")
+        .and_then(|t| u64::from_str_radix(t, 16).ok())
 }
 
 /// Discover functions: entry point + prologue scan, expanded through direct
@@ -156,7 +192,7 @@ pub fn discover_functions(target: &Target) -> Vec<Function> {
         if funcs.contains_key(&addr) {
             continue;
         }
-        let (size, calls) = linear_run(target, addr, 0x20000);
+        let (size, calls) = function_body(target, addr, 0x20000);
         if size == 0 {
             continue;
         }
