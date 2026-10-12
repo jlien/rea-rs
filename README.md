@@ -5,7 +5,8 @@ Reverse engineer anything — from the terminal, or through your agent.
 A clean-room Rust implementation of the MCP reverse-engineering toolkit
 concept (inspired by [morluto/rea](https://github.com/morluto/rea)): one
 tool surface for inspecting native binaries across **Mach-O** (including
-fat/universal binaries), **ELF**, and **PE** formats. All analysis runs
+fat/universal binaries), **ELF**, **PE**, and **LE** (Watcom/DOS/4GW)
+formats. All analysis runs
 locally; nothing leaves your machine.
 
 ## Install
@@ -80,7 +81,7 @@ Or in an MCP client config:
 - **Fat binaries are first-class**: universal Mach-O files are resolved to
   the host-architecture slice before analysis.
 - **Uniform surface**: every format loads into the same `Target` struct, so
-  tools behave identically across Mach-O, ELF, and PE.
+  tools behave identically across Mach-O, ELF, PE, and LE.
 - **vaddr → file offset mapping** is built in (`Target::vaddr_to_offset`),
   so disassembly works on virtual addresses, not raw file offsets.
 - The MCP server is implemented directly against the JSON-RPC 2.0 +

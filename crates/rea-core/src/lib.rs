@@ -2,6 +2,7 @@
 //! across Mach-O (incl. fat), ELF, and PE.
 
 pub mod disasm;
+pub mod le;
 pub mod loader;
 pub mod strings;
 
@@ -11,6 +12,8 @@ pub enum Format {
     MachO,
     Elf,
     Pe,
+    /// Watcom/DOS/4GW linear executable.
+    Le,
 }
 
 impl Format {
@@ -19,6 +22,7 @@ impl Format {
             Format::MachO => "mach-o",
             Format::Elf => "elf",
             Format::Pe => "pe",
+            Format::Le => "le",
         }
     }
 }
@@ -88,11 +92,18 @@ pub struct Target {
     pub symbols: Vec<Symbol>,
     /// Raw file bytes (arch slice for fat Mach-O).
     pub bytes: Vec<u8>,
+    /// Page-granular translation table (LE format). When present it takes
+    /// precedence over the linear section mapping.
+    pub page_map: Option<le::LePages>,
 }
 
 impl Target {
-    /// Map a virtual address to a file offset via sections.
+    /// Map a virtual address to a file offset. LE images translate through
+    /// their object/page tables; everything else maps linearly via sections.
     pub fn vaddr_to_offset(&self, vaddr: u64) -> Option<u64> {
+        if let Some(pm) = &self.page_map {
+            return pm.translate(vaddr);
+        }
         self.sections.iter().find_map(|s| {
             (vaddr >= s.addr && vaddr < s.addr + s.size)
                 .then(|| s.file_offset + (vaddr - s.addr))

@@ -1,5 +1,6 @@
 //! Loaders producing a uniform [`Target`] for each supported format.
 
+use crate::le::{self, LeImage};
 use crate::{Arch, Error, Format, Result, Section, Symbol, SymbolKind, Target};
 use std::path::Path;
 
@@ -9,6 +10,11 @@ pub fn load(path: impl AsRef<Path>) -> Result<Target> {
     let path = path.as_ref();
     let bytes = std::fs::read(path).map_err(Error::Io)?;
     let path_str = path.display().to_string();
+
+    // LE images must be checked before goblin: it mispeeks them as PE.
+    if le::is_le(&bytes) {
+        return load_le(bytes, path_str);
+    }
 
     match {
         let mut cursor = std::io::Cursor::new(&*bytes);
@@ -21,6 +27,26 @@ pub fn load(path: impl AsRef<Path>) -> Result<Target> {
             "format hint {other:?} is not supported"
         ))),
     }
+}
+
+fn load_le(bytes: Vec<u8>, path: String) -> Result<Target> {
+    let img = LeImage::parse(&bytes)?;
+    let entry = img.entry;
+    let arch = img.arch();
+    let sections = img.sections();
+    let page_map = img.pages;
+    Ok(Target {
+        path,
+        format: Format::Le,
+        arch,
+        bits: 32,
+        little_endian: true,
+        entry,
+        sections,
+        symbols: Vec::new(),
+        bytes,
+        page_map: Some(page_map),
+    })
 }
 
 fn load_macho(bytes: Vec<u8>, path: String) -> Result<Target> {
@@ -117,6 +143,7 @@ fn macho_target(mo: goblin::mach::MachO, bytes: Vec<u8>, path: String) -> Result
         sections,
         symbols,
         bytes,
+        page_map: None,
     })
 }
 
@@ -183,6 +210,7 @@ fn load_elf(bytes: Vec<u8>, path: String) -> Result<Target> {
         sections,
         symbols,
         bytes,
+        page_map: None,
     })
 }
 
@@ -237,5 +265,6 @@ fn load_pe(bytes: Vec<u8>, path: String) -> Result<Target> {
         sections,
         symbols,
         bytes,
+        page_map: None,
     })
 }
