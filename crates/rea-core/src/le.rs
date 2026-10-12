@@ -109,6 +109,19 @@ impl LePages {
     }
 }
 
+/// Fixup (relocation) records. Format cross-checked against rizin's
+/// `librz/bin/format/le` parser and empirically against WAR.EXE:
+/// record = `[src_flags u8][trg_flags u8][src_off i16][ordinal][target……]`,
+/// where source type 7 = 32-bit offset, target type 0 = internal.
+const F_SOURCE_TYPE_MASK: u8 = 0xF;
+const F_SOURCE_LIST: u8 = 0x20;
+const F_TARGET_TYPE_MASK: u8 = 0x3;
+const F_TARGET_OFF32: u8 = 0x10;
+const F_TARGET_ADDITIVE: u8 = 0x4;
+const F_TARGET_ADD32: u8 = 0x20;
+const F_TARGET_CHAIN: u8 = 0x8;
+const F_TARGET_ORD16: u8 = 0x40;
+
 /// Parsed LE image.
 #[derive(Debug, Clone)]
 pub struct LeImage {
@@ -118,6 +131,12 @@ pub struct LeImage {
     /// object-relative per the OS/2 convention).
     pub entry: u64,
     cpu: u16,
+    /// Header-relative offset of the fixup page table (0 = none).
+    fpagetab: u32,
+    /// Header-relative offset of the fixup record table.
+    frectab: u32,
+    /// Number of pages (bounds the fixup page table).
+    mpages: u32,
 }
 
 /// Quick detection: MZ stub with `e_lfanew` pointing at an "LE" magic.
@@ -150,6 +169,8 @@ impl LeImage {
         let objtab = h(0x40)? as usize;
         let objcnt = h(0x44)?;
         let objmap = h(0x48)? as usize;
+        let fpagetab = h(0x68)?;
+        let frectab = h(0x6c)?;
         let datapage = h(0x80)?;
 
         if pagesize == 0 || startobj == 0 || startobj > objcnt {
@@ -194,7 +215,190 @@ impl LeImage {
             },
             entry,
             cpu,
+            fpagetab,
+            frectab,
+            mpages,
         })
+    }
+
+    /// Apply internal fixups (relocations) to a mutable copy of the file
+    /// bytes. For each 32-bit/16-bit-offset fixup targeting an internal
+    /// object, the target linear address is written at the source location.
+    /// Returns the number of fixups applied; chains, selectors, external
+    /// imports and entry-point targets are counted but skipped.
+    pub fn apply_fixups(&self, bytes: &mut Vec<u8>) -> Result<usize> {
+        if self.fpagetab == 0 || self.frectab == 0 {
+            return Ok(0);
+        }
+        let pagesize = self.pages.pagesize as u64;
+        // Map page number -> starting vaddr (first page whose entry matches).
+        let mut page_vaddr: Vec<u64> = vec![0; self.mpages as usize + 1];
+        {
+            let mut start_idx = 0usize;
+            for o in &self.pages.objects {
+                for idx in 0..o.mapsize as usize {
+                    let page_no = self.pages.pages[start_idx + idx] as usize;
+                    if page_no >= 1 && page_no <= self.mpages as usize && page_vaddr[page_no] == 0
+                    {
+                        page_vaddr[page_no] = u64::from(o.base) + idx as u64 * pagesize;
+                    }
+                }
+                start_idx += o.mapsize as usize;
+            }
+        }
+
+        let mut applied = 0usize;
+        let mut skipped = 0usize;
+        let read_u16 = |bytes: &[u8], off: usize| -> Option<u16> {
+            let b = bytes.get(off..off + 2)?;
+            Some(u16::from_le_bytes([b[0], b[1]]))
+        };
+        let read_u32 = |bytes: &[u8], off: usize| -> Option<u32> {
+            let b = bytes.get(off..off + 4)?;
+            Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        };
+
+        for page_i in 0..self.mpages as usize {
+            let start = self.pages.header_off
+                + self.fpagetab as usize
+                + page_i * 4; // fixup page table uses u32 entries (DOS/4GW)
+            let Some(&beg) = u32_at(bytes, start).ok().as_ref() else {
+                continue;
+            };
+            let Some(&end) = u32_at(bytes, start + 4).ok().as_ref() else {
+                continue;
+            };
+            let (beg, end) = (beg as usize, end as usize);
+            if end <= beg {
+                continue;
+            }
+            let page_base = page_vaddr[page_i + 1]; // page numbers are 1-based
+            let mut off = self.pages.header_off + self.frectab as usize + beg;
+            let off_end = self.pages.header_off + self.frectab as usize + end;
+            while off < off_end {
+                let Some(&src_flags) = bytes.get(off) else {
+                    break;
+                };
+                let Some(&trg_flags) = bytes.get(off + 1) else {
+                    break;
+                };
+                off += 2;
+                // Source list vs single source offset.
+                let mut src_offs: Vec<i32> = Vec::new();
+                if src_flags & F_SOURCE_LIST != 0 {
+                    let Some(&count) = bytes.get(off) else {
+                        break;
+                    };
+                    off += 1;
+                    for _ in 0..count {
+                        let Some(v) = read_u16(bytes, off) else {
+                            break;
+                        };
+                        off += 2;
+                        src_offs.push(v as i32);
+                    }
+                } else {
+                    let Some(v) = read_u16(bytes, off) else {
+                        break;
+                    };
+                    off += 2;
+                    src_offs.push(v as i16 as i32);
+                }
+                // Target ordinal (object number for internal fixups).
+                let ordinal: u32 = if trg_flags & F_TARGET_ORD16 != 0 {
+                    let Some(v) = read_u16(bytes, off) else {
+                        break;
+                    };
+                    off += 2;
+                    u32::from(v)
+                } else {
+                    let Some(&v) = bytes.get(off) else {
+                        break;
+                    };
+                    off += 1;
+                    u32::from(v)
+                };
+                // Only internal targets can be resolved statically.
+                let trg_type = trg_flags & F_TARGET_TYPE_MASK;
+                let mut target: Option<u64> = None;
+                if trg_type == 0 {
+                    let obj_idx = ordinal.checked_sub(1).and_then(|i| {
+                        self.pages.objects.get(i as usize).map(|o| u64::from(o.base))
+                    });
+                    if let Some(base) = obj_idx {
+                        let tgt_off = if trg_flags & F_TARGET_OFF32 != 0 {
+                            read_u32(bytes, off).map(u64::from)
+                        } else {
+                            read_u16(bytes, off).map(u64::from)
+                        };
+                        if let Some(t) = tgt_off {
+                            off += if trg_flags & F_TARGET_OFF32 != 0 {
+                                4
+                            } else {
+                                2
+                            };
+                            target = Some(base + t);
+                        }
+                    } else {
+                        skipped += 1;
+                        continue;
+                    }
+                    if trg_flags & F_TARGET_ADDITIVE != 0 {
+                        let addend = if trg_flags & F_TARGET_ADD32 != 0 {
+                            read_u32(bytes, off).map(u64::from)
+                        } else {
+                            read_u16(bytes, off).map(u64::from)
+                        };
+                        if let Some(a) = addend {
+                            off += if trg_flags & F_TARGET_ADD32 != 0 {
+                                4
+                            } else {
+                                2
+                            };
+                            target = Some(target.unwrap_or(0) + a);
+                        }
+                    }
+                } else {
+                    skipped += 1;
+                    continue;
+                }
+                if trg_flags & F_TARGET_CHAIN != 0 {
+                    skipped += 1; // chain fixups need page-data walking; rare
+                    continue;
+                }
+                let Some(target) = target else {
+                    continue;
+                };
+                let src_type = src_flags & F_SOURCE_TYPE_MASK;
+                if src_type != 7 && src_type != 5 {
+                    skipped += 1; // selectors / relative fixups: not applicable
+                    continue;
+                }
+                for src_off in &src_offs {
+                    if *src_off < 0 || *src_off as u64 >= pagesize {
+                        continue;
+                    }
+                    let src_vaddr = page_base + *src_off as u64;
+                    let Some(file_off) = self.pages.translate(src_vaddr) else {
+                        continue;
+                    };
+                    let file_off = file_off as usize;
+                    if src_type == 7 {
+                        let Some(src) = bytes.get_mut(file_off..file_off + 4) else {
+                            continue;
+                        };
+                        src.copy_from_slice(&(target as u32).to_le_bytes());
+                    } else {
+                        let Some(src) = bytes.get_mut(file_off..file_off + 2) else {
+                            continue;
+                        };
+                        src.copy_from_slice(&(target as u16).to_le_bytes());
+                    }
+                    applied += 1;
+                }
+            }
+        }
+        Ok(applied)
     }
 
     pub fn arch(&self) -> Arch {
