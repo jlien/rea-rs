@@ -1,0 +1,18 @@
+[package]
+name = "rea-cli"
+description = "rea: reverse-engineer anything — CLI over the rea-rs analysis core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "rea"
+path = "src/main.rs"
+
+[dependencies]
+rea-core = { path = "../rea-core" }
+rea-mcp = { path = "../rea-mcp" }
+clap = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }

@@ -1,0 +1,18 @@
+[package]
+name = "rea-core"
+description = "Core binary-analysis types and loaders for rea"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+goblin = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+capstone = { workspace = true, optional = true }
+
+[features]
+default = ["disasm"]
+disasm = ["dep:capstone"]

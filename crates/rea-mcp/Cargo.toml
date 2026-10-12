@@ -1,0 +1,16 @@
+[package]
+name = "rea-mcp"
+description = "MCP stdio server exposing rea's binary-analysis tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rea-core = { path = "../rea-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[features]
+default = ["disasm"]
+disasm = ["rea-core/disasm"]
