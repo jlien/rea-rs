@@ -43,7 +43,7 @@ pub fn disassemble(target: &Target, vaddr: u64, count: usize) -> Result<Vec<Inst
         .collect())
 }
 
-fn build_capstone(arch: Arch) -> Result<capstone::Capstone> {
+pub(crate) fn build_capstone(arch: Arch) -> Result<capstone::Capstone> {
     use capstone::arch::*;
     use capstone::prelude::*;
 

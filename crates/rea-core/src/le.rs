@@ -81,6 +81,32 @@ impl LePages {
                 + off % pagesize,
         )
     }
+    /// Reverse translation: file offset (inside the data-page area) back to
+    /// a virtual address. Needed for string/constant cross-referencing.
+    pub fn offset_to_vaddr(&self, file_off: u64) -> Option<u64> {
+        let area = self.header_off as u64 + u64::from(self.datapage);
+        if file_off < area {
+            return None;
+        }
+        let in_area = file_off - area;
+        let pagesize = u64::from(self.pagesize);
+        let page_idx = (in_area / pagesize) as usize;
+        let page_no = *self.pages.get(page_idx)? as u64;
+        if page_no == 0 {
+            return None;
+        }
+        let mut start_idx = 0usize;
+        for o in &self.objects {
+            let idx = page_idx.checked_sub(start_idx)?;
+            if (idx as u64) < u64::from(o.mapsize) {
+                return Some(
+                    u64::from(o.base) + idx as u64 * pagesize + in_area % pagesize,
+                );
+            }
+            start_idx += o.mapsize as usize;
+        }
+        None
+    }
 }
 
 /// Parsed LE image.

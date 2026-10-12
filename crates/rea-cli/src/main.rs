@@ -5,7 +5,7 @@
 
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
-use rea_core::{disasm, loader, strings};
+use rea_core::{analysis, disasm, loader, strings};
 use std::io::BufReader;
 
 #[derive(Parser)]
@@ -40,20 +40,31 @@ enum Command {
         #[arg(value_enum, default_value_t = SymKind::All)]
         kind: SymKind,
     },
-    /// Extract printable strings.
+    /// Extract printable strings, optionally with code cross-references.
     Strings {
         path: String,
         #[arg(long, default_value_t = 4)]
         min_length: usize,
+        /// Annotate each string with code references (data xref scan).
+        #[arg(long)]
+        xrefs: bool,
     },
     /// Disassemble instructions at a virtual address (default: entry point).
     Disasm {
         path: String,
-        /// Virtual address, hex (0x…) or decimal.
+        /// Virtual address, hex (0x…) or decimal. Defaults to entry point.
         #[arg(long)]
-        address: Option<u64>,
+        address: Option<String>,
         #[arg(long, default_value_t = 32)]
         count: usize,
+    },
+    /// Discover functions (entry + prologue scan + call targets).
+    Funcs { path: String },
+    /// Find code locations referencing an address (data xrefs).
+    Xrefs {
+        path: String,
+        /// Address, hex (0x…) or decimal.
+        address: String,
     },
     /// Run the MCP stdio server (for agent integration).
     Mcp,
@@ -74,7 +85,9 @@ fn main() -> anyhow::Result<()> {
                 | Command::Sections { path }
                 | Command::Symbols { path, .. }
                 | Command::Strings { path, .. }
-                | Command::Disasm { path, .. } => (path, ()),
+                | Command::Disasm { path, .. }
+                | Command::Funcs { path }
+                | Command::Xrefs { path, .. } => (path, ()),
                 Command::Mcp => unreachable!(),
             };
             let target = loader::load(path).context("failed to load target")?;
@@ -104,15 +117,37 @@ fn main() -> anyhow::Result<()> {
                         .collect();
                     serde_json::json!({ "count": syms.len(), "symbols": syms })
                 }
-                Command::Strings { min_length, .. } => {
-                    let hits = strings::extract(&target.bytes, *min_length);
-                    serde_json::json!({ "count": hits.len(), "strings": hits })
+                Command::Strings { min_length, xrefs, .. } => {
+                    if *xrefs {
+                        let hits = analysis::strings_with_xrefs(&target, *min_length);
+                        serde_json::json!({ "count": hits.len(), "strings": hits })
+                    } else {
+                        let hits = strings::extract(&target.bytes, *min_length);
+                        serde_json::json!({ "count": hits.len(), "strings": hits })
+                    }
                 }
                 Command::Disasm { address, count, .. } => {
-                    let addr = address.unwrap_or(target.entry);
+                    let addr = match address.as_deref() {
+                        Some(a) if a.starts_with("0x") => u64::from_str_radix(&a[2..], 16)?,
+                        Some(a) => a.parse::<u64>()?,
+                        None => target.entry,
+                    };
                     let insns = disasm::disassemble(&target, addr, *count)
                         .context("disassembly failed")?;
                     serde_json::json!({ "address": addr, "count": insns.len(), "instructions": insns })
+                }
+                Command::Funcs { .. } => {
+                    let funcs = analysis::discover_functions(&target);
+                    serde_json::json!({ "count": funcs.len(), "functions": funcs })
+                }
+                Command::Xrefs { address, .. } => {
+                    let addr = if let Some(h) = address.strip_prefix("0x") {
+                        u64::from_str_radix(h, 16)?
+                    } else {
+                        address.parse::<u64>()?
+                    };
+                    let refs = analysis::data_xrefs(&target, addr);
+                    serde_json::json!({ "address": addr, "count": refs.len(), "refs": refs })
                 }
                 Command::Mcp => unreachable!(),
             };

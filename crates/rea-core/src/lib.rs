@@ -1,6 +1,7 @@
 //! rea-core: load a binary target and expose a uniform analysis surface
 //! across Mach-O (incl. fat), ELF, and PE.
 
+pub mod analysis;
 pub mod disasm;
 pub mod le;
 pub mod loader;
