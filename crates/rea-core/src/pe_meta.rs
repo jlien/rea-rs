@@ -44,8 +44,19 @@ pub struct ClrHeader {
     pub version: Option<String>,
     /// Stream headers fully inside the metadata blob and the file, in directory order. Empty when `version` is `None`.
     pub streams: Vec<ClrStream>,
-    /// Row counts from the `#~` stream, or `#-` when `#~` is absent. Empty when that stream is missing or shorter than its header. Rows and IL are not read.
+    /// Row counts from the `#~` stream, or `#-` when `#~` is absent. Empty when that stream is missing or shorter than its header.
     pub tables: Vec<ClrTable>,
+    /// Names from `Module`, `TypeRef`, and `TypeDef` only. Empty when the string heap or those rows are missing. Other table rows and IL are not read.
+    pub types: Vec<ClrType>,
+}
+
+/// A type or module name from the metadata tables.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ClrType {
+    /// `Module`, `TypeRef`, or `TypeDef`.
+    pub table: String,
+    pub namespace: String,
+    pub name: String,
 }
 
 /// One metadata table named in the `#~` / `#-` header, with its row count.
@@ -123,6 +134,7 @@ fn parse_clr(header: &[u8], file: &[u8], metadata_off: Option<usize>) -> Option<
     let metadata_size = u32::from_le_bytes([header[12], header[13], header[14], header[15]]);
     let (version, streams) = metadata_version(file, metadata_off, metadata_size);
     let tables = metadata_tables(file, metadata_off, &streams);
+    let types = metadata_type_names(file, metadata_off, &streams);
     Some(ClrHeader {
         major_runtime: u16::from_le_bytes([header[4], header[5]]),
         minor_runtime: u16::from_le_bytes([header[6], header[7]]),
@@ -133,6 +145,7 @@ fn parse_clr(header: &[u8], file: &[u8], metadata_off: Option<usize>) -> Option<
         version,
         streams,
         tables,
+        types,
     })
 }
 
@@ -366,6 +379,152 @@ fn table_name(index: u32) -> String {
         Some(name) => (*name).to_string(),
         None => format!("table-{index}"),
     }
+}
+
+/// `Module`, `TypeRef`, and `TypeDef` names. Later tables are not decoded.
+///
+/// String and coded-index widths follow the `#~` heap-size byte and the row counts. A row that does not fit ends the list. Names are UTF-8 from `#Strings`, cut at 512 bytes.
+fn metadata_type_names(
+    file: &[u8],
+    metadata_off: Option<usize>,
+    streams: &[ClrStream],
+) -> Vec<ClrType> {
+    let Some(root) = metadata_off else {
+        return Vec::new();
+    };
+    let Some(blob) = stream_bytes(file, root, streams, "#~")
+        .or_else(|| stream_bytes(file, root, streams, "#-"))
+    else {
+        return Vec::new();
+    };
+    let Some(strings) = stream_bytes(file, root, streams, "#Strings") else {
+        return Vec::new();
+    };
+    if blob.len() < 24 {
+        return Vec::new();
+    }
+    let valid = u64::from_le_bytes(blob[8..16].try_into().unwrap());
+    let count = valid.count_ones() as usize;
+    let Some(header_end) = count.checked_mul(4).and_then(|n| n.checked_add(24)) else {
+        return Vec::new();
+    };
+    if blob.len() < header_end {
+        return Vec::new();
+    }
+    let str_w = if blob[6] & 0x01 != 0 { 4 } else { 2 };
+    let guid_w = if blob[6] & 0x02 != 0 { 4 } else { 2 };
+    let module_rows = rows_at(blob, valid, 0);
+    let typeref_rows = rows_at(blob, valid, 1);
+    let typedef_rows = rows_at(blob, valid, 2);
+    let scope_w = coded_width(
+        module_rows
+            .max(rows_at(blob, valid, 26))
+            .max(rows_at(blob, valid, 35))
+            .max(typeref_rows),
+        2,
+    );
+    let extends_w = coded_width(typedef_rows.max(typeref_rows).max(rows_at(blob, valid, 27)), 2);
+    let field_w = index_width(rows_at(blob, valid, 4));
+    let method_w = index_width(rows_at(blob, valid, 6));
+    let module_size = 2 + str_w + guid_w * 3;
+    let typeref_size = scope_w + str_w * 2;
+    let typedef_size = 4 + str_w * 2 + extends_w + field_w + method_w;
+
+    let mut cursor = header_end;
+    let mut out = Vec::new();
+    for bit in 0..3u32 {
+        if valid & (1u64 << bit) == 0 {
+            continue;
+        }
+        let (rows, size, table) = match bit {
+            0 => (module_rows, module_size, "Module"),
+            1 => (typeref_rows, typeref_size, "TypeRef"),
+            _ => (typedef_rows, typedef_size, "TypeDef"),
+        };
+        for _ in 0..rows {
+            let Some(end) = cursor.checked_add(size) else {
+                return out;
+            };
+            if end > blob.len() {
+                return out;
+            }
+            let row = &blob[cursor..end];
+            let (namespace, name) = match bit {
+                0 => (String::new(), heap_string(strings, read_index(row, 2, str_w))),
+                1 => (
+                    heap_string(strings, read_index(row, scope_w + str_w, str_w)),
+                    heap_string(strings, read_index(row, scope_w, str_w)),
+                ),
+                _ => (
+                    heap_string(strings, read_index(row, 4 + str_w, str_w)),
+                    heap_string(strings, read_index(row, 4, str_w)),
+                ),
+            };
+            out.push(ClrType {
+                table: table.to_string(),
+                namespace,
+                name,
+            });
+            cursor = end;
+        }
+    }
+    out
+}
+
+fn stream_bytes<'a>(
+    file: &'a [u8],
+    root: usize,
+    streams: &[ClrStream],
+    name: &str,
+) -> Option<&'a [u8]> {
+    let stream = streams.iter().find(|stream| stream.name == name)?;
+    let start = root.checked_add(stream.offset as usize)?;
+    let end = start.checked_add(stream.size as usize)?;
+    if start >= file.len() {
+        return None;
+    }
+    file.get(start..end.min(file.len()))
+}
+
+fn rows_at(blob: &[u8], valid: u64, bit: u32) -> u32 {
+    if valid & (1u64 << bit) == 0 {
+        return 0;
+    }
+    let mut prior = 0usize;
+    for earlier in 0..bit {
+        if valid & (1u64 << earlier) != 0 {
+            prior += 1;
+        }
+    }
+    let at = 24 + prior * 4;
+    u32::from_le_bytes(blob[at..at + 4].try_into().unwrap())
+}
+
+fn index_width(rows: u32) -> usize {
+    if rows < 0x1_0000 { 2 } else { 4 }
+}
+
+fn coded_width(max_rows: u32, tag_bits: u32) -> usize {
+    let small_limit = 1u32 << (16 - tag_bits);
+    if max_rows < small_limit { 2 } else { 4 }
+}
+
+fn read_index(row: &[u8], at: usize, width: usize) -> u32 {
+    if width == 2 {
+        u32::from(u16::from_le_bytes([row[at], row[at + 1]]))
+    } else {
+        u32::from_le_bytes([row[at], row[at + 1], row[at + 2], row[at + 3]])
+    }
+}
+
+fn heap_string(strings: &[u8], index: u32) -> String {
+    let start = index as usize;
+    if start >= strings.len() {
+        return String::new();
+    }
+    let rest = &strings[start..];
+    let end = rest.iter().position(|byte| *byte == 0).unwrap_or(rest.len());
+    String::from_utf8_lossy(&rest[..end.min(512)]).into_owned()
 }
 
 pub fn facts(bytes: &[u8]) -> Result<PeFacts> {
@@ -670,6 +829,93 @@ mod tests {
             size: 32,
         }];
         assert!(metadata_tables(&tilde_header(1, &[1]), Some(0), &unnamed).is_empty());
+    }
+
+    fn with_strings(tilde: &[u8], strings: &[u8]) -> (Vec<u8>, Vec<ClrStream>) {
+        let mut file = tilde.to_vec();
+        let strings_at = file.len() as u32;
+        file.extend_from_slice(strings);
+        let streams = vec![
+            ClrStream {
+                name: "#~".into(),
+                offset: 0,
+                size: strings_at,
+            },
+            ClrStream {
+                name: "#Strings".into(),
+                offset: strings_at,
+                size: strings.len() as u32,
+            },
+        ];
+        (file, streams)
+    }
+
+    #[test]
+    fn clr_type_names_from_module_and_typedef() {
+        let mut tilde = tilde_header(1 | (1 << 2), &[1, 1]);
+        tilde.extend_from_slice(&0u16.to_le_bytes());
+        tilde.extend_from_slice(&1u16.to_le_bytes());
+        tilde.extend_from_slice(&[0u8; 6]);
+        tilde.extend_from_slice(&0u32.to_le_bytes());
+        tilde.extend_from_slice(&13u16.to_le_bytes());
+        tilde.extend_from_slice(&7u16.to_le_bytes());
+        tilde.extend_from_slice(&0u16.to_le_bytes());
+        tilde.extend_from_slice(&0u16.to_le_bytes());
+        tilde.extend_from_slice(&0u16.to_le_bytes());
+        let mut strings = vec![0u8];
+        strings.extend_from_slice(b"Hello\0World\0App\0");
+        let (file, streams) = with_strings(&tilde, &strings);
+        let types = metadata_type_names(&file, Some(0), &streams);
+        assert_eq!(
+            types,
+            vec![
+                ClrType {
+                    table: "Module".into(),
+                    namespace: "".into(),
+                    name: "Hello".into(),
+                },
+                ClrType {
+                    table: "TypeDef".into(),
+                    namespace: "World".into(),
+                    name: "App".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn clr_typedef_uses_a_wide_field_index() {
+        let mut tilde = tilde_header(1 | (1 << 2) | (1 << 4), &[1, 2, 70_000]);
+        tilde.extend_from_slice(&0u16.to_le_bytes());
+        tilde.extend_from_slice(&1u16.to_le_bytes());
+        tilde.extend_from_slice(&[0u8; 6]);
+        for (name, namespace) in [(5u16, 7u16), (10u16, 12u16)] {
+            tilde.extend_from_slice(&0u32.to_le_bytes());
+            tilde.extend_from_slice(&name.to_le_bytes());
+            tilde.extend_from_slice(&namespace.to_le_bytes());
+            tilde.extend_from_slice(&0u16.to_le_bytes());
+            tilde.extend_from_slice(&0u32.to_le_bytes());
+            tilde.extend_from_slice(&0u16.to_le_bytes());
+        }
+        let mut strings = vec![0u8];
+        strings.extend_from_slice(b"Mod\0A\0N1\0B\0N2\0");
+        let (file, streams) = with_strings(&tilde, &strings);
+        let types = metadata_type_names(&file, Some(0), &streams);
+        assert_eq!(types[1].name, "A");
+        assert_eq!(types[1].namespace, "N1");
+        assert_eq!(types[2].name, "B");
+        assert_eq!(types[2].namespace, "N2");
+    }
+
+    #[test]
+    fn clr_type_names_need_the_string_heap() {
+        let tilde = tilde_header(1, &[1]);
+        let streams = vec![ClrStream {
+            name: "#~".into(),
+            offset: 0,
+            size: tilde.len() as u32,
+        }];
+        assert!(metadata_type_names(&tilde, Some(0), &streams).is_empty());
     }
 
     fn cor20_header(
