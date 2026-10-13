@@ -96,7 +96,11 @@ fn handle_tool_call(msg: &Value) -> Result<Value, String> {
         let value = if name == "rea_wasm" {
             json!(rea_core::wasm::inspect(&bytes).map_err(|e| e.to_string())?)
         } else if name == "rea_sqlite" {
-            json!(rea_core::sqlite::header(&bytes).map_err(|e| e.to_string())?)
+            let header = rea_core::sqlite::header(&bytes).map_err(|e| e.to_string())?;
+            let schema = rea_core::sqlite::schema(&bytes).map_err(|e| e.to_string())?;
+            let mut value = serde_json::to_value(header).map_err(|e| e.to_string())?;
+            value["schema"] = json!(schema);
+            value
         } else {
             match rea_core::goinfo::find_build_info(&bytes).map_err(|e| e.to_string())? {
                 Some(info) => json!({
@@ -314,7 +318,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "rea_sqlite",
-            "description": "SQLite database header: page size, page count, text encoding, and schema format. Does not read pages.",
+            "description": "SQLite database header and sqlite_schema objects (type, name, table, root page, SQL). Does not read table rows or a WAL file.",
             "inputSchema": schema(true, json!({}), &[]),
         }),
         json!({

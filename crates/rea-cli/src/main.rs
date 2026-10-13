@@ -78,7 +78,7 @@ enum Command {
     Pe { path: String },
     /// ELF interpreter, needed libraries, soname, and GNU build-id.
     Elf { path: String },
-    /// SQLite database header. Does not read schema or pages.
+    /// SQLite database header and schema objects. Does not read table rows.
     Sqlite { path: String },
     /// Run the MCP stdio server (for agent integration).
     Mcp,
@@ -102,7 +102,10 @@ fn main() -> anyhow::Result<()> {
         Command::Sqlite { path } => {
             let bytes = std::fs::read(path).context("failed to read target")?;
             let header = rea_core::sqlite::header(&bytes).context("sqlite")?;
-            println!("{}", serde_json::to_string_pretty(&header).unwrap());
+            let schema = rea_core::sqlite::schema(&bytes).context("sqlite")?;
+            let mut value = serde_json::to_value(header)?;
+            value["schema"] = serde_json::json!(schema);
+            println!("{}", serde_json::to_string_pretty(&value).unwrap());
             Ok(())
         }
         Command::Goinfo { path } => {
