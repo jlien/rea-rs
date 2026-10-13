@@ -31,7 +31,7 @@ pub struct PePdb {
     pub age: u32,
 }
 
-/// Leading `IMAGE_COR20_HEADER` fields, the BSJB version string, metadata stream headers, and table row counts.
+/// Leading `IMAGE_COR20_HEADER` fields, the BSJB version string, metadata stream headers, table row counts, and type and method names.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ClrHeader {
     pub major_runtime: u16,
@@ -46,7 +46,7 @@ pub struct ClrHeader {
     pub streams: Vec<ClrStream>,
     /// Row counts from the `#~` stream, or `#-` when `#~` is absent. Empty when that stream is missing or shorter than its header.
     pub tables: Vec<ClrTable>,
-    /// Names from `Module`, `TypeRef`, and `TypeDef` only. Empty when the string heap or those rows are missing. Other table rows and IL are not read.
+    /// Names from `Module`, `TypeRef`, and `TypeDef`, with `MethodDef` names on each `TypeDef`. Empty when the string heap or those rows are missing. Other table rows and IL are not read.
     pub types: Vec<ClrType>,
 }
 
@@ -57,6 +57,8 @@ pub struct ClrType {
     pub table: String,
     pub namespace: String,
     pub name: String,
+    /// `MethodDef` names owned by a `TypeDef`, in table order. Empty for `Module` and `TypeRef`. Signatures and IL are not read.
+    pub methods: Vec<String>,
 }
 
 /// One metadata table named in the `#~` / `#-` header, with its row count.
@@ -381,9 +383,9 @@ fn table_name(index: u32) -> String {
     }
 }
 
-/// `Module`, `TypeRef`, and `TypeDef` names. Later tables are not decoded.
+/// `Module`, `TypeRef`, and `TypeDef` names, plus `MethodDef` names on each `TypeDef`.
 ///
-/// String and coded-index widths follow the `#~` heap-size byte and the row counts. A row that does not fit ends the list. Names are UTF-8 from `#Strings`, cut at 512 bytes.
+/// `FieldPtr`, `Field`, and `MethodPtr` are skipped by row size so `MethodDef` stays aligned. `MethodPtr` is not applied. String, blob, and coded-index widths follow the `#~` heap-size byte and the row counts. A row that does not fit ends the list and keeps the names already read. Signatures, RVAs, `Param` rows, and IL are not read.
 fn metadata_type_names(
     file: &[u8],
     metadata_off: Option<usize>,
@@ -413,9 +415,12 @@ fn metadata_type_names(
     }
     let str_w = if blob[6] & 0x01 != 0 { 4 } else { 2 };
     let guid_w = if blob[6] & 0x02 != 0 { 4 } else { 2 };
+    let blob_w = if blob[6] & 0x04 != 0 { 4 } else { 2 };
     let module_rows = rows_at(blob, valid, 0);
     let typeref_rows = rows_at(blob, valid, 1);
     let typedef_rows = rows_at(blob, valid, 2);
+    let field_rows = rows_at(blob, valid, 4);
+    let method_rows = rows_at(blob, valid, 6);
     let scope_w = coded_width(
         module_rows
             .max(rows_at(blob, valid, 26))
@@ -424,51 +429,112 @@ fn metadata_type_names(
         2,
     );
     let extends_w = coded_width(typedef_rows.max(typeref_rows).max(rows_at(blob, valid, 27)), 2);
-    let field_w = index_width(rows_at(blob, valid, 4));
-    let method_w = index_width(rows_at(blob, valid, 6));
+    let field_w = index_width(field_rows);
+    let method_w = index_width(method_rows);
+    let param_w = index_width(rows_at(blob, valid, 8));
     let module_size = 2 + str_w + guid_w * 3;
     let typeref_size = scope_w + str_w * 2;
     let typedef_size = 4 + str_w * 2 + extends_w + field_w + method_w;
+    let method_list_at = 4 + str_w * 2 + extends_w + field_w;
+    let field_size = 2 + str_w + blob_w;
+    let method_size = 8 + str_w + blob_w + param_w;
 
     let mut cursor = header_end;
     let mut out = Vec::new();
-    for bit in 0..3u32 {
+    // Index into `out` and the 1-based MethodList for each TypeDef, in table order.
+    let mut typedefs: Vec<(usize, u32)> = Vec::new();
+    for bit in 0..7u32 {
         if valid & (1u64 << bit) == 0 {
             continue;
         }
-        let (rows, size, table) = match bit {
-            0 => (module_rows, module_size, "Module"),
-            1 => (typeref_rows, typeref_size, "TypeRef"),
-            _ => (typedef_rows, typedef_size, "TypeDef"),
-        };
-        for _ in 0..rows {
-            let Some(end) = cursor.checked_add(size) else {
-                return out;
-            };
-            if end > blob.len() {
-                return out;
+        match bit {
+            0 | 1 | 2 => {
+                let (rows, size, table) = match bit {
+                    0 => (module_rows, module_size, "Module"),
+                    1 => (typeref_rows, typeref_size, "TypeRef"),
+                    _ => (typedef_rows, typedef_size, "TypeDef"),
+                };
+                for _ in 0..rows {
+                    let Some(end) = cursor.checked_add(size) else {
+                        return out;
+                    };
+                    if end > blob.len() {
+                        return out;
+                    }
+                    let row = &blob[cursor..end];
+                    let (namespace, name) = match bit {
+                        0 => (String::new(), heap_string(strings, read_index(row, 2, str_w))),
+                        1 => (
+                            heap_string(strings, read_index(row, scope_w + str_w, str_w)),
+                            heap_string(strings, read_index(row, scope_w, str_w)),
+                        ),
+                        _ => (
+                            heap_string(strings, read_index(row, 4 + str_w, str_w)),
+                            heap_string(strings, read_index(row, 4, str_w)),
+                        ),
+                    };
+                    if bit == 2 {
+                        typedefs.push((out.len(), read_index(row, method_list_at, method_w)));
+                    }
+                    out.push(ClrType {
+                        table: table.to_string(),
+                        namespace,
+                        name,
+                        methods: Vec::new(),
+                    });
+                    cursor = end;
+                }
             }
-            let row = &blob[cursor..end];
-            let (namespace, name) = match bit {
-                0 => (String::new(), heap_string(strings, read_index(row, 2, str_w))),
-                1 => (
-                    heap_string(strings, read_index(row, scope_w + str_w, str_w)),
-                    heap_string(strings, read_index(row, scope_w, str_w)),
-                ),
-                _ => (
-                    heap_string(strings, read_index(row, 4 + str_w, str_w)),
-                    heap_string(strings, read_index(row, 4, str_w)),
-                ),
-            };
-            out.push(ClrType {
-                table: table.to_string(),
-                namespace,
-                name,
-            });
-            cursor = end;
+            3 | 4 | 5 => {
+                let (rows, size) = match bit {
+                    3 => (rows_at(blob, valid, 3), field_w),
+                    4 => (field_rows, field_size),
+                    _ => (rows_at(blob, valid, 5), method_w),
+                };
+                let Some(total) = usize::try_from(rows).ok().and_then(|n| n.checked_mul(size))
+                else {
+                    return out;
+                };
+                let Some(end) = cursor.checked_add(total) else {
+                    return out;
+                };
+                if end > blob.len() {
+                    return out;
+                }
+                cursor = end;
+            }
+            _ => {
+                let mut names = Vec::new();
+                for _ in 0..method_rows {
+                    let Some(end) = cursor.checked_add(method_size) else {
+                        attach_method_names(&mut out, &typedefs, &names);
+                        return out;
+                    };
+                    if end > blob.len() {
+                        attach_method_names(&mut out, &typedefs, &names);
+                        return out;
+                    }
+                    let row = &blob[cursor..end];
+                    names.push(heap_string(strings, read_index(row, 8, str_w)));
+                    cursor = end;
+                }
+                attach_method_names(&mut out, &typedefs, &names);
+            }
         }
     }
     out
+}
+
+/// `MethodList` is 1-based. Each TypeDef owns names up to the next list, or the end of `MethodDef`.
+fn attach_method_names(out: &mut [ClrType], typedefs: &[(usize, u32)], names: &[String]) {
+    for (i, &(at, list)) in typedefs.iter().enumerate() {
+        let start = (list.saturating_sub(1) as usize).min(names.len());
+        let end = match typedefs.get(i + 1) {
+            Some(&(_, next)) => (next.saturating_sub(1) as usize).max(start).min(names.len()),
+            None => names.len(),
+        };
+        out[at].methods = names[start..end].to_vec();
+    }
 }
 
 fn stream_bytes<'a>(
@@ -873,11 +939,13 @@ mod tests {
                     table: "Module".into(),
                     namespace: "".into(),
                     name: "Hello".into(),
+                    methods: vec![],
                 },
                 ClrType {
                     table: "TypeDef".into(),
                     namespace: "World".into(),
                     name: "App".into(),
+                    methods: vec![],
                 },
             ]
         );
@@ -905,6 +973,43 @@ mod tests {
         assert_eq!(types[1].namespace, "N1");
         assert_eq!(types[2].name, "B");
         assert_eq!(types[2].namespace, "N2");
+        assert!(types[1].methods.is_empty());
+    }
+
+    #[test]
+    fn clr_typedef_methods_skip_the_field_row() {
+        // TypeDef, Field, MethodDef. The field row sits between the types and the methods.
+        let mut tilde = tilde_header((1 << 2) | (1 << 4) | (1 << 6), &[2, 1, 3]);
+        for (name, namespace, methods) in [(1u16, 5u16, 1u16), (17u16, 0u16, 3u16)] {
+            tilde.extend_from_slice(&0u32.to_le_bytes());
+            tilde.extend_from_slice(&name.to_le_bytes());
+            tilde.extend_from_slice(&namespace.to_le_bytes());
+            tilde.extend_from_slice(&0u16.to_le_bytes());
+            tilde.extend_from_slice(&1u16.to_le_bytes());
+            tilde.extend_from_slice(&methods.to_le_bytes());
+        }
+        tilde.extend_from_slice(&0u16.to_le_bytes());
+        tilde.extend_from_slice(&28u16.to_le_bytes());
+        tilde.extend_from_slice(&0u16.to_le_bytes());
+        for name in [8u16, 12u16, 23u16] {
+            tilde.extend_from_slice(&0u32.to_le_bytes());
+            tilde.extend_from_slice(&0u16.to_le_bytes());
+            tilde.extend_from_slice(&0u16.to_le_bytes());
+            tilde.extend_from_slice(&name.to_le_bytes());
+            tilde.extend_from_slice(&0u16.to_le_bytes());
+            tilde.extend_from_slice(&1u16.to_le_bytes());
+        }
+        let mut strings = vec![0u8];
+        strings.extend_from_slice(b"App\0Ns\0Run\0Stop\0Other\0Done\0Fld\0");
+        let (file, streams) = with_strings(&tilde, &strings);
+        let types = metadata_type_names(&file, Some(0), &streams);
+        assert_eq!(types[0].table, "TypeDef");
+        assert_eq!(types[0].namespace, "Ns");
+        assert_eq!(types[0].name, "App");
+        assert_eq!(types[0].methods, vec!["Run".to_string(), "Stop".to_string()]);
+        assert_eq!(types[1].name, "Other");
+        assert_eq!(types[1].namespace, "");
+        assert_eq!(types[1].methods, vec!["Done".to_string()]);
     }
 
     #[test]
