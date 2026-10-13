@@ -31,7 +31,7 @@ pub struct PePdb {
     pub age: u32,
 }
 
-/// Leading `IMAGE_COR20_HEADER` fields, the BSJB version string, and metadata stream headers.
+/// Leading `IMAGE_COR20_HEADER` fields, the BSJB version string, metadata stream headers, and table row counts.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ClrHeader {
     pub major_runtime: u16,
@@ -44,6 +44,15 @@ pub struct ClrHeader {
     pub version: Option<String>,
     /// Stream headers fully inside the metadata blob and the file, in directory order. Empty when `version` is `None`.
     pub streams: Vec<ClrStream>,
+    /// Row counts from the `#~` stream, or `#-` when `#~` is absent. Empty when that stream is missing or shorter than its header. Rows and IL are not read.
+    pub tables: Vec<ClrTable>,
+}
+
+/// One metadata table named in the `#~` / `#-` header, with its row count.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ClrTable {
+    pub name: String,
+    pub rows: u32,
 }
 
 /// One metadata stream header. `offset` is relative to the start of the metadata root.
@@ -113,6 +122,7 @@ fn parse_clr(header: &[u8], file: &[u8], metadata_off: Option<usize>) -> Option<
     }
     let metadata_size = u32::from_le_bytes([header[12], header[13], header[14], header[15]]);
     let (version, streams) = metadata_version(file, metadata_off, metadata_size);
+    let tables = metadata_tables(file, metadata_off, &streams);
     Some(ClrHeader {
         major_runtime: u16::from_le_bytes([header[4], header[5]]),
         minor_runtime: u16::from_le_bytes([header[6], header[7]]),
@@ -122,6 +132,7 @@ fn parse_clr(header: &[u8], file: &[u8], metadata_off: Option<usize>) -> Option<
         entry_point: u32::from_le_bytes([header[20], header[21], header[22], header[23]]),
         version,
         streams,
+        tables,
     })
 }
 
@@ -252,6 +263,109 @@ fn metadata_streams(
         });
     }
     streams
+}
+
+/// Row counts from the compressed `#~` stream, or the uncompressed `#-` stream.
+///
+/// The 24-byte header is reserved, version bytes, heap sizes, a reserved byte, then the valid and sorted bitmasks. One little-endian `u32` follows for each set bit, lowest bit first. A short stream yields no tables.
+fn metadata_tables(file: &[u8], metadata_off: Option<usize>, streams: &[ClrStream]) -> Vec<ClrTable> {
+    let Some(root) = metadata_off else {
+        return Vec::new();
+    };
+    let Some(stream) = streams
+        .iter()
+        .find(|stream| stream.name == "#~")
+        .or_else(|| streams.iter().find(|stream| stream.name == "#-"))
+    else {
+        return Vec::new();
+    };
+    let Some(start) = root.checked_add(stream.offset as usize) else {
+        return Vec::new();
+    };
+    let Some(end) = start.checked_add(stream.size as usize) else {
+        return Vec::new();
+    };
+    let Some(blob) = file.get(start..end) else {
+        return Vec::new();
+    };
+    if blob.len() < 24 {
+        return Vec::new();
+    }
+    let valid = u64::from_le_bytes(blob[8..16].try_into().unwrap());
+    let count = valid.count_ones() as usize;
+    let Some(need) = count.checked_mul(4).and_then(|rows| rows.checked_add(24)) else {
+        return Vec::new();
+    };
+    if blob.len() < need {
+        return Vec::new();
+    }
+    let mut tables = Vec::with_capacity(count);
+    for bit in 0..64u32 {
+        if valid & (1u64 << bit) == 0 {
+            continue;
+        }
+        let at = 24 + tables.len() * 4;
+        let rows = u32::from_le_bytes(blob[at..at + 4].try_into().unwrap());
+        tables.push(ClrTable {
+            name: table_name(bit),
+            rows,
+        });
+    }
+    tables
+}
+
+fn table_name(index: u32) -> String {
+    const NAMES: [&str; 45] = [
+        "Module",
+        "TypeRef",
+        "TypeDef",
+        "FieldPtr",
+        "Field",
+        "MethodPtr",
+        "MethodDef",
+        "ParamPtr",
+        "Param",
+        "InterfaceImpl",
+        "MemberRef",
+        "Constant",
+        "CustomAttribute",
+        "FieldMarshal",
+        "DeclSecurity",
+        "ClassLayout",
+        "FieldLayout",
+        "StandAloneSig",
+        "EventMap",
+        "EventPtr",
+        "Event",
+        "PropertyMap",
+        "PropertyPtr",
+        "Property",
+        "MethodSemantics",
+        "MethodImpl",
+        "ModuleRef",
+        "TypeSpec",
+        "ImplMap",
+        "FieldRVA",
+        "EncLog",
+        "EncMap",
+        "Assembly",
+        "AssemblyProcessor",
+        "AssemblyOS",
+        "AssemblyRef",
+        "AssemblyRefProcessor",
+        "AssemblyRefOS",
+        "File",
+        "ExportedType",
+        "ManifestResource",
+        "NestedClass",
+        "GenericParam",
+        "MethodSpec",
+        "GenericParamConstraint",
+    ];
+    match NAMES.get(index as usize) {
+        Some(name) => (*name).to_string(),
+        None => format!("table-{index}"),
+    }
 }
 
 pub fn facts(bytes: &[u8]) -> Result<PeFacts> {
@@ -488,6 +602,74 @@ mod tests {
         push_debug_entry(&mut bytes, DEBUG_CODEVIEW, 24, 1000);
         assert!(codeview_pdb(&bytes, 0, DEBUG_ENTRY as u32).is_none());
         assert!(codeview_pdb(&bytes, 0, 10).is_none());
+    }
+
+    fn tilde_header(valid: u64, rows: &[u32]) -> Vec<u8> {
+        let mut blob = vec![0u8; 24];
+        blob[4] = 2;
+        blob[7] = 1;
+        blob[8..16].copy_from_slice(&valid.to_le_bytes());
+        for row in rows {
+            blob.extend_from_slice(&row.to_le_bytes());
+        }
+        blob
+    }
+
+    #[test]
+    fn clr_table_counts_follow_valid_bits() {
+        let blob = tilde_header(1 | (1 << 2) | (1 << 6), &[1, 4, 9]);
+        let streams = vec![ClrStream {
+            name: "#~".into(),
+            offset: 0,
+            size: blob.len() as u32,
+        }];
+        let tables = metadata_tables(&blob, Some(0), &streams);
+        assert_eq!(
+            tables,
+            vec![
+                ClrTable {
+                    name: "Module".into(),
+                    rows: 1
+                },
+                ClrTable {
+                    name: "TypeDef".into(),
+                    rows: 4
+                },
+                ClrTable {
+                    name: "MethodDef".into(),
+                    rows: 9
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn clr_uncompressed_stream_is_used_when_tilde_is_absent() {
+        let blob = tilde_header(1u64 << 32, &[2]);
+        let streams = vec![ClrStream {
+            name: "#-".into(),
+            offset: 0,
+            size: blob.len() as u32,
+        }];
+        let tables = metadata_tables(&blob, Some(0), &streams);
+        assert_eq!(tables[0].name, "Assembly");
+        assert_eq!(tables[0].rows, 2);
+    }
+
+    #[test]
+    fn clr_short_table_stream_is_empty() {
+        let streams = vec![ClrStream {
+            name: "#~".into(),
+            offset: 0,
+            size: 16,
+        }];
+        assert!(metadata_tables(&[0u8; 16], Some(0), &streams).is_empty());
+        let unnamed = vec![ClrStream {
+            name: "#Strings".into(),
+            offset: 0,
+            size: 32,
+        }];
+        assert!(metadata_tables(&tilde_header(1, &[1]), Some(0), &unnamed).is_empty());
     }
 
     fn cor20_header(

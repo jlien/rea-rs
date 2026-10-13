@@ -142,7 +142,7 @@
 
   <h2 id="progress">What landed</h2>
   <div class="banner">
-    <p>Workspace tests this round: <code>cargo test --workspace --offline</code> — rea-core 63 passed, rea-mcp 5 passed, CLI compiled. The pre-existing unused <code>mut</code> on the Capstone handle in <code>disasm.rs</code> is still a warning.</p>
+    <p>Workspace tests this round: <code>cargo test --workspace --offline</code> — rea-core 66 passed, rea-mcp 5 passed, CLI compiled. The pre-existing unused <code>mut</code> on the Capstone handle in <code>disasm.rs</code> is still a warning.</p>
   </div>
   <table>
     <thead><tr><th>Slice</th><th>Where it shows up</th><th>Check</th><th></th></tr></thead>
@@ -185,8 +185,8 @@
       </tr>
       <tr>
         <td>PE directories and CLR streams</td>
-        <td><code>rea pe</code>, <code>rea_pe</code>. Data directories, CLR runtime header, BSJB version, stream names with offsets and sizes, CodeView PDB path, root resource type ids.</td>
-        <td>Fixture streams <code>#~</code> at offset <code>0x6c</code> size <code>0x10</code> and <code>#Strings</code> at <code>0x80</code> size <code>0x20</code>. A truncated stream list keeps the version and the complete records only. CodeView PDB 7.0 and 2.0 paths are read from the debug directory. No metadata tables and no IL.</td>
+        <td><code>rea pe</code>, <code>rea_pe</code>. Data directories, CLR runtime header, BSJB version, stream names with offsets and sizes, metadata table row counts, CodeView PDB path, root resource type ids.</td>
+        <td>Fixture streams <code>#~</code> at offset <code>0x6c</code> size <code>0x10</code> and <code>#Strings</code> at <code>0x80</code> size <code>0x20</code>. A truncated stream list keeps the version and the complete records only. A <code>#~</code> header reports row counts for the tables whose valid bits are set, lowest bit first. A short table stream reports none. No table rows and no IL.</td>
         <td><span class="tag part">header</span></td>
       </tr>
       <tr>
@@ -218,7 +218,8 @@
       <tr><td><code>rea callgraph</code> on <code>WAR.EXE</code></td><td>742 functions, 1,962 edges. Same as the measurement taken before the arch change.</td></tr>
       <tr><td><code>rea macho /bin/ls</code></td><td>self, libutil, libncurses.5.4, libSystem.B, UUID <code>322cb148c4013ea0a0234b21a104d42f</code>, platform macos, minos 11.0.0, sdk 26.3.0, code signature present. Architectures x86_64 offset 16384 size 48112 and arm64 offset 65536 size 89088.</td></tr>
       <tr><td>Thumb discovery</td><td><code>thumb_push_pop_is_a_function</code> passed. <code>WAR.EXE</code> stayed 742 / 1,962 after the <code>blx</code> and <code>pop</code>/<code>pc</code> arms, so the x86 path did not move.</td></tr>
-      <tr><td>CLR streams</td><td>Ten <code>pe_meta</code> tests passed in the workspace run, including <code>#~</code> / <code>#Strings</code>, a bad BSJB signature with empty streams, and a truncated second record that keeps the first.</td></tr>
+      <tr><td>CLR streams</td><td>Stream cases still pass: <code>#~</code> / <code>#Strings</code>, a bad BSJB signature with empty streams, and a truncated second record that keeps the first.</td></tr>
+      <tr><td>CLR table counts</td><td>Valid bits for Module, TypeDef, and MethodDef report 1, 4, and 9 rows. <code>#-</code> is used when <code>#~</code> is absent. A 16-byte table stream, and a file with only <code>#Strings</code>, report no tables.</td></tr>
       <tr><td><code>rea sqlite</code></td><td>Header tests still pass. Schema tests cover a leaf row, a NULL SQL column, an interior page, and UTF-16LE text. Against sqlite3, page size 512, the three <code>sqlite_master</code> rows matched, including the 926-byte view.</td></tr>
       <tr><td><code>rea sections /bin/ls</code></td><td><code>__text</code> is <code>r-x</code>. <code>__data</code> is <code>rw-</code>. Mach-O permissions come from the segment, so <code>__cstring</code> inside <code>__TEXT</code> is also <code>r-x</code>.</td></tr>
       <tr><td><code>rea sections</code> on <code>WAR.EXE</code></td><td><code>code0</code> is <code>r-x</code> at <code>0x10000</code>. <code>data1</code> is <code>rw-</code> at <code>0x50000</code>.</td></tr>
@@ -232,7 +233,7 @@
 
   <h3>In-process static slice</h3>
   <div class="banner">
-    <p>Thumb discovery, Mach-O fat architectures, build version, and the code-signature flag, the CLR stream directory, SQLite <code>sqlite_schema</code>, section <code>rwx</code> permissions, and a CodeView PDB path are in this tree. The rows below that stay partial are still cousins of the upstream tools, not drop-in replacements. Hopper, Ghidra, IDA, JEB, Frida, browser and CDP, Android and adb, evidence sessions, decompilation, WAT execution, pre-1.18 Go pointer chasing, metadata tables, IL, SQLite table rows, and WAL replay are not in this tree.</p>
+    <p>Thumb discovery, Mach-O fat architectures, build version, and the code-signature flag, the CLR stream directory, metadata table row counts, SQLite <code>sqlite_schema</code>, section <code>rwx</code> permissions, and a CodeView PDB path are in this tree. The rows below that stay partial are still cousins of the upstream tools, not drop-in replacements. Hopper, Ghidra, IDA, JEB, Frida, browser and CDP, Android and adb, evidence sessions, decompilation, WAT execution, pre-1.18 Go pointer chasing, metadata rows, IL, SQLite table rows, and WAL replay are not in this tree.</p>
   </div>
 
   <h3>Still out of scope</h3>
@@ -240,7 +241,7 @@
 
   <div class="verdict" id="fidelity">
     <strong>Fidelity</strong>
-    <p>Shared idea: a local stdio MCP and a JSON CLI for static inspection of native binaries. That slice is wider than the first review (five tools then, fourteen now). It covers function discovery on x86, x86_64, arm64, and Thumb, a direct call graph, WASM sections, Go 1.18+ build info, Mach-O dylibs, UUID, build version, a code-signature flag, and fat architectures, a PE directory skim plus a CLR header and stream directory, ELF interpreter and build-id, a SQLite header and <code>sqlite_schema</code>, and a real LE fixup pass. It is still a different program. Tool names do not match. There is no Evidence record, no provider session, and the protocol stays <code>2024-11-05</code> with text results. LE / DOS/4GW is original work. Upstream has no Watcom LE contract.</p>
+    <p>Shared idea: a local stdio MCP and a JSON CLI for static inspection of native binaries. That slice is wider than the first review (five tools then, fourteen now). It covers function discovery on x86, x86_64, arm64, and Thumb, a direct call graph, WASM sections, Go 1.18+ build info, Mach-O dylibs, UUID, build version, a code-signature flag, and fat architectures, a PE directory skim plus a CLR header, stream directory, and table row counts, ELF interpreter and build-id, a SQLite header and <code>sqlite_schema</code>, and a real LE fixup pass. It is still a different program. Tool names do not match. There is no Evidence record, no provider session, and the protocol stays <code>2024-11-05</code> with text results. LE / DOS/4GW is original work. Upstream has no Watcom LE contract.</p>
   </div>
 
   <h2>What each side is</h2>
@@ -354,7 +355,7 @@
       <tr><td>File-level extras (signature, plist, crash, layout, PE resources)</td><td>12</td><td><span class="tag part">section rwx; Mach-O UUID, build version, code-signature flag, fat arches; ELF build-id; PE directories and CodeView PDB path</span></td></tr>
       <tr><td>JavaScript, Electron, web, browser</td><td>32</td><td><span class="tag low">out of scope</span></td></tr>
       <tr><td>Android, adb, apktool, JEB</td><td>35</td><td><span class="tag low">out of scope</span></td></tr>
-      <tr><td>.NET / managed</td><td>7</td><td><span class="tag part">CLR header, version, stream directory. No tables or IL</span></td></tr>
+      <tr><td>.NET / managed</td><td>7</td><td><span class="tag part">CLR header, version, streams, table row counts. No rows or IL</span></td></tr>
       <tr><td>Frida</td><td>9</td><td><span class="tag low">out of scope</span></td></tr>
       <tr><td>Go, WASM, EVM, SQLite, firmware, Flutter, packets, signals</td><td>11</td><td><span class="tag part">Go 1.18+, WASM sections, SQLite schema. No table rows</span></td></tr>
       <tr><td>Artifact inventory (bundles, nibs, asset catalogs)</td><td>6</td><td><span class="tag low">missing</span></td></tr>

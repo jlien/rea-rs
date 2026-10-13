@@ -70,7 +70,7 @@ rea strings /bin/ls | jq '.count'
 - `rea_wasm` — WASM section ids, imports, and exports
 - `rea_go` — Go 1.18+ build info (version and module text)
 - `rea_macho` — dylibs, UUID, build version, code signature, and fat architectures
-- `rea_pe` — data directories, CLR runtime header, metadata version, stream directory, CodeView PDB path, root resource type ids
+- `rea_pe` — data directories, CLR runtime header, metadata version, stream directory, metadata table row counts, CodeView PDB path, root resource type ids
 - `rea_elf` — interpreter, needed libraries, soname, and GNU build-id
 - `rea_sqlite` — database header and `sqlite_schema` objects. No table rows and no WAL replay.
 
@@ -111,7 +111,7 @@ Or in an MCP client config:
 
 ## Roadmap
 
-- [ ] .NET metadata tables and IL (`rea pe` reads the CLR header, the BSJB version, and stream names, offsets, and sizes)
+- [ ] .NET metadata rows and IL (`rea pe` reads the CLR header, the BSJB version, stream names, and table row counts)
 - [x] WASM module inspection — section ids, imports, and exports (`rea wasm`). No decode to WAT and no execution
 - [x] Function boundary detection and cross-reference resolution — Capstone sweep (entry, direct calls, prologues on x86, x86_64, arm64, and Thumb) plus pointer-width data xrefs, exposed as `rea funcs`, `rea xrefs`, `rea callgraph`, and the MCP tools
 - [x] SQLite header and `sqlite_schema` objects (`rea sqlite`). No table-row reads and no WAL replay
