@@ -150,19 +150,19 @@
       <tr>
         <td>LE internal fixups</td>
         <td><code>le.rs</code> walker. <code>load_le</code> applies fixups and returns the error. Source offsets outside the page are skipped.</td>
-        <td><code>WAR.EXE</code>: 8,457 fixups. Record <code>07 00 eb 09 02 58 1b</code> writes <code>58 1b 05 00</code> at vaddr <code>0x109eb</code> (linear <code>0x00051b58</code>).</td>
+        <td>In-crate fixtures: an internal 32-bit write, a source list whose offsets follow the target tail, a 16-bit object-relative store, an import that must not eat the next internal record, and an oversized page map that returns <code>Err</code>.</td>
         <td><span class="tag have">landed</span></td>
       </tr>
       <tr>
         <td>Functions, xrefs, call graph</td>
         <td>CLI <code>funcs</code>, <code>xrefs</code>, <code>callgraph</code>. MCP <code>rea_funcs</code>, <code>rea_xrefs</code>, <code>rea_call_graph</code>. x86, x86_64, arm64, and Thumb (<code>push {r7, lr}</code>, <code>bl</code> / <code>blx</code>, <code>pop</code> of <code>pc</code>).</td>
-        <td><code>rea callgraph /bin/ls</code> (arm64): 143 functions, 499 edges. Was 1 and 0. <code>WAR.EXE</code> stayed 742 functions and 1,962 edges.</td>
+        <td><code>rea callgraph /bin/ls</code> (arm64): 143 functions, 499 edges. Was 1 and 0.</td>
         <td><span class="tag have">landed</span></td>
       </tr>
       <tr>
         <td>Symbol seeds and pointer width</td>
         <td><code>discover_functions</code> also starts at local and export symbols inside <code>__text</code>, <code>.text</code>, <code>CODE</code>, <code>.init</code>, or <code>.fini</code>. <code>rea_xrefs</code> and <code>rea strings --xrefs</code> use 8-byte little-endian pointers when the target is 64-bit, and 4-byte ones otherwise.</td>
-        <td><code>/bin/ls</code> is stripped: call graph stayed 143 / 499. String xrefs at min length 6 are 20. That was 47 under a 32-bit pattern, then 2 with absolute 8-byte pointers only. <code>WAR.EXE</code> stayed 742 / 1,962.</td>
+        <td><code>/bin/ls</code> is stripped: call graph stayed 143 / 499. String xrefs at min length 6 are 20. That was 47 under a 32-bit pattern, then 2 with absolute 8-byte pointers only.</td>
         <td><span class="tag have">landed</span></td>
       </tr>
       <tr>
@@ -215,9 +215,8 @@
     <thead><tr><th>Check</th><th>Result</th></tr></thead>
     <tbody>
       <tr><td><code>rea callgraph /bin/ls</code></td><td>143 functions, 499 edges. The sweep now follows arm64 <code>bl</code> and <code>#0x</code> operands, and seeds <code>stp x29, x30</code> prologues. These counts are a heuristic, not a ground-truth procedure list.</td></tr>
-      <tr><td><code>rea callgraph</code> on <code>WAR.EXE</code></td><td>742 functions, 1,962 edges. Same as the measurement taken before the arch change.</td></tr>
       <tr><td><code>rea macho /bin/ls</code></td><td>self, libutil, libncurses.5.4, libSystem.B, UUID <code>322cb148c4013ea0a0234b21a104d42f</code>, platform macos, minos 11.0.0, sdk 26.3.0, code signature present. Architectures x86_64 offset 16384 size 48112 and arm64 offset 65536 size 89088.</td></tr>
-      <tr><td>Thumb discovery</td><td><code>thumb_push_pop_is_a_function</code> passed. <code>WAR.EXE</code> stayed 742 / 1,962 after the <code>blx</code> and <code>pop</code>/<code>pc</code> arms, so the x86 path did not move.</td></tr>
+      <tr><td>Thumb discovery</td><td><code>thumb_push_pop_is_a_function</code> passed. The x86, x86_64, and arm64 sweeps are unchanged by the Thumb arms.</td></tr>
       <tr><td>CLR streams</td><td>Stream cases still pass: <code>#~</code> / <code>#Strings</code>, a bad BSJB signature with empty streams, and a truncated second record that keeps the first.</td></tr>
       <tr><td>CLR table counts</td><td>Valid bits for Module, TypeDef, and MethodDef report 1, 4, and 9 rows. <code>#-</code> is used when <code>#~</code> is absent. A 16-byte table stream, and a file with only <code>#Strings</code>, report no tables.</td></tr>
       <tr><td>CLR type names</td><td>Module <code>Hello</code> and TypeDef <code>World.App</code>. Two TypeDefs stay aligned when the Field index is 4 bytes because that table claims 70,000 rows. No names without <code>#Strings</code>. No system assembly was on this machine to smoke.</td></tr>
@@ -226,7 +225,6 @@
       <tr><td>CLR parameter names</td><td><code>Ns.App.Run</code> takes <code>a</code> and <code>b</code>. <code>Stop</code> takes <code>c</code>. A <code>ParamPtr</code> row between the method table and the parameter table is skipped and not applied. Sequence numbers and signatures are not read. No system assembly was on this machine to smoke.</td></tr>
       <tr><td><code>rea sqlite</code></td><td>Header tests still pass. Schema tests cover a leaf row, a NULL SQL column, an interior page, and UTF-16LE text. Against sqlite3, page size 512, the three <code>sqlite_master</code> rows matched, including the 926-byte view.</td></tr>
       <tr><td><code>rea sections /bin/ls</code></td><td><code>__text</code> is <code>r-x</code>. <code>__data</code> is <code>rw-</code>. Mach-O permissions come from the segment, so <code>__cstring</code> inside <code>__TEXT</code> is also <code>r-x</code>.</td></tr>
-      <tr><td><code>rea sections</code> on <code>WAR.EXE</code></td><td><code>code0</code> is <code>r-x</code> at <code>0x10000</code>. <code>data1</code> is <code>rw-</code> at <code>0x50000</code>.</td></tr>
       <tr><td>CodeView PDB</td><td>A non-CodeView entry is skipped. PDB 7.0 path <code>hello.pdb</code>, GUID <code>04030201-0605-0807-090a-0b0c0d0e0f10</code>, age 2. PDB 2.0 has a path and no GUID. A record that does not fit is absent. No system PE was smoked.</td></tr>
       <tr><td><code>rea elf</code></td><td>Fixture test passes. A Mach-O path returns <code>parse error: elf: Invalid magic number</code>.</td></tr>
       <tr><td>Symbol seeds</td><td>Fixture: a local symbol in <code>__text</code> is a function; an import, and a local symbol in <code>__cstring</code>, are not. <code>/bin/ls</code> has no defined symbol inside <code>__text</code>, so its call graph did not move.</td></tr>
@@ -370,15 +368,14 @@
   <ul>
     <li>One <code>Target</code> for Mach-O, ELF, PE, and LE, with virtual-address to file-offset translation. Fat Mach-O picks a host slice.</li>
     <li>LE is recognized before goblin. Fixup page bases use the object page map. A bad page-table slot or a short record returns <code>Err</code>.</li>
-    <li>Function bodies follow a forward <code>jmp</code> or arm64 <code>b</code>, and stop at <code>ret</code>, <code>retf</code>, Thumb <code>bx lr</code>, Thumb <code>pop</code> of <code>pc</code>, and an indirect or backward jump. <code>rea callgraph</code> on <code>WAR.EXE</code> reports 742 functions and 1,962 edges after the Thumb arms, the same as before them. The Warcraft note still says 2,386 call edges. That older tally was not what this CLI printed.</li>
-    <li>The Warcraft note in <code>docs/warcraft-1-demo-re.md</code> matches the corrected record order and the 8,457 / <code>0x109eb</code> check.</li>
+    <li>Function bodies follow a forward <code>jmp</code> or arm64 <code>b</code>, and stop at <code>ret</code>, <code>retf</code>, Thumb <code>bx lr</code>, Thumb <code>pop</code> of <code>pc</code>, and an indirect or backward jump.</li>
   </ul>
 
   <h2 id="review">LE fixup review — findings, then the fix</h2>
   <div class="banner">
-    <p>The four bugs, the suggestion, and the nit below were the review of commit <code>2e7687b</code>. They are fixed in this working tree. The walker was replaced, <code>load_le</code> propagates <code>apply_fixups</code>, and <code>WAR.EXE</code> was re-checked. The notes stay so the old failure mode is readable.</p>
+    <p>The four bugs, the suggestion, and the nit below were the review of commit <code>2e7687b</code>. They are fixed in this working tree. The walker was replaced, and <code>load_le</code> propagates <code>apply_fixups</code>. The notes stay so the old failure mode is readable.</p>
   </div>
-  <p>Commit <code>2e7687b</code> taught <code>LeImage::apply_fixups</code> to rewrite internal relocations. A single internal 32-bit fixup on an identity page map (the Warcraft demo) could land correctly. The first walker did not follow the record layout it cited, and a slipped cursor wrote later records into the image. <code>synthetic()</code> left the fixup tables at 0, so that path returned <code>Ok(0)</code> and hid the bugs. Tests now cover an internal 32-bit write, a source list whose offsets follow the target tail, a 16-bit object-relative store, an import that must not eat the next internal record, and an oversized page map that returns <code>Err</code>.</p>
+  <p>Commit <code>2e7687b</code> taught <code>LeImage::apply_fixups</code> to rewrite internal relocations. A single internal 32-bit fixup on an identity page map could land correctly. The first walker did not follow the record layout it cited, and a slipped cursor wrote later records into the image. <code>synthetic()</code> left the fixup tables at 0, so that path returned <code>Ok(0)</code> and hid the bugs. Tests now cover an internal 32-bit write, a source list whose offsets follow the target tail, a 16-bit object-relative store, an import that must not eat the next internal record, and an oversized page map that returns <code>Err</code>.</p>
 
   <article class="issue">
     <span class="tag have">fixed</span>
@@ -398,7 +395,7 @@
     <span class="tag have">fixed</span>
     <h3>Page bases were keyed by file page, then indexed by logical page</h3>
     <p class="where">was crates/rea-core/src/le.rs, page_vaddr</p>
-    <p>Those numbers match only for an identity map, which <code>WAR.EXE</code> has. The walker now uses the object page map, the same way <code>translate</code> does. An oversized <code>mapsize</code> returns <code>Err</code> instead of panicking. Stores go through <code>pages.translate</code> one byte at a time.</p>
+    <p>Those numbers match only for an identity page map. The walker now uses the object page map, the same way <code>translate</code> does. An oversized <code>mapsize</code> returns <code>Err</code> instead of panicking. Stores go through <code>pages.translate</code> one byte at a time.</p>
   </article>
 
   <article class="issue">
@@ -412,7 +409,7 @@
     <span class="tag have">fixed</span>
     <h3>The header comment, the tests, and the stats example</h3>
     <p class="where">le.rs module comment, synthetic fixtures, examples/le_fixup_stats.rs</p>
-    <p>The module comment now says internal fixups are in scope and that entry bundles and iterated pages are not. The stats example no longer clones an unused buffer, and the 4-byte read at <code>0x109eb</code> is bounds-checked.</p>
+    <p>The module comment now says internal fixups are in scope and that entry bundles and iterated pages are not. The stats example prints how many fixups it applied to the file you pass.</p>
   </article>
 
   <footer>

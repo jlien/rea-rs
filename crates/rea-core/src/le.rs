@@ -1,6 +1,5 @@
-//! Minimal Linear Executable (LE) support — the Watcom/DOS/4GW linear
-//! executable format used by classic 1990s DOS games (e.g. the original
-//! Warcraft demo). Layout was derived empirically from a DOS/4GW binary and
+//! Minimal Linear Executable (LE) support for the Watcom/DOS/4GW linear
+//! executable format. Layout was derived from DOS/4GW binaries and
 //! cross-checked against the OS/2 `exe386` structure definitions
 //! (E32_* / O32_* fields).
 //!
@@ -146,10 +145,10 @@ pub fn is_le(bytes: &[u8]) -> bool {
 /// Locate the LE overlay header within a DOS/4GW image.
 ///
 /// The classic DOS/4GW 1.x linker records the header offset in the MZ
-/// `e_lfanew` slot (offset 0x3c). Later DOS/4GW 2.x builds (e.g. SimCity 2000's
-/// extender) leave that slot stale/garbage and embed the overlay deeper in the
-/// stub, so fall back to scanning for the first header that passes the same
-/// field sanity checks parse() applies. The fast path is preserved intact.
+/// `e_lfanew` slot (offset 0x3c). Later DOS/4GW 2.x builds leave that slot
+/// stale and embed the overlay deeper in the stub, so fall back to scanning
+/// for the first header that passes the same field sanity checks parse()
+/// applies. The fast path is preserved intact.
 pub fn find_le_header(bytes: &[u8]) -> Option<usize> {
     fn honest(off: usize, bytes: &[u8]) -> bool {
         if off + 0x84 > bytes.len() {

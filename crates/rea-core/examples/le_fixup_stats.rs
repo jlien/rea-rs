@@ -10,14 +10,4 @@ fn main() {
         Ok(n) => println!("{path}: {n} fixups applied"),
         Err(e) => println!("{path}: error: {e}"),
     }
-    // Sample site used while checking WAR.EXE. Other binaries may not map it.
-    if let Some(off) = img.pages.translate(0x109eb) {
-        let off = off as usize;
-        if off + 4 <= patched.len() {
-            println!(
-                "bytes at vaddr 0x109eb (file {off:#x}): {:02x?}",
-                &patched[off..off + 4]
-            );
-        }
-    }
 }
