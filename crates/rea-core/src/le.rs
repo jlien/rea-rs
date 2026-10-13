@@ -4,9 +4,9 @@
 //! cross-checked against the OS/2 `exe386` structure definitions
 //! (E32_* / O32_* fields).
 //!
-//! Scope: object table, page map, entry point, and page-granular
-//! vaddr→file-offset translation (enough for info/sections/disasm). Fixups,
-//! entry bundles, and iterated (compressed) pages are not yet handled.
+//! Scope: object table, page map, entry point, internal fixups, and
+//! page-granular vaddr→file-offset translation (enough for info/sections/disasm).
+//! Entry bundles and iterated (compressed) pages are not yet handled.
 
 use crate::{Arch, Error, Result, Section};
 
@@ -109,18 +109,17 @@ impl LePages {
     }
 }
 
-/// Fixup (relocation) records. Format cross-checked against rizin's
-/// `librz/bin/format/le` parser and empirically against WAR.EXE:
-/// record = `[src_flags u8][trg_flags u8][src_off i16][ordinal][target……]`,
-/// where source type 7 = 32-bit offset, target type 0 = internal.
+/// Fixup records. A source-offset list (`src_flags & 0x20`) is stored after
+/// the target tail: the target is variable-length and has to be parsed first.
 const F_SOURCE_TYPE_MASK: u8 = 0xF;
 const F_SOURCE_LIST: u8 = 0x20;
 const F_TARGET_TYPE_MASK: u8 = 0x3;
 const F_TARGET_OFF32: u8 = 0x10;
 const F_TARGET_ADDITIVE: u8 = 0x4;
 const F_TARGET_ADD32: u8 = 0x20;
-const F_TARGET_CHAIN: u8 = 0x8;
 const F_TARGET_ORD16: u8 = 0x40;
+/// Import-by-ordinal: set means the import ordinal is a `u8`, clear means `u16`.
+const F_TARGET_ORD8: u8 = 0x80;
 
 /// Parsed LE image.
 #[derive(Debug, Clone)]
@@ -139,16 +138,66 @@ pub struct LeImage {
     mpages: u32,
 }
 
-/// Quick detection: MZ stub with `e_lfanew` pointing at an "LE" magic.
+/// Quick detection: MZ stub with a locatable LE overlay header.
 pub fn is_le(bytes: &[u8]) -> bool {
-    if bytes.len() < 0x40 || &bytes[0..2] != b"MZ" {
-        return false;
+    find_le_header(bytes).is_some()
+}
+
+/// Locate the LE overlay header within a DOS/4GW image.
+///
+/// The classic DOS/4GW 1.x linker records the header offset in the MZ
+/// `e_lfanew` slot (offset 0x3c). Later DOS/4GW 2.x builds (e.g. SimCity 2000's
+/// extender) leave that slot stale/garbage and embed the overlay deeper in the
+/// stub, so fall back to scanning for the first header that passes the same
+/// field sanity checks parse() applies. The fast path is preserved intact.
+pub fn find_le_header(bytes: &[u8]) -> Option<usize> {
+    fn honest(off: usize, bytes: &[u8]) -> bool {
+        if off + 0x84 > bytes.len() {
+            return false;
+        }
+        let Ok(cpu) = u16_at(bytes, off + 0x08) else {
+            return false;
+        };
+        let Ok(pagesize) = u32_at(bytes, off + 0x28) else {
+            return false;
+        };
+        let Ok(startobj) = u32_at(bytes, off + 0x18) else {
+            return false;
+        };
+        let Ok(objcnt) = u32_at(bytes, off + 0x44) else {
+            return false;
+        };
+        let Ok(objtab) = u32_at(bytes, off + 0x40) else {
+            return false;
+        };
+        cpu != 0
+            && pagesize >= 0x100
+            && pagesize <= 0x10000
+            && startobj > 0
+            && objcnt > 0
+            && objcnt < 0x800
+            && startobj <= objcnt
+            && objtab > 0
+            && objtab < bytes.len().try_into().unwrap()
     }
-    let Ok(le_off) = u32_at(bytes, 0x3c) else {
-        return false;
-    };
-    let le_off = le_off as usize;
-    le_off + 2 <= bytes.len() && &bytes[le_off..le_off + 2] == b"LE"
+    if bytes.len() >= 2 && bytes[0] == b'M' && bytes[1] == b'Z' {
+        // Fast path: classic e_lfanew slot pointing straight at the header.
+        let Ok(le_off) = u32_at(bytes, 0x3c) else {
+            return None;
+        };
+        let o = le_off as usize;
+        if o + 2 <= bytes.len() && bytes[o] == b'L' && bytes[o + 1] == b'E' && honest(o, bytes) {
+            return Some(o);
+        }
+        // DOS/4GW 2.x: stale e_lfanew, overlay buried in the stub. Scan.
+        let limit = bytes.len();
+        for i in 3..(limit - 2) {
+            if bytes[i] == b'L' && bytes[i + 1] == b'E' && honest(i, bytes) {
+                return Some(i);
+            }
+        }
+    }
+    None
 }
 
 impl LeImage {
@@ -157,7 +206,11 @@ impl LeImage {
         if !is_le(bytes) {
             return Err(Error::Parse("le: not a linear executable".into()));
         }
-        let header_off = u32_at(bytes, 0x3c)? as usize;
+        let found = find_le_header(bytes);
+        if found.is_none() {
+            return Err(Error::Parse("le: not a linear executable".into()));
+        }
+        let header_off = found.unwrap();
         let h = |off: usize| u32_at(bytes, header_off + off);
         let h16 = |off: usize| u16_at(bytes, header_off + off);
 
@@ -221,184 +274,245 @@ impl LeImage {
         })
     }
 
-    /// Apply internal fixups (relocations) to a mutable copy of the file
-    /// bytes. For each 32-bit/16-bit-offset fixup targeting an internal
-    /// object, the target linear address is written at the source location.
-    /// Returns the number of fixups applied; chains, selectors, external
-    /// imports and entry-point targets are counted but skipped.
+    /// Apply internal fixups to a mutable copy of the file bytes.
+    /// Source type 7 writes the target linear address, type 5 the
+    /// object-relative offset, and type 8 a 32-bit displacement from the
+    /// source slot. Other source types and non-internal targets are parsed
+    /// and skipped. Returns the number of source sites written.
     pub fn apply_fixups(&self, bytes: &mut Vec<u8>) -> Result<usize> {
         if self.fpagetab == 0 || self.frectab == 0 {
             return Ok(0);
         }
-        let pagesize = self.pages.pagesize as u64;
-        // Map page number -> starting vaddr (first page whose entry matches).
-        let mut page_vaddr: Vec<u64> = vec![0; self.mpages as usize + 1];
-        {
-            let mut start_idx = 0usize;
-            for o in &self.pages.objects {
-                for idx in 0..o.mapsize as usize {
-                    let page_no = self.pages.pages[start_idx + idx] as usize;
-                    if page_no >= 1 && page_no <= self.mpages as usize && page_vaddr[page_no] == 0
-                    {
-                        page_vaddr[page_no] = u64::from(o.base) + idx as u64 * pagesize;
-                    }
-                }
-                start_idx += o.mapsize as usize;
+
+        let pagesize = u64::from(self.pages.pagesize);
+        let mut page_base = Vec::with_capacity(self.mpages as usize);
+        let mut seen: u32 = 0;
+        for o in &self.pages.objects {
+            let start = o.pagemap.checked_sub(1).ok_or_else(|| {
+                Error::Parse("le: object page map out of range".into())
+            })?;
+            let slot_end = start.checked_add(o.mapsize).ok_or_else(|| {
+                Error::Parse("le: object page map out of range".into())
+            })?;
+            if slot_end as usize > self.pages.pages.len() {
+                return Err(Error::Parse("le: object page map out of range".into()));
             }
+            for idx in 0..o.mapsize {
+                page_base.push(u64::from(o.base) + u64::from(idx) * pagesize);
+            }
+            seen = seen.checked_add(o.mapsize).ok_or_else(|| {
+                Error::Parse("le: object mapsize overflow".into())
+            })?;
+        }
+        if seen != self.mpages {
+            return Err(Error::Parse(
+                "le: object mapsize sum does not match page count".into(),
+            ));
+        }
+
+        fn truncated() -> Error {
+            Error::Parse("le: truncated fixup record".into())
+        }
+        fn take<'a>(bytes: &'a [u8], off: &mut usize, end: usize, n: usize) -> Result<&'a [u8]> {
+            let next = off.checked_add(n).ok_or_else(truncated)?;
+            if next > end || next > bytes.len() {
+                return Err(truncated());
+            }
+            let slice = &bytes[*off..next];
+            *off = next;
+            Ok(slice)
+        }
+        fn take_u8(bytes: &[u8], off: &mut usize, end: usize) -> Result<u8> {
+            Ok(take(bytes, off, end, 1)?[0])
+        }
+        fn take_u16(bytes: &[u8], off: &mut usize, end: usize) -> Result<u16> {
+            let b = take(bytes, off, end, 2)?;
+            Ok(u16::from_le_bytes([b[0], b[1]]))
+        }
+        fn take_i16(bytes: &[u8], off: &mut usize, end: usize) -> Result<i16> {
+            Ok(take_u16(bytes, off, end)? as i16)
+        }
+        fn take_u32(bytes: &[u8], off: &mut usize, end: usize) -> Result<u32> {
+            let b = take(bytes, off, end, 4)?;
+            Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         }
 
         let mut applied = 0usize;
-        let mut skipped = 0usize;
-        let read_u16 = |bytes: &[u8], off: usize| -> Option<u16> {
-            let b = bytes.get(off..off + 2)?;
-            Some(u16::from_le_bytes([b[0], b[1]]))
-        };
-        let read_u32 = |bytes: &[u8], off: usize| -> Option<u32> {
-            let b = bytes.get(off..off + 4)?;
-            Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        };
-
+        let header = self.pages.header_off;
         for page_i in 0..self.mpages as usize {
-            let start = self.pages.header_off
-                + self.fpagetab as usize
-                + page_i * 4; // fixup page table uses u32 entries (DOS/4GW)
-            let Some(&beg) = u32_at(bytes, start).ok().as_ref() else {
-                continue;
-            };
-            let Some(&end) = u32_at(bytes, start + 4).ok().as_ref() else {
-                continue;
-            };
-            let (beg, end) = (beg as usize, end as usize);
-            if end <= beg {
+            let tab = header + self.fpagetab as usize + page_i * 4;
+            let beg = u32_at(bytes, tab)
+                .map_err(|_| Error::Parse("le: truncated fixup page table".into()))?;
+            let end = u32_at(bytes, tab + 4)
+                .map_err(|_| Error::Parse("le: truncated fixup page table".into()))?;
+            if end < beg {
+                return Err(Error::Parse("le: fixup page range inverted".into()));
+            }
+            if end == beg {
                 continue;
             }
-            let page_base = page_vaddr[page_i + 1]; // page numbers are 1-based
-            let mut off = self.pages.header_off + self.frectab as usize + beg;
-            let off_end = self.pages.header_off + self.frectab as usize + end;
+            let rec_base = header + self.frectab as usize;
+            let mut off = rec_base.checked_add(beg as usize).ok_or_else(truncated)?;
+            let off_end = rec_base.checked_add(end as usize).ok_or_else(truncated)?;
+            let vbase = page_base[page_i];
+
             while off < off_end {
-                let Some(&src_flags) = bytes.get(off) else {
-                    break;
-                };
-                let Some(&trg_flags) = bytes.get(off + 1) else {
-                    break;
-                };
-                off += 2;
-                // Source list vs single source offset.
-                let mut src_offs: Vec<i32> = Vec::new();
-                if src_flags & F_SOURCE_LIST != 0 {
-                    let Some(&count) = bytes.get(off) else {
-                        break;
-                    };
-                    off += 1;
-                    for _ in 0..count {
-                        let Some(v) = read_u16(bytes, off) else {
-                            break;
-                        };
-                        off += 2;
-                        src_offs.push(v as i32);
-                    }
-                } else {
-                    let Some(v) = read_u16(bytes, off) else {
-                        break;
-                    };
-                    off += 2;
-                    src_offs.push(v as i16 as i32);
-                }
-                // Target ordinal (object number for internal fixups).
-                let ordinal: u32 = if trg_flags & F_TARGET_ORD16 != 0 {
-                    let Some(v) = read_u16(bytes, off) else {
-                        break;
-                    };
-                    off += 2;
-                    u32::from(v)
-                } else {
-                    let Some(&v) = bytes.get(off) else {
-                        break;
-                    };
-                    off += 1;
-                    u32::from(v)
-                };
-                // Only internal targets can be resolved statically.
-                let trg_type = trg_flags & F_TARGET_TYPE_MASK;
-                let mut target: Option<u64> = None;
-                if trg_type == 0 {
-                    let obj_idx = ordinal.checked_sub(1).and_then(|i| {
-                        self.pages.objects.get(i as usize).map(|o| u64::from(o.base))
-                    });
-                    if let Some(base) = obj_idx {
-                        let tgt_off = if trg_flags & F_TARGET_OFF32 != 0 {
-                            read_u32(bytes, off).map(u64::from)
-                        } else {
-                            read_u16(bytes, off).map(u64::from)
-                        };
-                        if let Some(t) = tgt_off {
-                            off += if trg_flags & F_TARGET_OFF32 != 0 {
-                                4
-                            } else {
-                                2
-                            };
-                            target = Some(base + t);
-                        }
-                    } else {
-                        skipped += 1;
-                        continue;
-                    }
-                    if trg_flags & F_TARGET_ADDITIVE != 0 {
-                        let addend = if trg_flags & F_TARGET_ADD32 != 0 {
-                            read_u32(bytes, off).map(u64::from)
-                        } else {
-                            read_u16(bytes, off).map(u64::from)
-                        };
-                        if let Some(a) = addend {
-                            off += if trg_flags & F_TARGET_ADD32 != 0 {
-                                4
-                            } else {
-                                2
-                            };
-                            target = Some(target.unwrap_or(0) + a);
-                        }
-                    }
-                } else {
-                    skipped += 1;
-                    continue;
-                }
-                if trg_flags & F_TARGET_CHAIN != 0 {
-                    skipped += 1; // chain fixups need page-data walking; rare
-                    continue;
-                }
-                let Some(target) = target else {
-                    continue;
-                };
+                let src_flags = take_u8(bytes, &mut off, off_end)?;
+                let trg_flags = take_u8(bytes, &mut off, off_end)?;
                 let src_type = src_flags & F_SOURCE_TYPE_MASK;
-                if src_type != 7 && src_type != 5 {
-                    skipped += 1; // selectors / relative fixups: not applicable
+                let trg_type = trg_flags & F_TARGET_TYPE_MASK;
+
+                let list_count = if src_flags & F_SOURCE_LIST != 0 {
+                    Some(take_u8(bytes, &mut off, off_end)?)
+                } else {
+                    None
+                };
+                let single_src = if list_count.is_none() {
+                    take_i16(bytes, &mut off, off_end)?
+                } else {
+                    0
+                };
+
+                let mut off_field: u64 = 0;
+                let mut ordinal: Option<u32> = None;
+                match trg_type {
+                    0 | 3 => {
+                        let ord = if trg_flags & F_TARGET_ORD16 != 0 {
+                            u32::from(take_u16(bytes, &mut off, off_end)?)
+                        } else {
+                            u32::from(take_u8(bytes, &mut off, off_end)?)
+                        };
+                        if trg_type == 0 {
+                            ordinal = Some(ord);
+                        }
+                        // Selector fixups (source type 2) have no target offset.
+                        if src_type != 2 {
+                            off_field = if trg_flags & F_TARGET_OFF32 != 0 {
+                                u64::from(take_u32(bytes, &mut off, off_end)?)
+                            } else {
+                                u64::from(take_u16(bytes, &mut off, off_end)?)
+                            };
+                        }
+                    }
+                    1 => {
+                        if trg_flags & F_TARGET_ORD16 != 0 {
+                            take_u16(bytes, &mut off, off_end)?;
+                        } else {
+                            take_u8(bytes, &mut off, off_end)?;
+                        }
+                        if trg_flags & F_TARGET_ORD8 != 0 {
+                            take_u8(bytes, &mut off, off_end)?;
+                        } else {
+                            take_u16(bytes, &mut off, off_end)?;
+                        }
+                    }
+                    _ => {
+                        // Target type 2: import by name.
+                        if trg_flags & F_TARGET_ORD16 != 0 {
+                            take_u16(bytes, &mut off, off_end)?;
+                        } else {
+                            take_u8(bytes, &mut off, off_end)?;
+                        }
+                        if trg_flags & F_TARGET_OFF32 != 0 {
+                            take_u32(bytes, &mut off, off_end)?;
+                        } else {
+                            take_u16(bytes, &mut off, off_end)?;
+                        }
+                    }
+                }
+
+                let add_field = if trg_flags & F_TARGET_ADDITIVE != 0 {
+                    if trg_flags & F_TARGET_ADD32 != 0 {
+                        u64::from(take_u32(bytes, &mut off, off_end)?)
+                    } else {
+                        u64::from(take_u16(bytes, &mut off, off_end)?)
+                    }
+                } else {
+                    0
+                };
+
+                let src_offs = if let Some(count) = list_count {
+                    let mut v = Vec::with_capacity(count as usize);
+                    for _ in 0..count {
+                        v.push(take_i16(bytes, &mut off, off_end)?);
+                    }
+                    v
+                } else {
+                    vec![single_src]
+                };
+
+                if trg_type != 0 {
                     continue;
                 }
-                for src_off in &src_offs {
-                    if *src_off < 0 || *src_off as u64 >= pagesize {
+                let Some(ord) = ordinal else {
+                    continue;
+                };
+                let Some(obj) = ord
+                    .checked_sub(1)
+                    .and_then(|i| self.pages.objects.get(i as usize))
+                else {
+                    continue;
+                };
+
+                let rel = off_field + add_field;
+                let base = u64::from(obj.base);
+                for src_off in src_offs {
+                    // Offsets are page-relative. A negative or past-the-page
+                    // value is not a site on this logical page.
+                    if src_off < 0 || u64::from(src_off as u16) >= pagesize {
                         continue;
                     }
-                    let src_vaddr = page_base + *src_off as u64;
-                    let Some(file_off) = self.pages.translate(src_vaddr) else {
-                        continue;
-                    };
-                    let file_off = file_off as usize;
-                    if src_type == 7 {
-                        let Some(src) = bytes.get_mut(file_off..file_off + 4) else {
-                            continue;
-                        };
-                        src.copy_from_slice(&(target as u32).to_le_bytes());
-                    } else {
-                        let Some(src) = bytes.get_mut(file_off..file_off + 2) else {
-                            continue;
-                        };
-                        src.copy_from_slice(&(target as u16).to_le_bytes());
+                    let src_vaddr = vbase + u64::from(src_off as u16);
+                    match src_type {
+                        7 => {
+                            let value = (base.wrapping_add(rel) as u32).to_le_bytes();
+                            if self.patch_site(bytes, src_vaddr, &value) {
+                                applied += 1;
+                            }
+                        }
+                        5 => {
+                            let Ok(word) = u16::try_from(rel) else {
+                                continue;
+                            };
+                            if self.patch_site(bytes, src_vaddr, &word.to_le_bytes()) {
+                                applied += 1;
+                            }
+                        }
+                        8 => {
+                            let disp = base
+                                .wrapping_add(rel)
+                                .wrapping_sub(src_vaddr.wrapping_add(4));
+                            let value = (disp as u32).to_le_bytes();
+                            if self.patch_site(bytes, src_vaddr, &value) {
+                                applied += 1;
+                            }
+                        }
+                        _ => {}
                     }
-                    applied += 1;
                 }
             }
         }
         Ok(applied)
+    }
+
+    /// Store `value` at `src_vaddr`, one translated byte at a time.
+    /// Returns false, writing nothing, if any byte is unmapped.
+    fn patch_site(&self, bytes: &mut [u8], src_vaddr: u64, value: &[u8]) -> bool {
+        let mut file_offs = Vec::with_capacity(value.len());
+        for i in 0..value.len() {
+            let Some(fo) = self.pages.translate(src_vaddr + i as u64) else {
+                return false;
+            };
+            let fo = fo as usize;
+            if fo >= bytes.len() {
+                return false;
+            }
+            file_offs.push(fo);
+        }
+        for (i, fo) in file_offs.into_iter().enumerate() {
+            bytes[fo] = value[i];
+        }
+        true
     }
 
     pub fn arch(&self) -> Arch {
@@ -500,5 +614,111 @@ mod tests {
         assert_eq!(secs.len(), 1);
         assert_eq!(secs[0].name, "code0");
         assert_eq!(secs[0].addr, 0x400000);
+        let mut owned = b.clone();
+        assert_eq!(img.apply_fixups(&mut owned).unwrap(), 0);
+    }
+
+    /// Fixup page table + records in the gap between the page map and the data page.
+    fn with_fixup_records(records: &[u8]) -> Vec<u8> {
+        let mut b = synthetic();
+        let le = 0x40usize;
+        let fpagetab = 0xDCu32;
+        let frectab = 0xE4u32;
+        assert!(
+            records.len() <= 0x100 - frectab as usize,
+            "records would overlap the data page"
+        );
+        b[le + 0x68..le + 0x6c].copy_from_slice(&fpagetab.to_le_bytes());
+        b[le + 0x6c..le + 0x70].copy_from_slice(&frectab.to_le_bytes());
+        let pt = le + fpagetab as usize;
+        b[pt..pt + 4].copy_from_slice(&0u32.to_le_bytes());
+        b[pt + 4..pt + 8].copy_from_slice(&(records.len() as u32).to_le_bytes());
+        let rt = le + frectab as usize;
+        b[rt..rt + records.len()].copy_from_slice(records);
+        b
+    }
+
+    fn dword_at(bytes: &[u8], vaddr: u64, img: &LeImage) -> u32 {
+        let off = img.pages.translate(vaddr).unwrap() as usize;
+        u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap())
+    }
+
+    #[test]
+    fn internal_offset32_writes_base_plus_target() {
+        // src type 7, target type 0, 8-bit ordinal, 16-bit target offset 0x20.
+        let rec = [0x07, 0x00, 0x00, 0x00, 0x01, 0x20, 0x00];
+        let mut b = with_fixup_records(&rec);
+        let img = LeImage::parse(&b).unwrap();
+        assert_eq!(img.apply_fixups(&mut b).unwrap(), 1);
+        assert_eq!(dword_at(&b, 0x400000, &img), 0x400020);
+    }
+
+    #[test]
+    fn source_list_offsets_follow_target_tail() {
+        // List of two sources, then a separate type-7 record. Offsets sit
+        // after the ordinal and target offset, so the second record stays intact.
+        let rec = [
+            0x27, 0x00, // type 7, source list
+            0x02, // count
+            0x01, // object 1
+            0x20, 0x00, // target offset
+            0x00, 0x00, // source +0
+            0x04, 0x00, // source +4
+            0x07, 0x00, // plain type 7
+            0x08, 0x00, // source +8
+            0x01, // object 1
+            0x30, 0x00, // target offset
+        ];
+        let mut b = with_fixup_records(&rec);
+        let img = LeImage::parse(&b).unwrap();
+        assert_eq!(img.apply_fixups(&mut b).unwrap(), 3);
+        assert_eq!(dword_at(&b, 0x400000, &img), 0x400020);
+        assert_eq!(dword_at(&b, 0x400004, &img), 0x400020);
+        assert_eq!(dword_at(&b, 0x400008, &img), 0x400030);
+    }
+
+    #[test]
+    fn offset16_stores_object_relative_target() {
+        let rec = [0x05, 0x00, 0x00, 0x00, 0x01, 0x20, 0x00];
+        let mut b = with_fixup_records(&rec);
+        let o = 0x40 + 0xC0;
+        b[o + 4..o + 8].copy_from_slice(&0x400010u32.to_le_bytes());
+        let img = LeImage::parse(&b).unwrap();
+        assert_eq!(img.apply_fixups(&mut b).unwrap(), 1);
+        let off = img.pages.translate(0x400010).unwrap() as usize;
+        let word = u16::from_le_bytes([b[off], b[off + 1]]);
+        assert_eq!(word, 0x0020);
+    }
+
+    #[test]
+    fn import_by_ordinal_does_not_eat_following_internal() {
+        // Type 1: 8-bit module, 16-bit import ordinal, no additive, no list.
+        let rec = [
+            0x07, 0x01, // type 7 source, import-by-ordinal
+            0x00, 0x00, // source +0 (not written)
+            0x05, // module ordinal
+            0x34, 0x12, // import ordinal
+            0x07, 0x00, // internal type 7
+            0x04, 0x00, // source +4
+            0x01, 0x20, 0x00, // object 1, target 0x20
+        ];
+        let mut b = with_fixup_records(&rec);
+        let img = LeImage::parse(&b).unwrap();
+        assert_eq!(img.apply_fixups(&mut b).unwrap(), 1);
+        let untouched = img.pages.translate(0x400000).unwrap() as usize;
+        assert_eq!(&b[untouched..untouched + 4], &[0x55, 0x89, 0xe5, 0xc3]);
+        assert_eq!(dword_at(&b, 0x400004, &img), 0x400020);
+    }
+
+    #[test]
+    fn mapsize_larger_than_page_table_errors() {
+        let mut b = synthetic();
+        let le = 0x40;
+        let o = le + 0xC0;
+        b[o + 16..o + 20].copy_from_slice(&4u32.to_le_bytes());
+        b[le + 0x68..le + 0x6c].copy_from_slice(&1u32.to_le_bytes());
+        b[le + 0x6c..le + 0x70].copy_from_slice(&1u32.to_le_bytes());
+        let img = LeImage::parse(&b).unwrap();
+        assert!(img.apply_fixups(&mut b).is_err());
     }
 }
