@@ -549,6 +549,11 @@ impl LeImage {
                     addr: u64::from(o.base),
                     size: u64::from(o.size),
                     file_offset,
+                    perms: crate::section_perms(
+                        o.flags & 0x1 != 0,
+                        o.flags & 0x2 != 0,
+                        o.flags & 0x4 != 0,
+                    ),
                 }
             })
             .collect()

@@ -9,6 +9,7 @@ pub mod le;
 pub mod loader;
 pub mod macho_meta;
 pub mod pe_meta;
+pub mod sqlite;
 pub mod strings;
 pub mod wasm;
 
@@ -64,6 +65,21 @@ pub struct Section {
     pub size: u64,
     /// Offset in the file (for the selected arch slice in fat binaries).
     pub file_offset: u64,
+    /// Three characters: `r`, `w`, `x`, or `-` for each missing bit.
+    /// Mach-O uses the segment's initial protection. ELF has no read bit, so
+    /// `SHF_ALLOC` is reported as readable. PE uses the section memory bits.
+    /// LE uses object flags 0x1, 0x2, and 0x4.
+    pub perms: String,
+}
+
+/// Format read, write, and execute as `rwx`, with `-` for a missing bit.
+pub fn section_perms(read: bool, write: bool, exec: bool) -> String {
+    format!(
+        "{}{}{}",
+        if read { 'r' } else { '-' },
+        if write { 'w' } else { '-' },
+        if exec { 'x' } else { '-' },
+    )
 }
 
 /// A symbol defined or referenced by the target.
@@ -134,3 +150,15 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::section_perms;
+
+    #[test]
+    fn section_perms_uses_rwx_letters() {
+        assert_eq!(section_perms(true, false, true), "r-x");
+        assert_eq!(section_perms(true, true, false), "rw-");
+        assert_eq!(section_perms(false, false, false), "---");
+    }
+}

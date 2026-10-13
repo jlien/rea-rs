@@ -72,12 +72,14 @@ enum Command {
     Wasm { path: String },
     /// Go 1.18+ build info embedded in a binary. Pre-1.18 pointer blobs error.
     Goinfo { path: String },
-    /// Mach-O dylibs and UUID. Fat binaries use the host slice.
+    /// Mach-O dylibs, UUID, build version, code signature, and architectures.
     Macho { path: String },
-    /// PE data directories, CLR header presence, and root resource type ids.
+    /// PE data directories, CLR header, metadata streams, CodeView PDB path, and root resource type ids.
     Pe { path: String },
     /// ELF interpreter, needed libraries, soname, and GNU build-id.
     Elf { path: String },
+    /// SQLite database header. Does not read schema or pages.
+    Sqlite { path: String },
     /// Run the MCP stdio server (for agent integration).
     Mcp,
 }
@@ -95,6 +97,12 @@ fn main() -> anyhow::Result<()> {
             let bytes = std::fs::read(path).context("failed to read target")?;
             let module = rea_core::wasm::inspect(&bytes).context("wasm")?;
             println!("{}", serde_json::to_string_pretty(&module).unwrap());
+            Ok(())
+        }
+        Command::Sqlite { path } => {
+            let bytes = std::fs::read(path).context("failed to read target")?;
+            let header = rea_core::sqlite::header(&bytes).context("sqlite")?;
+            println!("{}", serde_json::to_string_pretty(&header).unwrap());
             Ok(())
         }
         Command::Goinfo { path } => {
@@ -124,7 +132,7 @@ fn main() -> anyhow::Result<()> {
                 | Command::Macho { path }
                 | Command::Pe { path }
                 | Command::Elf { path } => (path, ()),
-                Command::Wasm { .. } | Command::Goinfo { .. } => unreachable!(),
+                Command::Wasm { .. } | Command::Goinfo { .. } | Command::Sqlite { .. } => unreachable!(),
                 Command::Mcp => unreachable!(),
             };
             let target = loader::load(path).context("failed to load target")?;
@@ -198,7 +206,12 @@ fn main() -> anyhow::Result<()> {
                 Command::Macho { .. } => {
                     let facts = rea_core::macho_meta::facts(&target.bytes)
                         .map_err(|e| anyhow::anyhow!("{e}"))?;
-                    serde_json::json!(facts)
+                    let file = std::fs::read(&target.path)?;
+                    let architectures = rea_core::macho_meta::architectures(&file)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    let mut value = serde_json::to_value(facts)?;
+                    value["architectures"] = serde_json::json!(architectures);
+                    value
                 }
                 Command::Pe { .. } => {
                     let facts = rea_core::pe_meta::facts(&target.bytes)
@@ -210,7 +223,7 @@ fn main() -> anyhow::Result<()> {
                         .map_err(|e| anyhow::anyhow!("{e}"))?;
                     serde_json::json!(facts)
                 }
-                Command::Mcp | Command::Wasm { .. } | Command::Goinfo { .. } => unreachable!(),
+                Command::Mcp | Command::Wasm { .. } | Command::Goinfo { .. } | Command::Sqlite { .. } => unreachable!(),
             };
             println!("{}", serde_json::to_string_pretty(&json).unwrap());
             Ok(())

@@ -142,7 +142,7 @@
 
   <h2 id="progress">What landed</h2>
   <div class="banner">
-    <p>Workspace tests this round: <code>cargo test --workspace --offline</code> — rea-core 35 passed, rea-mcp 5 passed, CLI compiled. The pre-existing unused <code>mut</code> on the Capstone handle in <code>disasm.rs</code> is still a warning.</p>
+    <p>Workspace tests this round: <code>cargo test --workspace --offline</code> — rea-core 58 passed, rea-mcp 5 passed, CLI compiled. The pre-existing unused <code>mut</code> on the Capstone handle in <code>disasm.rs</code> is still a warning.</p>
   </div>
   <table>
     <thead><tr><th>Slice</th><th>Where it shows up</th><th>Check</th><th></th></tr></thead>
@@ -155,14 +155,14 @@
       </tr>
       <tr>
         <td>Functions, xrefs, call graph</td>
-        <td>CLI <code>funcs</code>, <code>xrefs</code>, <code>callgraph</code>. MCP <code>rea_funcs</code>, <code>rea_xrefs</code>, <code>rea_call_graph</code>. x86, x86_64, and arm64. Thumb is still empty.</td>
+        <td>CLI <code>funcs</code>, <code>xrefs</code>, <code>callgraph</code>. MCP <code>rea_funcs</code>, <code>rea_xrefs</code>, <code>rea_call_graph</code>. x86, x86_64, arm64, and Thumb (<code>push {r7, lr}</code>, <code>bl</code> / <code>blx</code>, <code>pop</code> of <code>pc</code>).</td>
         <td><code>rea callgraph /bin/ls</code> (arm64): 143 functions, 499 edges. Was 1 and 0. <code>WAR.EXE</code> stayed 742 functions and 1,962 edges.</td>
         <td><span class="tag have">landed</span></td>
       </tr>
       <tr>
         <td>Symbol seeds and pointer width</td>
         <td><code>discover_functions</code> also starts at local and export symbols inside <code>__text</code>, <code>.text</code>, <code>CODE</code>, <code>.init</code>, or <code>.fini</code>. <code>rea_xrefs</code> and <code>rea strings --xrefs</code> use 8-byte little-endian pointers when the target is 64-bit, and 4-byte ones otherwise.</td>
-        <td><code>/bin/ls</code> is stripped: call graph stayed 143 / 499. String xrefs at min length 6 went from 47 to 2, because the old 32-bit scan was matching truncated addresses. <code>WAR.EXE</code> stayed 742 / 1,962.</td>
+        <td><code>/bin/ls</code> is stripped: call graph stayed 143 / 499. String xrefs at min length 6 are 20. That was 47 under a 32-bit pattern, then 2 with absolute 8-byte pointers only. <code>WAR.EXE</code> stayed 742 / 1,962.</td>
         <td><span class="tag have">landed</span></td>
       </tr>
       <tr>
@@ -178,16 +178,16 @@
         <td><span class="tag have">landed</span></td>
       </tr>
       <tr>
-        <td>Mach-O dylibs and UUID</td>
-        <td><code>rea macho</code>, <code>rea_macho</code>. Fat files use the host slice already chosen by the loader.</td>
-        <td><code>/bin/ls</code>: self, libutil, libncurses.5.4, libSystem.B. UUID <code>322cb148c4013ea0a0234b21a104d42f</code>.</td>
+        <td>Mach-O dylibs, UUID, build version, signature flag, fat arches</td>
+        <td><code>rea macho</code>, <code>rea_macho</code>. Slice facts use the host slice. Architectures come from the original file.</td>
+        <td><code>/bin/ls</code>: self, libutil, libncurses.5.4, libSystem.B. UUID <code>322cb148c4013ea0a0234b21a104d42f</code>. Platform macos, minos 11.0.0, sdk 26.3.0, code signature present. x86_64 at offset 16384 size 48112, arm64 at offset 65536 size 89088.</td>
         <td><span class="tag have">landed</span></td>
       </tr>
       <tr>
-        <td>PE directories</td>
-        <td><code>rea pe</code>, <code>rea_pe</code>. Data directories, a CLR-header flag, root resource type ids.</td>
-        <td>This is a header skim. It does not load a managed assembly.</td>
-        <td><span class="tag part">skim</span></td>
+        <td>PE directories and CLR streams</td>
+        <td><code>rea pe</code>, <code>rea_pe</code>. Data directories, CLR runtime header, BSJB version, stream names with offsets and sizes, CodeView PDB path, root resource type ids.</td>
+        <td>Fixture streams <code>#~</code> at offset <code>0x6c</code> size <code>0x10</code> and <code>#Strings</code> at <code>0x80</code> size <code>0x20</code>. A truncated stream list keeps the version and the complete records only. CodeView PDB 7.0 and 2.0 paths are read from the debug directory. No metadata tables and no IL.</td>
+        <td><span class="tag part">header</span></td>
       </tr>
       <tr>
         <td>ELF facts</td>
@@ -196,9 +196,15 @@
         <td><span class="tag have">landed</span></td>
       </tr>
       <tr>
+        <td>SQLite header</td>
+        <td><code>rea sqlite</code>, <code>rea_sqlite</code>. Reads the file itself. The loader still rejects a database. Page size, page count, journal versions, text encoding, schema format, user version, change counter.</td>
+        <td>A sqlite3 database: page size 4096, page count 2, write and read version 1, utf8, schema format 4, user version 7, change counter 3. No schema and no pages.</td>
+        <td><span class="tag part">header</span></td>
+      </tr>
+      <tr>
         <td>MCP surface</td>
-        <td>Thirteen tools. Failures are text <code>error: …</code>. Unknown methods are JSON-RPC <code>-32601</code>.</td>
-        <td><code>tools_list_returns_thirteen_tools</code>.</td>
+        <td>Fourteen tools. Failures are text <code>error: …</code>. Unknown methods are JSON-RPC <code>-32601</code>.</td>
+        <td><code>tools_list_returns_fourteen_tools</code>, including <code>rea_sqlite</code>.</td>
         <td><span class="tag have">landed</span></td>
       </tr>
     </tbody>
@@ -210,22 +216,31 @@
     <tbody>
       <tr><td><code>rea callgraph /bin/ls</code></td><td>143 functions, 499 edges. The sweep now follows arm64 <code>bl</code> and <code>#0x</code> operands, and seeds <code>stp x29, x30</code> prologues. These counts are a heuristic, not a ground-truth procedure list.</td></tr>
       <tr><td><code>rea callgraph</code> on <code>WAR.EXE</code></td><td>742 functions, 1,962 edges. Same as the measurement taken before the arch change.</td></tr>
-      <tr><td><code>rea macho /bin/ls</code></td><td>Unchanged: self, libutil, libncurses.5.4, libSystem.B, UUID <code>322cb148c4013ea0a0234b21a104d42f</code>.</td></tr>
+      <tr><td><code>rea macho /bin/ls</code></td><td>self, libutil, libncurses.5.4, libSystem.B, UUID <code>322cb148c4013ea0a0234b21a104d42f</code>, platform macos, minos 11.0.0, sdk 26.3.0, code signature present. Architectures x86_64 offset 16384 size 48112 and arm64 offset 65536 size 89088.</td></tr>
+      <tr><td>Thumb discovery</td><td><code>thumb_push_pop_is_a_function</code> passed. <code>WAR.EXE</code> stayed 742 / 1,962 after the <code>blx</code> and <code>pop</code>/<code>pc</code> arms, so the x86 path did not move.</td></tr>
+      <tr><td>CLR streams</td><td>Ten <code>pe_meta</code> tests passed in the workspace run, including <code>#~</code> / <code>#Strings</code>, a bad BSJB signature with empty streams, and a truncated second record that keeps the first.</td></tr>
+      <tr><td><code>rea sqlite</code></td><td>Header fields above. Three in-crate tests: a normal header, page size 1 meaning 65536, and a short or foreign file rejected.</td></tr>
+      <tr><td><code>rea sections /bin/ls</code></td><td><code>__text</code> is <code>r-x</code>. <code>__data</code> is <code>rw-</code>. Mach-O permissions come from the segment, so <code>__cstring</code> inside <code>__TEXT</code> is also <code>r-x</code>.</td></tr>
+      <tr><td><code>rea sections</code> on <code>WAR.EXE</code></td><td><code>code0</code> is <code>r-x</code> at <code>0x10000</code>. <code>data1</code> is <code>rw-</code> at <code>0x50000</code>.</td></tr>
+      <tr><td>CodeView PDB</td><td>A non-CodeView entry is skipped. PDB 7.0 path <code>hello.pdb</code>, GUID <code>04030201-0605-0807-090a-0b0c0d0e0f10</code>, age 2. PDB 2.0 has a path and no GUID. A record that does not fit is absent. No system PE was smoked.</td></tr>
       <tr><td><code>rea elf</code></td><td>Fixture test passes. A Mach-O path returns <code>parse error: elf: Invalid magic number</code>.</td></tr>
       <tr><td>Symbol seeds</td><td>Fixture: a local symbol in <code>__text</code> is a function; an import, and a local symbol in <code>__cstring</code>, are not. <code>/bin/ls</code> has no defined symbol inside <code>__text</code>, so its call graph did not move.</td></tr>
-      <tr><td><code>rea strings /bin/ls --xrefs --min-length 6</code></td><td>2 strings. Was 47 under the 32-bit pattern. Arm64 code mostly addresses strings with <code>adrp</code>/<code>add</code>, which this scan does not decode.</td></tr>
+      <tr><td><code>rea strings /bin/ls --xrefs --min-length 6</code></td><td>20 strings. Was 2 with absolute 8-byte pointers only, and 47 under the old 32-bit pattern. Hits include <code>bin/ls</code> and <code>COLUMNS</code>. An <code>add</code> consumes the ADRP page, so a later load is not reported against the stale page.</td></tr>
+      <tr><td>CLR header</td><td>Fixture: runtime 2.5, entry <code>0x06000001</code>, version <code>v4.0.30319</code>. A bad BSJB signature keeps the runtime fields and leaves the version empty. A header shorter than 24 bytes does not fail the PE parse.</td></tr>
     </tbody>
   </table>
 
-  <h3>Next in this tree</h3>
-  <p>Thumb function discovery is still empty. Arm64 and x86_64 string references that are built with <code>adrp</code>/<code>add</code> or RIP-relative loads are still missed. A full .NET reader is still open. <code>rea pe</code> only reports that a CLR header exists.</p>
+  <h3>In-process static slice</h3>
+  <div class="banner">
+    <p>Thumb discovery, Mach-O fat architectures, build version, and the code-signature flag, the CLR stream directory, the SQLite database header, section <code>rwx</code> permissions, and a CodeView PDB path are in this tree. The rows below that stay partial are still cousins of the upstream tools, not drop-in replacements. Hopper, Ghidra, IDA, JEB, Frida, browser and CDP, Android and adb, evidence sessions, decompilation, WAT execution, pre-1.18 Go pointer chasing, metadata tables, IL, and a SQLite schema walk are not in this tree.</p>
+  </div>
 
   <h3>Still out of scope</h3>
   <p>Hopper, Ghidra, IDA, JEB, Frida, browser and CDP, Android and adb, evidence sessions, decompilation, WAT execution, and pre-1.18 Go pointer chasing.</p>
 
   <div class="verdict" id="fidelity">
     <strong>Fidelity</strong>
-    <p>Shared idea: a local stdio MCP and a JSON CLI for static inspection of native binaries. That slice is wider than the first review (five tools then, thirteen now). It covers function discovery on x86, x86_64, and arm64, a direct call graph, WASM sections, Go 1.18+ build info, Mach-O dylibs and UUID, a PE directory skim, ELF interpreter and build-id, and a real LE fixup pass. It is still a different program. Tool names do not match. There is no Evidence record, no provider session, and the protocol stays <code>2024-11-05</code> with text results. LE / DOS/4GW is original work. Upstream has no Watcom LE contract.</p>
+    <p>Shared idea: a local stdio MCP and a JSON CLI for static inspection of native binaries. That slice is wider than the first review (five tools then, fourteen now). It covers function discovery on x86, x86_64, arm64, and Thumb, a direct call graph, WASM sections, Go 1.18+ build info, Mach-O dylibs, UUID, build version, a code-signature flag, and fat architectures, a PE directory skim plus a CLR header and stream directory, ELF interpreter and build-id, a SQLite database header, and a real LE fixup pass. It is still a different program. Tool names do not match. There is no Evidence record, no provider session, and the protocol stays <code>2024-11-05</code> with text results. LE / DOS/4GW is original work. Upstream has no Watcom LE contract.</p>
   </div>
 
   <h2>What each side is</h2>
@@ -234,12 +249,12 @@
     <tbody>
       <tr><td>Shape</td><td>Three Rust crates, v0.1.0. goblin loads Mach-O (including fat), ELF, and PE. A hand-rolled LE parser runs first, because goblin peeks those files as PE. Capstone disassembles. MCP is a hand-rolled JSON-RPC loop.</td><td>TypeScript package <code>rea-agents</code>, 2,500+ commits. Analysis is delegated to Hopper, Ghidra, IDA, or JEB, plus many format parsers.</td></tr>
       <tr><td>Own words</td><td>README: “clean-room Rust implementation of the MCP reverse-engineering toolkit concept (inspired by morluto/rea).”</td><td>README: “One MCP for reverse engineering across binaries, applications, and runtime behavior.”</td></tr>
-      <tr><td>MCP surface</td><td>Thirteen tools, listed below. Errors are text. Notifications are dropped.</td><td>About 150 tool contracts under <code>src/contracts</code>, plus prompts. Results carry Evidence, structured content, sessions, progress, and cancellation.</td></tr>
-      <tr><td>CLI</td><td><code>info</code>, <code>sections</code>, <code>symbols</code>, <code>strings</code>, <code>disasm</code>, <code>funcs</code>, <code>xrefs</code>, <code>callgraph</code>, <code>wasm</code>, <code>goinfo</code>, <code>macho</code>, <code>pe</code>, <code>elf</code>, <code>mcp</code>.</td><td><code>npx rea-agents setup</code> registers agents. The CLI shares the evidence workflows with MCP.</td></tr>
+      <tr><td>MCP surface</td><td>Fourteen tools, listed below. Errors are text. Notifications are dropped.</td><td>About 150 tool contracts under <code>src/contracts</code>, plus prompts. Results carry Evidence, structured content, sessions, progress, and cancellation.</td></tr>
+      <tr><td>CLI</td><td><code>info</code>, <code>sections</code>, <code>symbols</code>, <code>strings</code>, <code>disasm</code>, <code>funcs</code>, <code>xrefs</code>, <code>callgraph</code>, <code>wasm</code>, <code>goinfo</code>, <code>macho</code>, <code>pe</code>, <code>elf</code>, <code>sqlite</code>, <code>mcp</code>.</td><td><code>npx rea-agents setup</code> registers agents. The CLI shares the evidence workflows with MCP.</td></tr>
     </tbody>
   </table>
   <div class="chips">
-    <span>rea_info</span><span>rea_sections</span><span>rea_symbols</span><span>rea_strings</span><span>rea_disasm</span><span>rea_funcs</span><span>rea_xrefs</span><span>rea_call_graph</span><span>rea_wasm</span><span>rea_go</span><span>rea_macho</span><span>rea_pe</span><span>rea_elf</span>
+    <span>rea_info</span><span>rea_sections</span><span>rea_symbols</span><span>rea_strings</span><span>rea_disasm</span><span>rea_funcs</span><span>rea_xrefs</span><span>rea_call_graph</span><span>rea_wasm</span><span>rea_go</span><span>rea_macho</span><span>rea_pe</span><span>rea_sqlite</span><span>rea_elf</span>
   </div>
 
   <h2 id="overlap">Where the native slice lines up</h2>
@@ -255,7 +270,7 @@
       </tr>
       <tr>
         <td>Sections</td>
-        <td><code>rea_sections</code> — goblin headers, or LE objects</td>
+        <td><code>rea_sections</code> — goblin headers or LE objects, plus an <code>rwx</code> string. Mach-O uses the segment's initial protection. ELF reports <code>SHF_ALLOC</code> as readable. PE and LE use their read, write, and execute bits. No overlays.</td>
         <td><code>list_segments</code> — provider memory blocks, permissions, overlays</td>
         <td><span class="tag part">partial</span></td>
       </tr>
@@ -279,19 +294,19 @@
       </tr>
       <tr>
         <td>Functions and calls</td>
-        <td><code>rea_funcs</code>, <code>rea_call_graph</code> — entry, text-section symbols, prologues, and direct calls on x86, x86_64, and arm64. Bodies follow a forward <code>jmp</code> or <code>b</code>. Thumb is not scanned.</td>
+        <td><code>rea_funcs</code>, <code>rea_call_graph</code> — entry, text-section symbols, prologues, and direct calls on x86, x86_64, arm64, and Thumb. Bodies follow a forward <code>jmp</code> or <code>b</code>.</td>
         <td><code>list_procedures</code>, <code>analyze_function</code>, <code>get_call_graph</code>, <code>procedure_pseudo_code</code></td>
         <td><span class="tag part">partial</span></td>
       </tr>
       <tr>
         <td>Cross-references</td>
-        <td><code>rea_xrefs</code> — little-endian absolute pointers, 8 bytes on 64-bit targets and 4 bytes otherwise. Not <code>adrp</code> or RIP-relative.</td>
+        <td><code>rea_xrefs</code> — absolute pointers at the binary's pointer width, plus arm64 <code>adrp</code>+<code>add</code>/<code>ldr</code> and x86_64 RIP-relative loads in <code>__text</code> / <code>.text</code>.</td>
         <td><code>xrefs</code>, <code>procedure_references</code>, <code>find_xrefs_to_name</code></td>
         <td><span class="tag part">partial</span></td>
       </tr>
       <tr>
         <td>Mach-O facts</td>
-        <td><code>rea_macho</code> — dylibs and UUID</td>
+        <td><code>rea_macho</code> — dylibs, UUID, build version, a code-signature flag, and fat architecture offsets</td>
         <td><code>inspect_macho</code> and a much wider header and signature surface</td>
         <td><span class="tag part">partial</span></td>
       </tr>
@@ -303,7 +318,7 @@
       </tr>
       <tr>
         <td>Go and WASM</td>
-        <td><code>rea_go</code> (1.18+ inline build info), <code>rea_wasm</code> (sections, imports, exports)</td>
+        <td><code>rea_go</code> (1.18+ inline build info), <code>rea_wasm</code> (sections, imports, exports), <code>rea_sqlite</code> (100-byte database header)</td>
         <td><code>inspect_go_binary</code>, <code>inspect_wasm_artifact</code></td>
         <td><span class="tag part">partial</span></td>
       </tr>
@@ -334,14 +349,14 @@
     <thead><tr><th>Area</th><th>Tools</th><th>rea-rs</th></tr></thead>
     <tbody>
       <tr><td>Hopper / Ghidra / IDA bridge</td><td>40</td><td><span class="tag low">out of scope</span></td></tr>
-      <tr><td>Enhanced native (overview, ObjC, Swift, value and UI trace)</td><td>12</td><td><span class="tag part">local call graph on x86, x86_64, arm64</span></td></tr>
+      <tr><td>Enhanced native (overview, ObjC, Swift, value and UI trace)</td><td>12</td><td><span class="tag part">local call graph on x86, x86_64, arm64, Thumb</span></td></tr>
       <tr><td>Session, evidence, comparisons</td><td>21</td><td><span class="tag low">out of scope</span></td></tr>
-      <tr><td>File-level extras (signature, plist, crash, layout, PE resources)</td><td>12</td><td><span class="tag part">Mach-O UUID, ELF build-id, PE directory skim</span></td></tr>
+      <tr><td>File-level extras (signature, plist, crash, layout, PE resources)</td><td>12</td><td><span class="tag part">section rwx; Mach-O UUID, build version, code-signature flag, fat arches; ELF build-id; PE directories and CodeView PDB path</span></td></tr>
       <tr><td>JavaScript, Electron, web, browser</td><td>32</td><td><span class="tag low">out of scope</span></td></tr>
       <tr><td>Android, adb, apktool, JEB</td><td>35</td><td><span class="tag low">out of scope</span></td></tr>
-      <tr><td>.NET / managed</td><td>7</td><td><span class="tag part">CLR flag only</span></td></tr>
+      <tr><td>.NET / managed</td><td>7</td><td><span class="tag part">CLR header, version, stream directory. No tables or IL</span></td></tr>
       <tr><td>Frida</td><td>9</td><td><span class="tag low">out of scope</span></td></tr>
-      <tr><td>Go, WASM, EVM, SQLite, firmware, Flutter, packets, signals</td><td>11</td><td><span class="tag part">Go 1.18+ and WASM MVP</span></td></tr>
+      <tr><td>Go, WASM, EVM, SQLite, firmware, Flutter, packets, signals</td><td>11</td><td><span class="tag part">Go 1.18+, WASM sections, SQLite header</span></td></tr>
       <tr><td>Artifact inventory (bundles, nibs, asset catalogs)</td><td>6</td><td><span class="tag low">missing</span></td></tr>
     </tbody>
   </table>
@@ -350,7 +365,7 @@
   <ul>
     <li>One <code>Target</code> for Mach-O, ELF, PE, and LE, with virtual-address to file-offset translation. Fat Mach-O picks a host slice.</li>
     <li>LE is recognized before goblin. Fixup page bases use the object page map. A bad page-table slot or a short record returns <code>Err</code>.</li>
-    <li>Function bodies follow a forward <code>jmp</code> or arm64 <code>b</code>, and stop at <code>ret</code>, <code>retf</code>, and an indirect or backward jump. <code>rea callgraph</code> on <code>WAR.EXE</code> reports 742 functions and 1,962 edges after the arm64 pass, the same as before it. The Warcraft note still says 2,386 call edges. That older tally was not what this CLI printed.</li>
+    <li>Function bodies follow a forward <code>jmp</code> or arm64 <code>b</code>, and stop at <code>ret</code>, <code>retf</code>, Thumb <code>bx lr</code>, Thumb <code>pop</code> of <code>pc</code>, and an indirect or backward jump. <code>rea callgraph</code> on <code>WAR.EXE</code> reports 742 functions and 1,962 edges after the Thumb arms, the same as before them. The Warcraft note still says 2,386 call edges. That older tally was not what this CLI printed.</li>
     <li>The Warcraft note in <code>docs/warcraft-1-demo-re.md</code> matches the corrected record order and the 8,457 / <code>0x109eb</code> check.</li>
   </ul>
 

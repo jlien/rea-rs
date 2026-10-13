@@ -11,6 +11,8 @@
 //! - Data cross-references come from searching code bytes for the
 //!   little-endian address: 4 bytes when `bits < 64`, 8 bytes otherwise
 //!   (covers `mov reg, [addr]`, `push [addr]`, and immediate loads).
+//!   Arm64 and x86_64 also record PC-relative addresses in `__text` / `.text`
+//!   (`adrp` plus `add` or a load, and RIP-relative memory operands).
 
 use crate::{disasm, strings, Arch, SymbolKind, Target};
 use std::collections::{BTreeMap, BTreeSet};
@@ -37,12 +39,16 @@ fn code_sections(target: &Target) -> impl Iterator<Item = &crate::Section> {
     target.sections.iter().filter(|s| s.size > 0)
 }
 
-/// Linear-sweep a code section, returning every direct `call`/`bl` target.
-/// Recovers from invalid bytes by advancing one byte, so the whole section
-/// gets covered (mixed code/data in flat 32-bit images). `blr` is indirect
-/// and is not recorded. Arm and unknown arches have no sweep.
+/// Linear-sweep a code section, returning every direct `call`/`bl`/`blx`
+/// target. Recovers from invalid bytes by advancing one byte, so the whole
+/// section gets covered (mixed code/data in flat 32-bit images). `blr` is
+/// indirect and is not recorded. `bl` is exact, so it does not match `blr`
+/// or `b.ne`. Unknown arches have no sweep.
 fn sweep_call_targets(target: &Target, sec: &crate::Section) -> Vec<u64> {
-    if !matches!(target.arch, Arch::X86 | Arch::X86_64 | Arch::Arm64) {
+    if !matches!(
+        target.arch,
+        Arch::X86 | Arch::X86_64 | Arch::Arm64 | Arch::Arm
+    ) {
         return Vec::new();
     }
     let Ok(mut cs) = disasm::build_capstone(target.arch) else {
@@ -66,7 +72,7 @@ fn sweep_call_targets(target: &Target, sec: &crate::Section) -> Vec<u64> {
                 let mut consumed = 0usize;
                 for ins in insns.iter() {
                     consumed += ins.bytes().len();
-                    if matches!(ins.mnemonic().unwrap_or(""), "call" | "bl") {
+                    if matches!(ins.mnemonic().unwrap_or(""), "call" | "bl" | "blx") {
                         if let Some(t) = direct_target(ins.op_str().unwrap_or("")) {
                             targets.push(t);
                         }
@@ -83,7 +89,8 @@ fn sweep_call_targets(target: &Target, sec: &crate::Section) -> Vec<u64> {
 /// Frame-pointer prologues in a code section.
 /// x86: `push ebp; mov ebp, esp`. x86_64: `push rbp; mov rbp, rsp`.
 /// arm64: `stp x29, x30, [sp, #imm]!` or `stp x29, x30, [sp, #imm]`,
-/// at 4-byte-aligned virtual addresses. Arm and unknown yield nothing.
+/// at 4-byte-aligned virtual addresses. Arm Thumb: `push {r7, lr}`
+/// (`80 b5`) at even virtual addresses. Unknown yields nothing.
 fn prologue_starts(target: &Target, sec: &crate::Section) -> Vec<u64> {
     let start = sec.file_offset as usize;
     let end = start + sec.size as usize;
@@ -94,7 +101,8 @@ fn prologue_starts(target: &Target, sec: &crate::Section) -> Vec<u64> {
         Arch::X86 => scan_prologue_bytes(target, sec, start, end, &[0x55, 0x8b, 0xec]),
         Arch::X86_64 => scan_prologue_bytes(target, sec, start, end, &[0x55, 0x48, 0x89, 0xe5]),
         Arch::Arm64 => scan_arm64_stp_prologues(target, sec, start, end),
-        Arch::Arm | Arch::Unknown => Vec::new(),
+        Arch::Arm => scan_thumb_push_prologues(target, sec, start, end),
+        Arch::Unknown => Vec::new(),
     }
 }
 
@@ -144,6 +152,26 @@ fn scan_arm64_stp_prologues(
     out
 }
 
+fn scan_thumb_push_prologues(
+    target: &Target,
+    sec: &crate::Section,
+    start: usize,
+    end: usize,
+) -> Vec<u64> {
+    let mut out = Vec::new();
+    // Thumb sites are 2-byte aligned. Skip one byte when the section address
+    // is odd so the first site is an even virtual address.
+    let misalign = (sec.addr as usize) % 2;
+    let mut i = start + misalign;
+    while i + 2 <= end {
+        if target.bytes[i] == 0x80 && target.bytes[i + 1] == 0xb5 {
+            out.push(sec.addr + (i - start) as u64);
+        }
+        i += 2;
+    }
+    out
+}
+
 /// Follow control flow from `start`, returning (body extent, call targets).
 /// Unlike a plain linear run this handles forward unconditional jumps
 /// (`jmp`, `b`), stops at `ret`, indirect jumps (`br` / register `jmp`),
@@ -169,13 +197,23 @@ fn function_body(target: &Target, start: u64, max: u64) -> (u64, Vec<u64>) {
             visited.insert(ins.addr);
             end = end.max(ins.addr + ins.size as u64);
             match ins.mnemonic.as_str() {
-                // Exact mnemonics: `b` must not swallow `bl` or `b.ne`.
-                "call" | "bl" | "blr" => {
+                // Exact mnemonics: `b` must not swallow `bl` or `b.ne`,
+                // and `bl` must not swallow `blr`. Thumb `blx` is a call.
+                "call" | "bl" | "blr" | "blx" => {
                     if let Some(t) = direct_target(&ins.operands) {
                         calls.push(t);
                     }
                 }
                 "ret" | "retf" => {
+                    jumped = false;
+                    break;
+                }
+                // Thumb returns. A bare `bx` or `pop` is not one.
+                "bx" if ins.operands.contains("lr") => {
+                    jumped = false;
+                    break;
+                }
+                "pop" if ins.operands.contains("pc") => {
                     jumped = false;
                     break;
                 }
@@ -327,14 +365,164 @@ pub fn call_graph(functions: &[Function]) -> CallGraph {
     CallGraph { edges, callers }
 }
 
+/// PC-relative data addresses in `__text` and `.text` only.
+///
+/// Arm64 keeps a map from the destination register to the ADRP page.
+/// `add` of that register emits `page + imm` and drops the page, because the
+/// register now holds the full address. `ldr` / `ldrb` / `ldrh` / `ldrsw`
+/// from a still-live page emit `page + disp`. Any other write of a mapped
+/// register drops it. x86_64 emits `insn + len + disp` for each RIP-relative
+/// memory operand with no index. Every other architecture is left alone.
+fn pc_relative_index(target: &Target) -> BTreeMap<u64, Vec<u64>> {
+    let mut index = BTreeMap::new();
+    if !matches!(target.arch, Arch::Arm64 | Arch::X86_64) {
+        return index;
+    }
+    let Ok(mut cs) = disasm::build_capstone(target.arch) else {
+        return index;
+    };
+    if cs.set_detail(true).is_err() {
+        return index;
+    }
+    for sec in target
+        .sections
+        .iter()
+        .filter(|sec| sec.size > 0 && matches!(sec.name.as_str(), "__text" | ".text"))
+    {
+        let start = sec.file_offset as usize;
+        let end = (start + sec.size as usize).min(target.bytes.len());
+        if start >= end {
+            continue;
+        }
+        let Ok(insns) = cs.disasm_all(&target.bytes[start..end], sec.addr) else {
+            continue;
+        };
+        match target.arch {
+            Arch::Arm64 => collect_arm64_pc_rel(&cs, insns.as_ref(), &mut index),
+            Arch::X86_64 => collect_x86_64_pc_rel(&cs, insns.as_ref(), &mut index),
+            _ => {}
+        }
+    }
+    index
+}
+
+fn collect_arm64_pc_rel(
+    cs: &capstone::Capstone,
+    insns: &[capstone::Insn<'_>],
+    index: &mut BTreeMap<u64, Vec<u64>>,
+) {
+    use capstone::arch::arm64::Arm64OperandType::{Imm, Mem, Reg};
+    use capstone::arch::DetailsArchInsn;
+    // Register id -> ADRP page. `add` of that register consumes the page.
+    let mut pages: BTreeMap<u16, u64> = BTreeMap::new();
+    for ins in insns {
+        let Ok(detail) = cs.insn_detail(ins) else {
+            continue;
+        };
+        let arch = detail.arch_detail();
+        let Some(arm) = arch.arm64() else {
+            continue;
+        };
+        let ops: Vec<_> = arm.operands().map(|op| op.op_type).collect();
+        let mnem = ins.mnemonic().unwrap_or("");
+        let from = ins.address();
+        let handled = match mnem {
+            "adrp" => match ops.as_slice() {
+                [Reg(dest), Imm(page)] if *page >= 0 => {
+                    pages.insert(dest.0, *page as u64);
+                    true
+                }
+                _ => false,
+            },
+            "add" => match ops.as_slice() {
+                [Reg(dest), Reg(src), Imm(off)] if *off >= 0 => {
+                    if let Some(&page) = pages.get(&src.0) {
+                        index
+                            .entry(page.wrapping_add(*off as u64))
+                            .or_default()
+                            .push(from);
+                        // The destination now holds the full address, not the page.
+                        pages.remove(&dest.0);
+                        true
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            },
+            "ldr" | "ldrb" | "ldrh" | "ldrsw" => {
+                let mut hit = false;
+                for op in &ops {
+                    let Mem(mem) = op else {
+                        continue;
+                    };
+                    let Some(&page) = pages.get(&mem.base().0) else {
+                        continue;
+                    };
+                    hit = true;
+                    if mem.disp() >= 0 {
+                        index
+                            .entry(page + mem.disp() as u64)
+                            .or_default()
+                            .push(from);
+                    }
+                }
+                hit
+            }
+            _ => false,
+        };
+        if !handled {
+            if let Some(Reg(dest)) = ops.first() {
+                pages.remove(&dest.0);
+            }
+        }
+    }
+}
+
+fn collect_x86_64_pc_rel(
+    cs: &capstone::Capstone,
+    insns: &[capstone::Insn<'_>],
+    index: &mut BTreeMap<u64, Vec<u64>>,
+) {
+    use capstone::arch::x86::X86OperandType::Mem;
+    use capstone::arch::DetailsArchInsn;
+    // Capstone's X86_REG_RIP. The absolute address is not in the immediate.
+    const X86_REG_RIP: u16 = 41;
+    for ins in insns {
+        let Ok(detail) = cs.insn_detail(ins) else {
+            continue;
+        };
+        let arch = detail.arch_detail();
+        let Some(x86) = arch.x86() else {
+            continue;
+        };
+        let from = ins.address();
+        let next = from.wrapping_add(ins.bytes().len() as u64);
+        for op in x86.operands() {
+            let Mem(mem) = op.op_type else {
+                continue;
+            };
+            if mem.base().0 == X86_REG_RIP && mem.index().0 == 0 {
+                let to = next.wrapping_add(mem.disp() as u64);
+                index.entry(to).or_default().push(from);
+            }
+        }
+    }
+}
+
 /// Find locations that reference `addr`. The needle is 8 little-endian bytes
 /// when `bits >= 64`, otherwise the 4-byte little-endian value. This
 /// over-matches (any byte pattern equal to the address). A 4-byte prefix is
-/// not a hit on a 64-bit target.
+/// not a hit on a 64-bit target. Arm64 and x86_64 text also contribute
+/// PC-relative hits. Results are sorted by `from` and deduped.
 pub fn data_xrefs(target: &Target, addr: u64) -> Vec<XRef> {
     let needle8 = addr.to_le_bytes();
     let needle4 = (addr as u32).to_le_bytes();
-    let needle: &[u8] = if target.bits >= 64 { &needle8 } else { &needle4 };
+    let needle: &[u8] = if target.bits >= 64 {
+        &needle8
+    } else {
+        &needle4
+    };
     let width = needle.len();
     let mut out = Vec::new();
     for sec in code_sections(target) {
@@ -351,6 +539,14 @@ pub fn data_xrefs(target: &Target, addr: u64) -> Vec<XRef> {
             i += 1;
         }
     }
+    let pcrel = pc_relative_index(target);
+    if let Some(froms) = pcrel.get(&addr) {
+        for &from in froms {
+            out.push(XRef { from, to: addr });
+        }
+    }
+    out.sort_by_key(|xref| xref.from);
+    out.dedup_by(|a, b| a.from == b.from);
     out
 }
 
@@ -403,11 +599,14 @@ fn code_pointer_index(target: &Target) -> BTreeMap<u64, Vec<u64>> {
 /// the text start.
 pub fn strings_with_xrefs(target: &Target, min_len: usize) -> Vec<AnnotatedString> {
     let index = code_pointer_index(target);
+    let pcrel = pc_relative_index(target);
     let mut out = Vec::new();
     for hit in strings::extract(&target.bytes, min_len) {
-        let Some(sec) = target.sections.iter().find(|s| {
-            hit.offset >= s.file_offset && hit.offset < s.file_offset + s.size
-        }) else {
+        let Some(sec) = target
+            .sections
+            .iter()
+            .find(|s| hit.offset >= s.file_offset && hit.offset < s.file_offset + s.size)
+        else {
             continue;
         };
         let vaddr = sec.addr + (hit.offset - sec.file_offset);
@@ -423,6 +622,9 @@ pub fn strings_with_xrefs(target: &Target, min_len: usize) -> Vec<AnnotatedStrin
                 u64::from(p as u32)
             };
             if let Some(locs) = index.get(&key) {
+                refs.extend_from_slice(locs);
+            }
+            if let Some(locs) = pcrel.get(&p) {
                 refs.extend_from_slice(locs);
             }
             p += 1;
@@ -468,6 +670,7 @@ mod tests {
                 addr: 0x1000,
                 size: bytes.len() as u64,
                 file_offset: 0,
+                perms: "---".into(),
             }],
             symbols: vec![],
             bytes,
@@ -521,6 +724,7 @@ mod tests {
                 addr: 0x1000,
                 size: code.len() as u64,
                 file_offset: 0,
+                perms: "---".into(),
             }],
             symbols: vec![],
             bytes,
@@ -547,6 +751,22 @@ mod tests {
         let entry = funcs.iter().find(|f| f.addr == 0x1000).expect("entry");
         assert_eq!(entry.calls, vec![0x100f]);
         assert!(funcs.iter().any(|f| f.addr == 0x100f));
+    }
+
+    #[test]
+    fn thumb_push_pop_is_a_function() {
+        // push {r7, lr}; pop {r7, pc}
+        let code = [0x80, 0xb5, 0x80, 0xbd];
+        let funcs = discover_functions(&synthetic_code(Arch::Arm, 32, &code));
+        let entry = funcs
+            .iter()
+            .find(|f| f.addr == 0x1000)
+            .expect("thumb entry");
+        assert!(
+            entry.size <= 8,
+            "size {} (pop should stop the body)",
+            entry.size
+        );
     }
 
     #[test]
@@ -588,6 +808,7 @@ mod tests {
                 addr: 0x1000,
                 size: 1,
                 file_offset: 0,
+                perms: "---".into(),
             }],
             symbols: vec![crate::Symbol {
                 addr: 0x1000,
@@ -628,6 +849,7 @@ mod tests {
                 addr: 0x1000,
                 size: bytes.len() as u64,
                 file_offset: 0,
+                perms: "---".into(),
             }],
             symbols: vec![],
             bytes: bytes.to_vec(),
@@ -654,5 +876,136 @@ mod tests {
         let hits = strings_with_xrefs(&target, 4);
         let hello = hits.iter().find(|s| s.value == "hello").expect("hello");
         assert!(hello.refs.contains(&0x1000));
+    }
+
+    fn flat_target(arch: Arch, bits: u8, sections: Vec<crate::Section>, bytes: Vec<u8>) -> Target {
+        Target {
+            path: "synthetic".into(),
+            format: crate::Format::Elf,
+            arch,
+            bits,
+            little_endian: true,
+            entry: 0,
+            sections,
+            symbols: vec![],
+            bytes,
+            page_map: None,
+        }
+    }
+
+    #[test]
+    fn arm64_adrp_add_is_an_xref() {
+        let bytes = vec![0x00, 0x00, 0x00, 0xb0, 0x00, 0x80, 0x00, 0x91];
+        let target = flat_target(
+            Arch::Arm64,
+            64,
+            vec![crate::Section {
+                name: "__text".into(),
+                addr: 0x1000,
+                size: 8,
+                file_offset: 0,
+                perms: "---".into(),
+            }],
+            bytes,
+        );
+        let refs = data_xrefs(&target, 0x2020);
+        assert_eq!(
+            refs.iter().filter(|r| r.from == 0x1004).count(),
+            1,
+            "{refs:?}"
+        );
+    }
+
+    #[test]
+    fn arm64_adrp_ldr_is_an_xref() {
+        // adrp x0, #0x2000; ldr x1, [x0, #8] — no add in between.
+        let bytes = vec![0x00, 0x00, 0x00, 0xb0, 0x01, 0x04, 0x40, 0xf9];
+        let target = flat_target(
+            Arch::Arm64,
+            64,
+            vec![crate::Section {
+                name: "__text".into(),
+                addr: 0x1000,
+                size: 8,
+                file_offset: 0,
+                perms: "---".into(),
+            }],
+            bytes,
+        );
+        let refs = data_xrefs(&target, 0x2008);
+        assert!(refs.iter().any(|r| r.from == 0x1004), "{refs:?}");
+    }
+
+    #[test]
+    fn arm64_add_consumes_the_adrp_page() {
+        // adrp; add x0, x0, #0x20; ldr x1, [x0, #8]
+        // The load is not a reference to the stale page.
+        let bytes = vec![
+            0x00, 0x00, 0x00, 0xb0, 0x00, 0x80, 0x00, 0x91, 0x01, 0x04, 0x40, 0xf9,
+        ];
+        let target = flat_target(
+            Arch::Arm64,
+            64,
+            vec![crate::Section {
+                name: "__text".into(),
+                addr: 0x1000,
+                size: 12,
+                file_offset: 0,
+                perms: "---".into(),
+            }],
+            bytes,
+        );
+        assert!(data_xrefs(&target, 0x2020).iter().any(|r| r.from == 0x1004));
+        assert!(data_xrefs(&target, 0x2008).is_empty());
+    }
+
+    #[test]
+    fn x86_64_rip_relative_is_an_xref() {
+        let bytes = vec![0x48, 0x8b, 0x05, 0xb8, 0x13, 0x00, 0x00];
+        let target = flat_target(
+            Arch::X86_64,
+            64,
+            vec![crate::Section {
+                name: ".text".into(),
+                addr: 0x1000,
+                size: 7,
+                file_offset: 0,
+                perms: "---".into(),
+            }],
+            bytes,
+        );
+        let refs = data_xrefs(&target, 0x23bf);
+        assert!(refs.iter().any(|r| r.from == 0x1000), "{refs:?}");
+        assert!(data_xrefs(&target, 0x13b8).is_empty());
+    }
+
+    #[test]
+    fn string_xref_follows_adrp_add() {
+        let mut bytes = vec![0x00, 0x00, 0x00, 0xb0, 0x00, 0x80, 0x00, 0x91];
+        bytes.extend_from_slice(b"hello\0");
+        let target = flat_target(
+            Arch::Arm64,
+            64,
+            vec![
+                crate::Section {
+                    name: "__text".into(),
+                    addr: 0x1000,
+                    size: 8,
+                    file_offset: 0,
+                    perms: "---".into(),
+                },
+                crate::Section {
+                    name: "__cstring".into(),
+                    addr: 0x2020,
+                    size: 6,
+                    file_offset: 8,
+                    perms: "---".into(),
+                },
+            ],
+            bytes,
+        );
+        let hits = strings_with_xrefs(&target, 4);
+        let hello = hits.iter().find(|s| s.value == "hello").expect("hello");
+        assert!(hello.refs.contains(&0x1004), "{:?}", hello.refs);
     }
 }

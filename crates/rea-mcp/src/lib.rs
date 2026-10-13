@@ -91,10 +91,12 @@ fn handle_tool_call(msg: &Value) -> Result<Value, String> {
         .and_then(Value::as_str)
         .ok_or("missing required argument: path")?;
 
-    if name == "rea_wasm" || name == "rea_go" {
+    if name == "rea_wasm" || name == "rea_go" || name == "rea_sqlite" {
         let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
         let value = if name == "rea_wasm" {
             json!(rea_core::wasm::inspect(&bytes).map_err(|e| e.to_string())?)
+        } else if name == "rea_sqlite" {
+            json!(rea_core::sqlite::header(&bytes).map_err(|e| e.to_string())?)
         } else {
             match rea_core::goinfo::find_build_info(&bytes).map_err(|e| e.to_string())? {
                 Some(info) => json!({
@@ -196,7 +198,13 @@ fn handle_tool_call(msg: &Value) -> Result<Value, String> {
                 })
             }
             "rea_macho" => {
-                json!(rea_core::macho_meta::facts(&target.bytes).map_err(|e| e.to_string())?)
+                let facts = rea_core::macho_meta::facts(&target.bytes).map_err(|e| e.to_string())?;
+                let file = std::fs::read(path).map_err(|e| e.to_string())?;
+                let architectures =
+                    rea_core::macho_meta::architectures(&file).map_err(|e| e.to_string())?;
+                let mut value = serde_json::to_value(facts).map_err(|e| e.to_string())?;
+                value["architectures"] = json!(architectures);
+                value
             }
             "rea_pe" => {
                 json!(rea_core::pe_meta::facts(&target.bytes).map_err(|e| e.to_string())?)
@@ -241,7 +249,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "rea_sections",
-            "description": "List sections of a binary with names, virtual addresses, sizes, and file offsets.",
+            "description": "List sections of a binary with names, virtual addresses, sizes, file offsets, and rwx permissions.",
             "inputSchema": schema(true, json!({}), &[]),
         }),
         json!({
@@ -274,7 +282,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "rea_xrefs",
-            "description": "Find code locations referencing an address (32-bit data xrefs).",
+            "description": "Find code locations referencing an address. Absolute pointers use the target pointer width. Text also includes arm64 ADRP and x86_64 RIP-relative loads.",
             "inputSchema": schema(false, json!({
                 "address": { "type": "integer", "description": "Address to find references to" }
             }), &["address"]),
@@ -296,12 +304,17 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "rea_macho",
-            "description": "Mach-O dylibs and UUID for one slice. Fat binaries are resolved to the host slice first.",
+            "description": "Mach-O dylibs, UUID, build version, code signature, and fat architectures. Slice facts use the host slice. Architectures come from the original file.",
             "inputSchema": schema(true, json!({}), &[]),
         }),
         json!({
             "name": "rea_pe",
-            "description": "PE data directories, whether a CLR header is present, and root resource type ids.",
+            "description": "PE data directories, CLR runtime header, metadata version, stream names, CodeView PDB path, and root resource type ids.",
+            "inputSchema": schema(true, json!({}), &[]),
+        }),
+        json!({
+            "name": "rea_sqlite",
+            "description": "SQLite database header: page size, page count, text encoding, and schema format. Does not read pages.",
             "inputSchema": schema(true, json!({}), &[]),
         }),
         json!({
@@ -334,10 +347,13 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_returns_thirteen_tools() {
+    fn tools_list_returns_fourteen_tools() {
         let (lines, _) = exchange(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#);
         let v: Value = serde_json::from_str(&lines[0]).unwrap();
-        assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 13);
+        let tools = v["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 14);
+        let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        assert!(names.contains(&"rea_sqlite"));
     }
 
     #[test]

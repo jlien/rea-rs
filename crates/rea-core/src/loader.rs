@@ -105,11 +105,17 @@ fn macho_target(mo: goblin::mach::MachO, bytes: Vec<u8>, path: String) -> Result
             .map_err(|e| Error::Parse(format!("sections: {e}")))?
         {
             let name = String::from_utf8_lossy(&sect.sectname).trim_end_matches('\0').to_string();
+            let prot = seg.initprot;
             sections.push(Section {
                 name,
                 addr: u64::from(sect.addr),
                 size: u64::from(sect.size),
                 file_offset: u64::from(sect.offset),
+                perms: crate::section_perms(
+                    prot & goblin::mach::constants::VM_PROT_READ != 0,
+                    prot & goblin::mach::constants::VM_PROT_WRITE != 0,
+                    prot & goblin::mach::constants::VM_PROT_EXECUTE != 0,
+                ),
             });
         }
     }
@@ -167,14 +173,19 @@ fn load_elf(bytes: Vec<u8>, path: String) -> Result<Target> {
         .section_headers
         .iter()
         .enumerate()
-        .map(|(i, sh)| Section {
-            name: shstr
-                .get_at(i)
-                .unwrap_or("")
-                .to_string(),
-            addr: sh.sh_addr,
-            size: sh.sh_size,
-            file_offset: sh.sh_offset,
+        .map(|(i, sh)| {
+            let flags = sh.sh_flags;
+            Section {
+                name: shstr.get_at(i).unwrap_or("").to_string(),
+                addr: sh.sh_addr,
+                size: sh.sh_size,
+                file_offset: sh.sh_offset,
+                perms: crate::section_perms(
+                    flags & u64::from(goblin::elf::section_header::SHF_ALLOC) != 0,
+                    flags & u64::from(goblin::elf::section_header::SHF_WRITE) != 0,
+                    flags & u64::from(goblin::elf::section_header::SHF_EXECINSTR) != 0,
+                ),
+            }
         })
         .collect();
 
@@ -232,11 +243,19 @@ fn load_pe(bytes: Vec<u8>, path: String) -> Result<Target> {
     let sections: Vec<Section> = pe
         .sections
         .iter()
-        .map(|s| Section {
-            name: String::from_utf8_lossy(&s.name).trim_end_matches('\0').to_string(),
-            addr: u64::from(s.virtual_address),
-            size: u64::from(s.virtual_size),
-            file_offset: u64::from(s.pointer_to_raw_data),
+        .map(|s| {
+            let flags = s.characteristics;
+            Section {
+                name: String::from_utf8_lossy(&s.name).trim_end_matches('\0').to_string(),
+                addr: u64::from(s.virtual_address),
+                size: u64::from(s.virtual_size),
+                file_offset: u64::from(s.pointer_to_raw_data),
+                perms: crate::section_perms(
+                    flags & goblin::pe::section_table::IMAGE_SCN_MEM_READ != 0,
+                    flags & goblin::pe::section_table::IMAGE_SCN_MEM_WRITE != 0,
+                    flags & goblin::pe::section_table::IMAGE_SCN_MEM_EXECUTE != 0,
+                ),
+            }
         })
         .collect();
 
