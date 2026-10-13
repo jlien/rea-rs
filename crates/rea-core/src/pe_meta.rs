@@ -31,7 +31,7 @@ pub struct PePdb {
     pub age: u32,
 }
 
-/// Leading `IMAGE_COR20_HEADER` fields, the BSJB version string, metadata stream headers, table row counts, and type, field, and method names.
+/// Leading `IMAGE_COR20_HEADER` fields, the BSJB version string, metadata stream headers, table row counts, and type, field, method, and parameter names.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ClrHeader {
     pub major_runtime: u16,
@@ -46,7 +46,7 @@ pub struct ClrHeader {
     pub streams: Vec<ClrStream>,
     /// Row counts from the `#~` stream, or `#-` when `#~` is absent. Empty when that stream is missing or shorter than its header.
     pub tables: Vec<ClrTable>,
-    /// Names from `Module`, `TypeRef`, and `TypeDef`, with `Field` and `MethodDef` names on each `TypeDef`. Empty when the string heap or those rows are missing. Other table rows and IL are not read.
+    /// Names from `Module`, `TypeRef`, and `TypeDef`, with `Field` and `MethodDef` names on each `TypeDef` and `Param` names on each method. Empty when the string heap or those rows are missing. Other table rows and IL are not read.
     pub types: Vec<ClrType>,
 }
 
@@ -59,8 +59,16 @@ pub struct ClrType {
     pub name: String,
     /// `Field` names owned by a `TypeDef`, in table order. Empty for `Module` and `TypeRef`. Signatures are not read.
     pub fields: Vec<String>,
-    /// `MethodDef` names owned by a `TypeDef`, in table order. Empty for `Module` and `TypeRef`. Signatures and IL are not read.
-    pub methods: Vec<String>,
+    /// `MethodDef` rows owned by a `TypeDef`, in table order. Empty for `Module` and `TypeRef`. Signatures and IL are not read.
+    pub methods: Vec<ClrMethod>,
+}
+
+/// A method name and the `Param` names it owns.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ClrMethod {
+    pub name: String,
+    /// `Param` names in table order. Sequence numbers and the signature are not read.
+    pub params: Vec<String>,
 }
 
 /// One metadata table named in the `#~` / `#-` header, with its row count.
@@ -385,9 +393,9 @@ fn table_name(index: u32) -> String {
     }
 }
 
-/// `Module`, `TypeRef`, and `TypeDef` names, plus `Field` and `MethodDef` names on each `TypeDef`.
+/// `Module`, `TypeRef`, and `TypeDef` names, plus `Field` and `MethodDef` names on each `TypeDef` and `Param` names on each method.
 ///
-/// `FieldPtr` and `MethodPtr` are skipped by row size and not applied. String, blob, and coded-index widths follow the `#~` heap-size byte and the row counts. A row that does not fit ends the list and keeps the names already read. Signatures, RVAs, `Param` rows, and IL are not read.
+/// `FieldPtr`, `MethodPtr`, and `ParamPtr` are skipped by row size and not applied. String, blob, and coded-index widths follow the `#~` heap-size byte and the row counts. A row that does not fit ends the list and keeps the names already read. Signatures, RVAs, parameter sequence numbers, and IL are not read.
 fn metadata_type_names(
     file: &[u8],
     metadata_off: Option<usize>,
@@ -433,7 +441,8 @@ fn metadata_type_names(
     let extends_w = coded_width(typedef_rows.max(typeref_rows).max(rows_at(blob, valid, 27)), 2);
     let field_w = index_width(field_rows);
     let method_w = index_width(method_rows);
-    let param_w = index_width(rows_at(blob, valid, 8));
+    let param_rows = rows_at(blob, valid, 8);
+    let param_w = index_width(param_rows);
     let module_size = 2 + str_w + guid_w * 3;
     let typeref_size = scope_w + str_w * 2;
     let typedef_size = 4 + str_w * 2 + extends_w + field_w + method_w;
@@ -441,12 +450,17 @@ fn metadata_type_names(
     let method_list_at = field_list_at + field_w;
     let field_size = 2 + str_w + blob_w;
     let method_size = 8 + str_w + blob_w + param_w;
+    let param_list_at = 8 + str_w + blob_w;
+    let param_size = 4 + str_w;
 
     let mut cursor = header_end;
     let mut out = Vec::new();
     // Index into `out`, then the 1-based FieldList and MethodList for each TypeDef.
     let mut typedefs: Vec<(usize, u32, u32)> = Vec::new();
-    for bit in 0..7u32 {
+    // Method name and its 1-based ParamList, in MethodDef order.
+    let mut method_recs: Vec<(String, u32)> = Vec::new();
+    let mut params_attached = false;
+    for bit in 0..9u32 {
         if valid & (1u64 << bit) == 0 {
             continue;
         }
@@ -499,17 +513,9 @@ fn metadata_type_names(
                 } else {
                     (rows_at(blob, valid, 5), method_w)
                 };
-                let Some(total) = usize::try_from(rows).ok().and_then(|n| n.checked_mul(size))
-                else {
-                    return out;
-                };
-                let Some(end) = cursor.checked_add(total) else {
-                    return out;
-                };
-                if end > blob.len() {
+                if !skip_rows(blob, &mut cursor, rows, size) {
                     return out;
                 }
-                cursor = end;
             }
             4 => {
                 let mut names = Vec::new();
@@ -528,59 +534,113 @@ fn metadata_type_names(
                 }
                 attach_field_names(&mut out, &typedefs, &names);
             }
-            _ => {
-                let mut names = Vec::new();
+            6 => {
                 for _ in 0..method_rows {
                     let Some(end) = cursor.checked_add(method_size) else {
-                        attach_method_names(&mut out, &typedefs, &names);
+                        attach_methods(&mut out, &typedefs, &method_recs, &[]);
                         return out;
                     };
                     if end > blob.len() {
-                        attach_method_names(&mut out, &typedefs, &names);
+                        attach_methods(&mut out, &typedefs, &method_recs, &[]);
                         return out;
                     }
                     let row = &blob[cursor..end];
-                    names.push(heap_string(strings, read_index(row, 8, str_w)));
+                    method_recs.push((
+                        heap_string(strings, read_index(row, 8, str_w)),
+                        read_index(row, param_list_at, param_w),
+                    ));
                     cursor = end;
                 }
-                attach_method_names(&mut out, &typedefs, &names);
+            }
+            7 => {
+                let rows = rows_at(blob, valid, 7);
+                if !skip_rows(blob, &mut cursor, rows, param_w) {
+                    attach_methods(&mut out, &typedefs, &method_recs, &[]);
+                    return out;
+                }
+            }
+            _ => {
+                let mut names = Vec::new();
+                for _ in 0..param_rows {
+                    let Some(end) = cursor.checked_add(param_size) else {
+                        attach_methods(&mut out, &typedefs, &method_recs, &names);
+                        return out;
+                    };
+                    if end > blob.len() {
+                        attach_methods(&mut out, &typedefs, &method_recs, &names);
+                        return out;
+                    }
+                    let row = &blob[cursor..end];
+                    names.push(heap_string(strings, read_index(row, 4, str_w)));
+                    cursor = end;
+                }
+                attach_methods(&mut out, &typedefs, &method_recs, &names);
+                params_attached = true;
             }
         }
+    }
+    if !params_attached {
+        attach_methods(&mut out, &typedefs, &method_recs, &[]);
     }
     out
 }
 
 /// `FieldList` is 1-based. Each TypeDef owns names up to the next list, or the end of `Field`.
 fn attach_field_names(out: &mut [ClrType], typedefs: &[(usize, u32, u32)], names: &[String]) {
-    for (i, &(at, list, _)) in typedefs.iter().enumerate() {
-        let (start, end) = owned_range(typedefs, i, list, names.len(), |row| row.1);
+    let lists: Vec<u32> = typedefs.iter().map(|row| row.1).collect();
+    for (index, &(at, _, _)) in typedefs.iter().enumerate() {
+        let (start, end) = list_span(&lists, index, names.len());
         out[at].fields = names[start..end].to_vec();
     }
 }
 
-/// `MethodList` is 1-based. Each TypeDef owns names up to the next list, or the end of `MethodDef`.
-fn attach_method_names(out: &mut [ClrType], typedefs: &[(usize, u32, u32)], names: &[String]) {
-    for (i, &(at, _, list)) in typedefs.iter().enumerate() {
-        let (start, end) = owned_range(typedefs, i, list, names.len(), |row| row.2);
-        out[at].methods = names[start..end].to_vec();
+/// `MethodList` and `ParamList` are 1-based. Each method owns parameter names up to the next list.
+fn attach_methods(
+    out: &mut [ClrType],
+    typedefs: &[(usize, u32, u32)],
+    recs: &[(String, u32)],
+    param_names: &[String],
+) {
+    let param_lists: Vec<u32> = recs.iter().map(|rec| rec.1).collect();
+    let methods: Vec<ClrMethod> = recs
+        .iter()
+        .enumerate()
+        .map(|(index, (name, _))| {
+            let (start, end) = list_span(&param_lists, index, param_names.len());
+            ClrMethod {
+                name: name.clone(),
+                params: param_names[start..end].to_vec(),
+            }
+        })
+        .collect();
+    let method_lists: Vec<u32> = typedefs.iter().map(|row| row.2).collect();
+    for (index, &(at, _, _)) in typedefs.iter().enumerate() {
+        let (start, end) = list_span(&method_lists, index, methods.len());
+        out[at].methods = methods[start..end].to_vec();
     }
 }
 
-fn owned_range(
-    typedefs: &[(usize, u32, u32)],
-    index: usize,
-    list: u32,
-    names_len: usize,
-    next_list: impl Fn(&(usize, u32, u32)) -> u32,
-) -> (usize, usize) {
-    let start = (list.saturating_sub(1) as usize).min(names_len);
-    let end = match typedefs.get(index + 1) {
-        Some(next) => (next_list(next).saturating_sub(1) as usize)
-            .max(start)
-            .min(names_len),
-        None => names_len,
+fn list_span(lists: &[u32], index: usize, len: usize) -> (usize, usize) {
+    let start = (lists[index].saturating_sub(1) as usize).min(len);
+    let end = match lists.get(index + 1) {
+        Some(&next) => (next.saturating_sub(1) as usize).max(start).min(len),
+        None => len,
     };
     (start, end)
+}
+
+fn skip_rows(blob: &[u8], cursor: &mut usize, rows: u32, size: usize) -> bool {
+    let Some(total) = usize::try_from(rows).ok().and_then(|rows| rows.checked_mul(size)) else {
+        return false;
+    };
+    let Some(end) = cursor.checked_add(total) else {
+        return false;
+    };
+    if end > blob.len() {
+        return false;
+    }
+    *cursor = end;
+    true
 }
 
 fn stream_bytes<'a>(
@@ -1054,11 +1114,14 @@ mod tests {
         assert_eq!(types[0].table, "TypeDef");
         assert_eq!(types[0].namespace, "Ns");
         assert_eq!(types[0].name, "App");
-        assert_eq!(types[0].methods, vec!["Run".to_string(), "Stop".to_string()]);
+        assert_eq!(
+            types[0].methods,
+            vec![clr_method("Run", &[]), clr_method("Stop", &[])]
+        );
         assert!(types[0].fields.is_empty());
         assert_eq!(types[1].name, "Other");
         assert_eq!(types[1].namespace, "");
-        assert_eq!(types[1].methods, vec!["Done".to_string()]);
+        assert_eq!(types[1].methods, vec![clr_method("Done", &[])]);
         assert_eq!(types[1].fields, vec!["Fld".to_string()]);
     }
 
@@ -1097,10 +1160,56 @@ mod tests {
         assert_eq!(types[0].name, "App");
         assert_eq!(types[0].namespace, "Ns");
         assert_eq!(types[0].fields, vec!["Fld".to_string()]);
-        assert_eq!(types[0].methods, vec!["Run".to_string()]);
+        assert_eq!(types[0].methods, vec![clr_method("Run", &[])]);
         assert_eq!(types[1].name, "Other");
         assert_eq!(types[1].fields, vec!["More".to_string()]);
-        assert_eq!(types[1].methods, vec!["Done".to_string()]);
+        assert_eq!(types[1].methods, vec![clr_method("Done", &[])]);
+    }
+
+    #[test]
+    fn clr_method_params_skip_the_param_ptr_row() {
+        // ParamPtr sits between MethodDef and Param. Its one index is skipped, not applied.
+        let mut tilde = tilde_header((1 << 2) | (1 << 6) | (1 << 7) | (1 << 8), &[1, 2, 1, 3]);
+        tilde.extend_from_slice(&0u32.to_le_bytes());
+        tilde.extend_from_slice(&1u16.to_le_bytes());
+        tilde.extend_from_slice(&5u16.to_le_bytes());
+        tilde.extend_from_slice(&0u16.to_le_bytes());
+        tilde.extend_from_slice(&1u16.to_le_bytes());
+        tilde.extend_from_slice(&1u16.to_le_bytes());
+        for (name, params) in [(8u16, 1u16), (12u16, 3u16)] {
+            tilde.extend_from_slice(&0u32.to_le_bytes());
+            tilde.extend_from_slice(&0u16.to_le_bytes());
+            tilde.extend_from_slice(&0u16.to_le_bytes());
+            tilde.extend_from_slice(&name.to_le_bytes());
+            tilde.extend_from_slice(&0u16.to_le_bytes());
+            tilde.extend_from_slice(&params.to_le_bytes());
+        }
+        tilde.extend_from_slice(&1u16.to_le_bytes());
+        for name in [17u16, 19u16, 21u16] {
+            tilde.extend_from_slice(&0u16.to_le_bytes());
+            tilde.extend_from_slice(&0u16.to_le_bytes());
+            tilde.extend_from_slice(&name.to_le_bytes());
+        }
+        let mut strings = vec![0u8];
+        strings.extend_from_slice(b"App\0Ns\0Run\0Stop\0a\0b\0c\0");
+        let (file, streams) = with_strings(&tilde, &strings);
+        let types = metadata_type_names(&file, Some(0), &streams);
+        assert_eq!(types[0].name, "App");
+        assert_eq!(types[0].namespace, "Ns");
+        assert_eq!(
+            types[0].methods,
+            vec![
+                clr_method("Run", &["a", "b"]),
+                clr_method("Stop", &["c"])
+            ]
+        );
+    }
+
+    fn clr_method(name: &str, params: &[&str]) -> ClrMethod {
+        ClrMethod {
+            name: name.to_string(),
+            params: params.iter().map(|param| (*param).to_string()).collect(),
+        }
     }
 
     #[test]
