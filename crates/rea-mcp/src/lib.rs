@@ -3,7 +3,7 @@
 //! Exposes rea's analysis commands as MCP tools so any MCP-capable agent
 //! can inspect binaries. Run via `rea mcp`.
 
-use rea_core::{loader, strings};
+use rea_core::{analysis, loader, strings};
 #[cfg(feature = "disasm")]
 use rea_core::disasm;
 use serde_json::{json, Value};
@@ -91,6 +91,23 @@ fn handle_tool_call(msg: &Value) -> Result<Value, String> {
         .and_then(Value::as_str)
         .ok_or("missing required argument: path")?;
 
+    if name == "rea_wasm" || name == "rea_go" {
+        let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+        let value = if name == "rea_wasm" {
+            json!(rea_core::wasm::inspect(&bytes).map_err(|e| e.to_string())?)
+        } else {
+            match rea_core::goinfo::find_build_info(&bytes).map_err(|e| e.to_string())? {
+                Some(info) => json!({
+                    "found": true,
+                    "version": info.version,
+                    "modules": info.modules,
+                }),
+                None => json!({ "found": false }),
+            }
+        };
+        return Ok(text_result(value.to_string()));
+    }
+
     let result: Result<Value, String> = (|| {
         let target = loader::load(path).map_err(|e| e.to_string())?;
         Ok(match name {
@@ -128,8 +145,14 @@ fn handle_tool_call(msg: &Value) -> Result<Value, String> {
                     .get("min_length")
                     .and_then(Value::as_u64)
                     .unwrap_or(4) as usize;
-                let hits = strings::extract(&target.bytes, min);
-                json!({ "count": hits.len(), "strings": hits })
+                let with_xrefs = args.get("xrefs").and_then(Value::as_bool).unwrap_or(false);
+                if with_xrefs {
+                    let hits = analysis::strings_with_xrefs(&target, min);
+                    json!({ "count": hits.len(), "strings": hits })
+                } else {
+                    let hits = strings::extract(&target.bytes, min);
+                    json!({ "count": hits.len(), "strings": hits })
+                }
             }
             "rea_disasm" => {
                 #[cfg(feature = "disasm")]
@@ -151,6 +174,36 @@ fn handle_tool_call(msg: &Value) -> Result<Value, String> {
                     json!({ "error": "built without disasm feature" })
                 }
             }
+            "rea_funcs" => {
+                let funcs = analysis::discover_functions(&target);
+                json!({ "count": funcs.len(), "functions": funcs })
+            }
+            "rea_xrefs" => {
+                let addr = args
+                    .get("address")
+                    .and_then(Value::as_u64)
+                    .ok_or("missing required argument: address")?;
+                let refs = analysis::data_xrefs(&target, addr);
+                json!({ "address": addr, "count": refs.len(), "refs": refs })
+            }
+            "rea_call_graph" => {
+                let functions = analysis::discover_functions(&target);
+                let graph = analysis::call_graph(&functions);
+                json!({
+                    "functions": functions.len(),
+                    "edges": graph.edges.len(),
+                    "graph": graph,
+                })
+            }
+            "rea_macho" => {
+                json!(rea_core::macho_meta::facts(&target.bytes).map_err(|e| e.to_string())?)
+            }
+            "rea_pe" => {
+                json!(rea_core::pe_meta::facts(&target.bytes).map_err(|e| e.to_string())?)
+            }
+            "rea_elf" => {
+                json!(rea_core::elf_meta::facts(&target.bytes).map_err(|e| e.to_string())?)
+            }
             other => return Err(format!("unknown tool: {other}")),
         })
     })();
@@ -162,7 +215,7 @@ fn handle_tool_call(msg: &Value) -> Result<Value, String> {
 }
 
 fn tool_definitions() -> Vec<Value> {
-    fn schema(path_only: bool, extra: Value) -> Value {
+    fn schema(path_only: bool, extra: Value, extra_required: &[&str]) -> Value {
         let mut props = json!({
             "path": { "type": "string", "description": "Filesystem path to the binary" }
         });
@@ -173,33 +226,38 @@ fn tool_definitions() -> Vec<Value> {
                 }
             }
         }
-        json!({ "type": "object", "properties": props, "required": ["path"] })
+        let mut required = vec![json!("path")];
+        for name in extra_required {
+            required.push(json!(*name));
+        }
+        json!({ "type": "object", "properties": props, "required": required })
     }
 
     vec![
         json!({
             "name": "rea_info",
             "description": "Identify a binary: format, architecture, bits, endianness, entry point, and section/symbol counts.",
-            "inputSchema": schema(true, json!({})),
+            "inputSchema": schema(true, json!({}), &[]),
         }),
         json!({
             "name": "rea_sections",
             "description": "List sections of a binary with names, virtual addresses, sizes, and file offsets.",
-            "inputSchema": schema(true, json!({})),
+            "inputSchema": schema(true, json!({}), &[]),
         }),
         json!({
             "name": "rea_symbols",
             "description": "List symbols; optionally filter by kind: imports, exports, or locals.",
             "inputSchema": schema(false, json!({
                 "kind": { "type": "string", "enum": ["all", "imports", "exports", "locals"] }
-            })),
+            }), &[]),
         }),
         json!({
             "name": "rea_strings",
-            "description": "Extract printable ASCII strings with file offsets.",
+            "description": "Extract printable ASCII strings with file offsets. Set xrefs to annotate each string with code references.",
             "inputSchema": schema(false, json!({
-                "min_length": { "type": "integer", "description": "Minimum string length (default 4)" }
-            })),
+                "min_length": { "type": "integer", "description": "Minimum string length (default 4)" },
+                "xrefs": { "type": "boolean", "description": "Annotate each string with code references (default false)" }
+            }), &[]),
         }),
         json!({
             "name": "rea_disasm",
@@ -207,7 +265,49 @@ fn tool_definitions() -> Vec<Value> {
             "inputSchema": schema(false, json!({
                 "address": { "type": "integer", "description": "Virtual address (hex or decimal)" },
                 "count": { "type": "integer", "description": "Max instructions (default 32)" }
-            })),
+            }), &[]),
+        }),
+        json!({
+            "name": "rea_funcs",
+            "description": "Discover functions from the entry point, direct call targets, and prologue scan.",
+            "inputSchema": schema(true, json!({}), &[]),
+        }),
+        json!({
+            "name": "rea_xrefs",
+            "description": "Find code locations referencing an address (32-bit data xrefs).",
+            "inputSchema": schema(false, json!({
+                "address": { "type": "integer", "description": "Address to find references to" }
+            }), &["address"]),
+        }),
+        json!({
+            "name": "rea_call_graph",
+            "description": "Direct call graph over discovered functions. Calls to unknown addresses are dropped.",
+            "inputSchema": schema(true, json!({}), &[]),
+        }),
+        json!({
+            "name": "rea_wasm",
+            "description": "List WASM section ids, imports, and exports. Does not execute the module.",
+            "inputSchema": schema(true, json!({}), &[]),
+        }),
+        json!({
+            "name": "rea_go",
+            "description": "Read Go 1.18+ inline build info. Pointer-based pre-1.18 blobs return an error.",
+            "inputSchema": schema(true, json!({}), &[]),
+        }),
+        json!({
+            "name": "rea_macho",
+            "description": "Mach-O dylibs and UUID for one slice. Fat binaries are resolved to the host slice first.",
+            "inputSchema": schema(true, json!({}), &[]),
+        }),
+        json!({
+            "name": "rea_pe",
+            "description": "PE data directories, whether a CLR header is present, and root resource type ids.",
+            "inputSchema": schema(true, json!({}), &[]),
+        }),
+        json!({
+            "name": "rea_elf",
+            "description": "ELF interpreter, needed libraries, soname, and GNU build-id.",
+            "inputSchema": schema(true, json!({}), &[]),
         }),
     ]
 }
@@ -234,10 +334,25 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_returns_five_tools() {
+    fn tools_list_returns_thirteen_tools() {
         let (lines, _) = exchange(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#);
         let v: Value = serde_json::from_str(&lines[0]).unwrap();
-        assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 5);
+        assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 13);
+    }
+
+    #[test]
+    fn tools_list_includes_funcs_and_xrefs() {
+        let (lines, _) = exchange(r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#);
+        let v: Value = serde_json::from_str(&lines[0]).unwrap();
+        let tools = v["result"]["tools"].as_array().unwrap();
+        let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        assert!(names.contains(&"rea_funcs"));
+        assert!(names.contains(&"rea_xrefs"));
+
+        let xrefs = tools.iter().find(|t| t["name"] == "rea_xrefs").unwrap();
+        let required = xrefs["inputSchema"]["required"].as_array().unwrap();
+        assert!(required.iter().any(|r| r == "path"));
+        assert!(required.iter().any(|r| r == "address"));
     }
 
     #[test]

@@ -66,6 +66,18 @@ enum Command {
         /// Address, hex (0x…) or decimal.
         address: String,
     },
+    /// Direct call graph over discovered functions.
+    Callgraph { path: String },
+    /// WASM imports, exports, and section ids. Does not execute the module.
+    Wasm { path: String },
+    /// Go 1.18+ build info embedded in a binary. Pre-1.18 pointer blobs error.
+    Goinfo { path: String },
+    /// Mach-O dylibs and UUID. Fat binaries use the host slice.
+    Macho { path: String },
+    /// PE data directories, CLR header presence, and root resource type ids.
+    Pe { path: String },
+    /// ELF interpreter, needed libraries, soname, and GNU build-id.
+    Elf { path: String },
     /// Run the MCP stdio server (for agent integration).
     Mcp,
 }
@@ -79,15 +91,40 @@ fn main() -> anyhow::Result<()> {
                 .context("mcp server terminated")?;
             Ok(())
         }
+        Command::Wasm { path } => {
+            let bytes = std::fs::read(path).context("failed to read target")?;
+            let module = rea_core::wasm::inspect(&bytes).context("wasm")?;
+            println!("{}", serde_json::to_string_pretty(&module).unwrap());
+            Ok(())
+        }
+        Command::Goinfo { path } => {
+            let bytes = std::fs::read(path).context("failed to read target")?;
+            let found = rea_core::goinfo::find_build_info(&bytes).context("go buildinfo")?;
+            let json = match found {
+                Some(info) => serde_json::json!({
+                    "found": true,
+                    "version": info.version,
+                    "modules": info.modules,
+                }),
+                None => serde_json::json!({ "found": false }),
+            };
+            println!("{}", serde_json::to_string_pretty(&json).unwrap());
+            Ok(())
+        }
         _ => {
-            let (path, rest): (&String, ()) = match &cli.command {
+            let (path, _rest): (&String, ()) = match &cli.command {
                 Command::Info { path }
                 | Command::Sections { path }
                 | Command::Symbols { path, .. }
                 | Command::Strings { path, .. }
                 | Command::Disasm { path, .. }
                 | Command::Funcs { path }
-                | Command::Xrefs { path, .. } => (path, ()),
+                | Command::Xrefs { path, .. }
+                | Command::Callgraph { path }
+                | Command::Macho { path }
+                | Command::Pe { path }
+                | Command::Elf { path } => (path, ()),
+                Command::Wasm { .. } | Command::Goinfo { .. } => unreachable!(),
                 Command::Mcp => unreachable!(),
             };
             let target = loader::load(path).context("failed to load target")?;
@@ -149,7 +186,31 @@ fn main() -> anyhow::Result<()> {
                     let refs = analysis::data_xrefs(&target, addr);
                     serde_json::json!({ "address": addr, "count": refs.len(), "refs": refs })
                 }
-                Command::Mcp => unreachable!(),
+                Command::Callgraph { .. } => {
+                    let functions = analysis::discover_functions(&target);
+                    let graph = analysis::call_graph(&functions);
+                    serde_json::json!({
+                        "functions": functions.len(),
+                        "edges": graph.edges.len(),
+                        "graph": graph,
+                    })
+                }
+                Command::Macho { .. } => {
+                    let facts = rea_core::macho_meta::facts(&target.bytes)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    serde_json::json!(facts)
+                }
+                Command::Pe { .. } => {
+                    let facts = rea_core::pe_meta::facts(&target.bytes)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    serde_json::json!(facts)
+                }
+                Command::Elf { .. } => {
+                    let facts = rea_core::elf_meta::facts(&target.bytes)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    serde_json::json!(facts)
+                }
+                Command::Mcp | Command::Wasm { .. } | Command::Goinfo { .. } => unreachable!(),
             };
             println!("{}", serde_json::to_string_pretty(&json).unwrap());
             Ok(())

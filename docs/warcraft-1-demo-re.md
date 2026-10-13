@@ -122,15 +122,14 @@ decoded to PNG successfully (`/tmp/warblocks/orc_resource_bar.png`).
 - `rea xrefs`, `rea funcs`, `rea strings --xrefs` CLI commands.
 - Hex address parsing (`0x…`) for `xrefs` and `disasm`.
 - **LE fixup engine** (`rea-core::le`): parses the fixup page table
-  (LE header +`0x68`, header-relative) and record table (LE +`0x6C`);
-  record = `[src_flags u8][trg_flags u8][src_off u16|list][ordinal][target
-  off][addend]`. Source types 5/7 (16/32-bit offset) targeting internal
-  objects are resolved and patched into a copy of the image at load time
-  (constants cross-checked against rizin `le_specs.h`). Verified
-  empirically on WAR.EXE: 8,457 fixups; the first record
-  `07 00 eb 09 02 58 1b` writes obj2-base+0x1b58 at page1+0x9eb, and the
-  patched bytes read back exactly that. `examples/le_fixup_stats.rs`
-  prints the stats for any LE file.
+  (LE header +`0x68`, header-relative) and record table (LE +`0x6C`).
+  A source-list count is read up front, but the `i16` offsets come last,
+  after the ordinal, target, and optional additive. Source types 5, 7, and
+  8 targeting an internal object are patched into a copy of the image at
+  load. Imports are consumed and skipped. Re-checked on this `WAR.EXE`:
+  8,457 fixups. The record `07 00 eb 09 02 58 1b` writes `58 1b 05 00`
+  at vaddr `0x109eb` (object 2 base + `0x1b58`).
+  `examples/le_fixup_stats.rs` prints the applied count for any LE file.
 - **Control-flow function bodies**: discovery now walks real control flow
   (visited-set BFS over disassembled instructions) instead of linear runs,
   so functions no longer bleed past forward jumps, jump tables, or padding.

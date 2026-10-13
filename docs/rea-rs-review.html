@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>rea-rs — review and fidelity to morluto/rea</title>
+<title>rea-rs — progress and fidelity to morluto/rea</title>
 <style>
   :root {
     --paper: #f4f0e6;
@@ -21,6 +21,8 @@
     --part: #8a5a10;
     --have: #1d6b43;
     --have-bg: #e3f0e7;
+    --run: #1d4e89;
+    --run-bg: #e4eef8;
     --code: #2a241c;
   }
   * { box-sizing: border-box; }
@@ -48,10 +50,10 @@
     font-size: 0.82rem;
     letter-spacing: 0.01em;
   }
-  header.top nav { display: flex; gap: 1rem; }
+  header.top nav { display: flex; gap: 1rem; flex-wrap: wrap; }
   header.top a { text-decoration: none; border-bottom: 1px solid transparent; }
   header.top a:hover { border-bottom-color: var(--ink); }
-  main { max-width: 46rem; margin: 0 auto; padding: 2.4rem 1.3rem 4rem; }
+  main { max-width: 48rem; margin: 0 auto; padding: 2.4rem 1.3rem 4rem; }
   h1 { font-size: 2.15rem; line-height: 1.15; font-weight: 600; margin: 0 0 0.4rem; }
   h2 { font-size: 1.45rem; margin: 2.4rem 0 0.6rem; font-weight: 600; }
   h3 { font-size: 1.05rem; margin: 1.4rem 0 0.35rem; font-family: "Avenir Next", "Segoe UI", sans-serif; }
@@ -60,11 +62,21 @@
   .verdict {
     background: var(--sheet);
     border: 1px solid var(--line);
-    border-left: 4px solid var(--low);
+    border-left: 4px solid var(--part);
     padding: 0.9rem 1rem;
     margin: 1rem 0 1.4rem;
   }
-  .verdict strong { font-family: "Avenir Next", "Segoe UI", sans-serif; font-size: 0.78rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--low); }
+  .verdict strong { font-family: "Avenir Next", "Segoe UI", sans-serif; font-size: 0.78rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--part); }
+  .banner {
+    background: var(--have-bg);
+    border: 1px solid #b7d4c2;
+    padding: 0.75rem 1rem;
+    margin: 0.8rem 0 1rem;
+  }
+  .banner.run {
+    background: var(--run-bg);
+    border-color: #b9cfe6;
+  }
   p { margin: 0.55rem 0; }
   code, .mono {
     font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
@@ -88,6 +100,7 @@
   .tag.part, .tag.sugg { background: var(--sugg-bg); color: var(--sugg); }
   .tag.have { background: var(--have-bg); color: var(--have); }
   .tag.nit { background: var(--nit-bg); color: var(--nit); }
+  .tag.run { background: var(--run-bg); color: var(--run); }
   .issue {
     background: var(--sheet);
     border: 1px solid var(--line);
@@ -113,36 +126,124 @@
 </head>
 <body>
 <header class="top">
-  <span>rea-rs · 12 Oct 2026</span>
+  <span>rea-rs · 13 Oct 2026</span>
   <nav>
+    <a href="#progress">Progress</a>
     <a href="#fidelity">Fidelity</a>
     <a href="#overlap">Overlap</a>
-    <a href="#review">Fixup review</a>
+    <a href="#gaps">Gaps</a>
+    <a href="#review">LE review</a>
   </nav>
 </header>
 <main>
-  <h1>How closely rea-rs tracks morluto/rea</h1>
-  <p class="lede">It tracks the pitch, not the product. rea-rs is a clean-room Rust sketch of “one local MCP that inspects native binaries.” <a href="https://github.com/morluto/rea">morluto/rea</a> is a Node toolkit with on the order of 150 MCP tools, external decompilers, and an evidence session around every result.</p>
-  <p class="meta">Compared against <code>morluto/rea</code> <code>main</code> on 12 Oct 2026, and rea-rs <code>95171c9</code>. Tool names were read from <code>src/contracts</code>, not from a live <code>tools/list</code>.</p>
+  <h1>rea-rs progress</h1>
+  <p class="lede">The in-process static slice grew. It still tracks the pitch of <a href="https://github.com/morluto/rea">morluto/rea</a>, not the product. API compatibility is none.</p>
+  <p class="meta">Compared with <code>morluto/rea</code> <code>main</code> on 12 Oct 2026. Upstream tool names were read from <code>src/contracts</code>. GLM 5.3 Flash wrote the new parsers; this page is the integration record.</p>
 
-  <div class="verdict" id="fidelity">
-    <strong>Fidelity</strong>
-    <p>API compatibility is none: different tool names, no Evidence records, no provider session, protocol pinned to <code>2024-11-05</code> with text-only results. The shared idea is a stdio MCP plus a JSON CLI for static native inspection. Everything past that — decompilation, call graphs, JavaScript, web, Android, .NET, Frida, firmware, WASM — is absent. LE / DOS/4GW support is original work in this tree, not a port.</p>
+  <h2 id="progress">What landed</h2>
+  <div class="banner">
+    <p>Workspace tests this round: <code>cargo test --workspace --offline</code> — rea-core 35 passed, rea-mcp 5 passed, CLI compiled. The pre-existing unused <code>mut</code> on the Capstone handle in <code>disasm.rs</code> is still a warning.</p>
   </div>
-
-  <h2>What each side actually is</h2>
   <table>
-    <thead><tr><th></th><th>rea-rs</th><th>morluto/rea</th></tr></thead>
+    <thead><tr><th>Slice</th><th>Where it shows up</th><th>Check</th><th></th></tr></thead>
     <tbody>
-      <tr><td>Shape</td><td>Three Rust crates, v0.1.0. <code>goblin</code> loads Mach-O (including fat), ELF, and PE. Capstone disassembles. A hand-rolled JSON-RPC loop is the MCP server.</td><td>TypeScript npm package <code>rea-agents</code>, 2,500+ commits. Analysis is delegated to Hopper, Ghidra, IDA, or JEB, plus many format-specific parsers.</td></tr>
-      <tr><td>Own words</td><td>README: “clean-room Rust implementation of the MCP reverse-engineering toolkit concept (inspired by morluto/rea).”</td><td>README: “One MCP for reverse engineering across binaries, applications, and runtime behavior.”</td></tr>
-      <tr><td>MCP surface</td><td>Five tools: <code>rea_info</code>, <code>rea_sections</code>, <code>rea_symbols</code>, <code>rea_strings</code>, <code>rea_disasm</code>. Errors come back as text. Notifications are dropped.</td><td>About 150 tool contracts under <code>src/contracts</code>, plus prompts. Results carry canonical Evidence, structured content, sessions, progress, and cancellation.</td></tr>
-      <tr><td>CLI</td><td><code>info</code>, <code>sections</code>, <code>symbols</code>, <code>strings</code>, <code>disasm</code>, <code>funcs</code>, <code>xrefs</code>, <code>mcp</code>. <code>funcs</code> and <code>xrefs</code> are not on the MCP server. The README roadmap still lists them as future work.</td><td><code>npx rea-agents setup</code> registers agents. The CLI shares the evidence workflows with MCP.</td></tr>
+      <tr>
+        <td>LE internal fixups</td>
+        <td><code>le.rs</code> walker. <code>load_le</code> applies fixups and returns the error. Source offsets outside the page are skipped.</td>
+        <td><code>WAR.EXE</code>: 8,457 fixups. Record <code>07 00 eb 09 02 58 1b</code> writes <code>58 1b 05 00</code> at vaddr <code>0x109eb</code> (linear <code>0x00051b58</code>).</td>
+        <td><span class="tag have">landed</span></td>
+      </tr>
+      <tr>
+        <td>Functions, xrefs, call graph</td>
+        <td>CLI <code>funcs</code>, <code>xrefs</code>, <code>callgraph</code>. MCP <code>rea_funcs</code>, <code>rea_xrefs</code>, <code>rea_call_graph</code>. x86, x86_64, and arm64. Thumb is still empty.</td>
+        <td><code>rea callgraph /bin/ls</code> (arm64): 143 functions, 499 edges. Was 1 and 0. <code>WAR.EXE</code> stayed 742 functions and 1,962 edges.</td>
+        <td><span class="tag have">landed</span></td>
+      </tr>
+      <tr>
+        <td>Symbol seeds and pointer width</td>
+        <td><code>discover_functions</code> also starts at local and export symbols inside <code>__text</code>, <code>.text</code>, <code>CODE</code>, <code>.init</code>, or <code>.fini</code>. <code>rea_xrefs</code> and <code>rea strings --xrefs</code> use 8-byte little-endian pointers when the target is 64-bit, and 4-byte ones otherwise.</td>
+        <td><code>/bin/ls</code> is stripped: call graph stayed 143 / 499. String xrefs at min length 6 went from 47 to 2, because the old 32-bit scan was matching truncated addresses. <code>WAR.EXE</code> stayed 742 / 1,962.</td>
+        <td><span class="tag have">landed</span></td>
+      </tr>
+      <tr>
+        <td>WASM module facts</td>
+        <td><code>rea wasm</code>, <code>rea_wasm</code>. Reads the file itself. Loader still rejects WASM.</td>
+        <td>Sample <code>0061736d…</code>: version 1, sections 1, 3, 7, 10, export <code>f</code> func 0.</td>
+        <td><span class="tag have">landed</span></td>
+      </tr>
+      <tr>
+        <td>Go build info</td>
+        <td><code>rea goinfo</code>, <code>rea_go</code>. Inline Go 1.18+ strings only. Pointer form returns an error.</td>
+        <td><code>rea goinfo /bin/ls</code> is <code>{found:false}</code>.</td>
+        <td><span class="tag have">landed</span></td>
+      </tr>
+      <tr>
+        <td>Mach-O dylibs and UUID</td>
+        <td><code>rea macho</code>, <code>rea_macho</code>. Fat files use the host slice already chosen by the loader.</td>
+        <td><code>/bin/ls</code>: self, libutil, libncurses.5.4, libSystem.B. UUID <code>322cb148c4013ea0a0234b21a104d42f</code>.</td>
+        <td><span class="tag have">landed</span></td>
+      </tr>
+      <tr>
+        <td>PE directories</td>
+        <td><code>rea pe</code>, <code>rea_pe</code>. Data directories, a CLR-header flag, root resource type ids.</td>
+        <td>This is a header skim. It does not load a managed assembly.</td>
+        <td><span class="tag part">skim</span></td>
+      </tr>
+      <tr>
+        <td>ELF facts</td>
+        <td><code>rea elf</code>, <code>rea_elf</code>. Interpreter, needed libraries, soname, GNU build-id.</td>
+        <td>In-crate ELF64 fixture: interpreter <code>/lib64/ld-linux-x86-64.so.2</code>, needed <code>libc.so.6</code>, soname <code>libexample.so</code>, build-id <code>01020304</code>. <code>rea elf /bin/ls</code> errors. This Mac has no system ELF to smoke.</td>
+        <td><span class="tag have">landed</span></td>
+      </tr>
+      <tr>
+        <td>MCP surface</td>
+        <td>Thirteen tools. Failures are text <code>error: …</code>. Unknown methods are JSON-RPC <code>-32601</code>.</td>
+        <td><code>tools_list_returns_thirteen_tools</code>.</td>
+        <td><span class="tag have">landed</span></td>
+      </tr>
     </tbody>
   </table>
 
+  <h3>Checked this round</h3>
+  <table>
+    <thead><tr><th>Check</th><th>Result</th></tr></thead>
+    <tbody>
+      <tr><td><code>rea callgraph /bin/ls</code></td><td>143 functions, 499 edges. The sweep now follows arm64 <code>bl</code> and <code>#0x</code> operands, and seeds <code>stp x29, x30</code> prologues. These counts are a heuristic, not a ground-truth procedure list.</td></tr>
+      <tr><td><code>rea callgraph</code> on <code>WAR.EXE</code></td><td>742 functions, 1,962 edges. Same as the measurement taken before the arch change.</td></tr>
+      <tr><td><code>rea macho /bin/ls</code></td><td>Unchanged: self, libutil, libncurses.5.4, libSystem.B, UUID <code>322cb148c4013ea0a0234b21a104d42f</code>.</td></tr>
+      <tr><td><code>rea elf</code></td><td>Fixture test passes. A Mach-O path returns <code>parse error: elf: Invalid magic number</code>.</td></tr>
+      <tr><td>Symbol seeds</td><td>Fixture: a local symbol in <code>__text</code> is a function; an import, and a local symbol in <code>__cstring</code>, are not. <code>/bin/ls</code> has no defined symbol inside <code>__text</code>, so its call graph did not move.</td></tr>
+      <tr><td><code>rea strings /bin/ls --xrefs --min-length 6</code></td><td>2 strings. Was 47 under the 32-bit pattern. Arm64 code mostly addresses strings with <code>adrp</code>/<code>add</code>, which this scan does not decode.</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Next in this tree</h3>
+  <p>Thumb function discovery is still empty. Arm64 and x86_64 string references that are built with <code>adrp</code>/<code>add</code> or RIP-relative loads are still missed. A full .NET reader is still open. <code>rea pe</code> only reports that a CLR header exists.</p>
+
+  <h3>Still out of scope</h3>
+  <p>Hopper, Ghidra, IDA, JEB, Frida, browser and CDP, Android and adb, evidence sessions, decompilation, WAT execution, and pre-1.18 Go pointer chasing.</p>
+
+  <div class="verdict" id="fidelity">
+    <strong>Fidelity</strong>
+    <p>Shared idea: a local stdio MCP and a JSON CLI for static inspection of native binaries. That slice is wider than the first review (five tools then, thirteen now). It covers function discovery on x86, x86_64, and arm64, a direct call graph, WASM sections, Go 1.18+ build info, Mach-O dylibs and UUID, a PE directory skim, ELF interpreter and build-id, and a real LE fixup pass. It is still a different program. Tool names do not match. There is no Evidence record, no provider session, and the protocol stays <code>2024-11-05</code> with text results. LE / DOS/4GW is original work. Upstream has no Watcom LE contract.</p>
+  </div>
+
+  <h2>What each side is</h2>
+  <table>
+    <thead><tr><th></th><th>rea-rs</th><th>morluto/rea</th></tr></thead>
+    <tbody>
+      <tr><td>Shape</td><td>Three Rust crates, v0.1.0. goblin loads Mach-O (including fat), ELF, and PE. A hand-rolled LE parser runs first, because goblin peeks those files as PE. Capstone disassembles. MCP is a hand-rolled JSON-RPC loop.</td><td>TypeScript package <code>rea-agents</code>, 2,500+ commits. Analysis is delegated to Hopper, Ghidra, IDA, or JEB, plus many format parsers.</td></tr>
+      <tr><td>Own words</td><td>README: “clean-room Rust implementation of the MCP reverse-engineering toolkit concept (inspired by morluto/rea).”</td><td>README: “One MCP for reverse engineering across binaries, applications, and runtime behavior.”</td></tr>
+      <tr><td>MCP surface</td><td>Thirteen tools, listed below. Errors are text. Notifications are dropped.</td><td>About 150 tool contracts under <code>src/contracts</code>, plus prompts. Results carry Evidence, structured content, sessions, progress, and cancellation.</td></tr>
+      <tr><td>CLI</td><td><code>info</code>, <code>sections</code>, <code>symbols</code>, <code>strings</code>, <code>disasm</code>, <code>funcs</code>, <code>xrefs</code>, <code>callgraph</code>, <code>wasm</code>, <code>goinfo</code>, <code>macho</code>, <code>pe</code>, <code>elf</code>, <code>mcp</code>.</td><td><code>npx rea-agents setup</code> registers agents. The CLI shares the evidence workflows with MCP.</td></tr>
+    </tbody>
+  </table>
+  <div class="chips">
+    <span>rea_info</span><span>rea_sections</span><span>rea_symbols</span><span>rea_strings</span><span>rea_disasm</span><span>rea_funcs</span><span>rea_xrefs</span><span>rea_call_graph</span><span>rea_wasm</span><span>rea_go</span><span>rea_macho</span><span>rea_pe</span><span>rea_elf</span>
+  </div>
+
   <h2 id="overlap">Where the native slice lines up</h2>
-  <p>These are conceptual cousins. Calling one does not satisfy a client written for the other.</p>
+  <p>These are cousins. Calling one does not satisfy a client written for the other.</p>
   <table>
     <thead><tr><th>Job</th><th>rea-rs</th><th>Upstream</th><th></th></tr></thead>
     <tbody>
@@ -154,7 +255,7 @@
       </tr>
       <tr>
         <td>Sections</td>
-        <td><code>rea_sections</code> — goblin section headers, or LE objects</td>
+        <td><code>rea_sections</code> — goblin headers, or LE objects</td>
         <td><code>list_segments</code> — provider memory blocks, permissions, overlays</td>
         <td><span class="tag part">partial</span></td>
       </tr>
@@ -166,26 +267,44 @@
       </tr>
       <tr>
         <td>Strings</td>
-        <td><code>rea_strings</code> — ASCII scan of file bytes. CLI <code>--xrefs</code> adds a pointer scan.</td>
-        <td><code>list_strings</code>, <code>search_strings</code> — typed string objects from the decompiler</td>
+        <td><code>rea_strings</code> — ASCII scan. Optional code-pointer annotation.</td>
+        <td><code>list_strings</code>, <code>search_strings</code> — typed strings from the decompiler</td>
         <td><span class="tag part">partial</span></td>
       </tr>
       <tr>
         <td>Disassembly</td>
-        <td><code>rea_disasm</code> — N Capstone instructions at a virtual address</td>
+        <td><code>rea_disasm</code> — Capstone at a virtual address. Modes: x86, x86_64, Thumb, arm64.</td>
         <td><code>procedure_assembly</code>, <code>inspect_native_instruction</code>, <code>read_function_instructions</code></td>
         <td><span class="tag part">partial</span></td>
       </tr>
       <tr>
-        <td>Functions</td>
-        <td>CLI <code>rea funcs</code> — entry, <code>push ebp</code> prologues, direct-call sweep, control-flow bodies. Not an MCP tool.</td>
-        <td><code>list_procedures</code>, <code>analyze_function</code>, <code>procedure_pseudo_code</code></td>
+        <td>Functions and calls</td>
+        <td><code>rea_funcs</code>, <code>rea_call_graph</code> — entry, text-section symbols, prologues, and direct calls on x86, x86_64, and arm64. Bodies follow a forward <code>jmp</code> or <code>b</code>. Thumb is not scanned.</td>
+        <td><code>list_procedures</code>, <code>analyze_function</code>, <code>get_call_graph</code>, <code>procedure_pseudo_code</code></td>
         <td><span class="tag part">partial</span></td>
       </tr>
       <tr>
         <td>Cross-references</td>
-        <td>CLI <code>rea xrefs</code> — 32-bit data pointers in code sections. Not an MCP tool.</td>
-        <td><code>xrefs</code>, <code>procedure_references</code>, <code>find_xrefs_to_name</code>, <code>get_call_graph</code></td>
+        <td><code>rea_xrefs</code> — little-endian absolute pointers, 8 bytes on 64-bit targets and 4 bytes otherwise. Not <code>adrp</code> or RIP-relative.</td>
+        <td><code>xrefs</code>, <code>procedure_references</code>, <code>find_xrefs_to_name</code></td>
+        <td><span class="tag part">partial</span></td>
+      </tr>
+      <tr>
+        <td>Mach-O facts</td>
+        <td><code>rea_macho</code> — dylibs and UUID</td>
+        <td><code>inspect_macho</code> and a much wider header and signature surface</td>
+        <td><span class="tag part">partial</span></td>
+      </tr>
+      <tr>
+        <td>ELF facts</td>
+        <td><code>rea_elf</code> — interpreter, needed libraries, soname, GNU build-id</td>
+        <td>Layout and note inspection inside the native file tools. No matching single contract name.</td>
+        <td><span class="tag part">partial</span></td>
+      </tr>
+      <tr>
+        <td>Go and WASM</td>
+        <td><code>rea_go</code> (1.18+ inline build info), <code>rea_wasm</code> (sections, imports, exports)</td>
+        <td><code>inspect_go_binary</code>, <code>inspect_wasm_artifact</code></td>
         <td><span class="tag part">partial</span></td>
       </tr>
       <tr>
@@ -197,104 +316,87 @@
       <tr>
         <td>Session and evidence</td>
         <td>None. Each call reloads the file.</td>
-        <td><code>open_binary</code>, <code>binary_session</code>, <code>get_evidence_bundle</code>, compare/trace workflows</td>
+        <td><code>open_binary</code>, <code>binary_session</code>, <code>get_evidence_bundle</code></td>
         <td><span class="tag low">missing</span></td>
       </tr>
       <tr>
         <td>LE / DOS/4GW</td>
-        <td>Custom loader. Fixups run on every LE load. See the review below.</td>
+        <td>Custom loader. Internal fixups run on every LE load. Entry bundles and iterated pages are not handled.</td>
         <td>No Watcom LE contract. <code>inspect_native_load_image</code> covers DOS MZ and COM.</td>
         <td><span class="tag have">local only</span></td>
       </tr>
     </tbody>
   </table>
 
-  <h2>What upstream has that this tree does not</h2>
-  <p>Counts are tool names declared in contract modules. Example fixtures and prompt contracts are left out. A few names are spliced into the official list from a helper, so treat the total as about 150, not an exact catalog digest.</p>
+  <h2 id="gaps">What upstream has that this tree does not</h2>
+  <p>Counts are tool names declared in contract modules. Treat the total as about 150.</p>
   <table>
     <thead><tr><th>Area</th><th>Tools</th><th>rea-rs</th></tr></thead>
     <tbody>
-      <tr><td>Hopper / Ghidra / IDA bridge (procedures, names, comments, bookmarks, pseudocode, raw bytes)</td><td>40</td><td><span class="tag low">missing</span></td></tr>
-      <tr><td>Enhanced native (overview, ObjC, Swift, call graph, value/UI trace)</td><td>12</td><td><span class="tag low">missing</span></td></tr>
-      <tr><td>Session, evidence, comparisons, unknowns</td><td>21</td><td><span class="tag low">missing</span></td></tr>
-      <tr><td>File-level native extras (Mach-O, signature, plist, UI observation, crash, PE resources, layout)</td><td>12</td><td><span class="tag part">Mach-O/ELF/PE load only</span></td></tr>
-      <tr><td>JavaScript, Electron, web, browser</td><td>32</td><td><span class="tag low">missing</span></td></tr>
-      <tr><td>Android, adb, apktool, JEB</td><td>35</td><td><span class="tag low">missing</span></td></tr>
-      <tr><td>.NET / managed</td><td>7</td><td><span class="tag low">roadmap item</span></td></tr>
-      <tr><td>Frida</td><td>9</td><td><span class="tag low">missing</span></td></tr>
-      <tr><td>Go, WASM, EVM, SQLite, firmware, Flutter, packet capture, signals</td><td>11</td><td><span class="tag low">WASM is a roadmap item</span></td></tr>
-      <tr><td>Artifact inventory (bundles, nibs, asset catalogs, dylibs)</td><td>6</td><td><span class="tag low">missing</span></td></tr>
+      <tr><td>Hopper / Ghidra / IDA bridge</td><td>40</td><td><span class="tag low">out of scope</span></td></tr>
+      <tr><td>Enhanced native (overview, ObjC, Swift, value and UI trace)</td><td>12</td><td><span class="tag part">local call graph on x86, x86_64, arm64</span></td></tr>
+      <tr><td>Session, evidence, comparisons</td><td>21</td><td><span class="tag low">out of scope</span></td></tr>
+      <tr><td>File-level extras (signature, plist, crash, layout, PE resources)</td><td>12</td><td><span class="tag part">Mach-O UUID, ELF build-id, PE directory skim</span></td></tr>
+      <tr><td>JavaScript, Electron, web, browser</td><td>32</td><td><span class="tag low">out of scope</span></td></tr>
+      <tr><td>Android, adb, apktool, JEB</td><td>35</td><td><span class="tag low">out of scope</span></td></tr>
+      <tr><td>.NET / managed</td><td>7</td><td><span class="tag part">CLR flag only</span></td></tr>
+      <tr><td>Frida</td><td>9</td><td><span class="tag low">out of scope</span></td></tr>
+      <tr><td>Go, WASM, EVM, SQLite, firmware, Flutter, packets, signals</td><td>11</td><td><span class="tag part">Go 1.18+ and WASM MVP</span></td></tr>
+      <tr><td>Artifact inventory (bundles, nibs, asset catalogs)</td><td>6</td><td><span class="tag low">missing</span></td></tr>
     </tbody>
   </table>
 
-  <details>
-    <summary>Native tool names this tree would have to grow into</summary>
-    <div class="chips">
-      <span>binary_overview</span><span>open_binary</span><span>list_segments</span><span>list_names</span><span>list_strings</span><span>list_procedures</span><span>procedure_assembly</span><span>procedure_pseudo_code</span><span>procedure_callers</span><span>procedure_callees</span><span>xrefs</span><span>get_call_graph</span><span>analyze_function</span><span>inspect_native_instruction</span><span>read_bytes</span><span>address_to_file_offset</span><span>inspect_macho</span><span>inspect_binary_layout</span><span>inspect_go_binary</span><span>inspect_wasm_artifact</span>
-    </div>
-  </details>
-
   <h2>What this tree does on its own</h2>
   <ul>
-    <li>Uniform <code>Target</code> for Mach-O, ELF, PE, and LE, with virtual-address to file-offset translation. Fat Mach-O picks a host slice.</li>
-    <li>LE is checked before goblin, because goblin peeks those files as PE.</li>
-    <li>Function discovery and string cross-references were added to read <code>WAR.EXE</code>. They live on the CLI. The Warcraft notes in <code>docs/warcraft-1-demo-re.md</code> still say fixups are not applied; <code>load_le</code> now calls <code>apply_fixups</code> and ignores the result.</li>
-    <li>The module comment at the top of <code>le.rs</code> still says fixups are out of scope. That comment is false.</li>
+    <li>One <code>Target</code> for Mach-O, ELF, PE, and LE, with virtual-address to file-offset translation. Fat Mach-O picks a host slice.</li>
+    <li>LE is recognized before goblin. Fixup page bases use the object page map. A bad page-table slot or a short record returns <code>Err</code>.</li>
+    <li>Function bodies follow a forward <code>jmp</code> or arm64 <code>b</code>, and stop at <code>ret</code>, <code>retf</code>, and an indirect or backward jump. <code>rea callgraph</code> on <code>WAR.EXE</code> reports 742 functions and 1,962 edges after the arm64 pass, the same as before it. The Warcraft note still says 2,386 call edges. That older tally was not what this CLI printed.</li>
+    <li>The Warcraft note in <code>docs/warcraft-1-demo-re.md</code> matches the corrected record order and the 8,457 / <code>0x109eb</code> check.</li>
   </ul>
 
-  <h2 id="review">Review of the LE fixup loader</h2>
-  <p>Commit <code>2e7687b</code> teaches <code>LeImage::apply_fixups</code> to rewrite internal relocations, and <code>load_le</code> runs it on every LE binary. A single internal 32-bit fixup on an identity page map (the Warcraft demo) can land correctly. The walker does not follow the fixup-record layout it cites, and a slipped cursor writes later records into the image as if they were fixups. No test builds a real fixup record: <code>synthetic()</code> leaves the fixup tables at 0, so <code>apply_fixups</code> returns <code>Ok(0)</code>.</p>
+  <h2 id="review">LE fixup review — findings, then the fix</h2>
+  <div class="banner">
+    <p>The four bugs, the suggestion, and the nit below were the review of commit <code>2e7687b</code>. They are fixed in this working tree. The walker was replaced, <code>load_le</code> propagates <code>apply_fixups</code>, and <code>WAR.EXE</code> was re-checked. The notes stay so the old failure mode is readable.</p>
+  </div>
+  <p>Commit <code>2e7687b</code> taught <code>LeImage::apply_fixups</code> to rewrite internal relocations. A single internal 32-bit fixup on an identity page map (the Warcraft demo) could land correctly. The first walker did not follow the record layout it cited, and a slipped cursor wrote later records into the image. <code>synthetic()</code> left the fixup tables at 0, so that path returned <code>Ok(0)</code> and hid the bugs. Tests now cover an internal 32-bit write, a source list whose offsets follow the target tail, a 16-bit object-relative store, an import that must not eat the next internal record, and an oversized page map that returns <code>Err</code>.</p>
 
   <article class="issue">
-    <span class="tag bug">bug</span>
-    <h3>Source lists are parsed before the ordinal and target</h3>
-    <p class="where">crates/rea-core/src/le.rs:288</p>
-    <p>The source-list flag replaces the single <code>i16</code> offset with a count. The count offsets come after the ordinal and the target, not before them. This code reads the offsets immediately, so the ordinal and target are taken from the list and the rest of that page shifts. A short list only breaks the inner loop, then still parses an ordinal from whatever follows.</p>
-    <p>Read the count, parse the ordinal and target tail, then read the offsets. On a short read, stop the page. A fixture with one list record followed by a normal type-7 record would have caught this.</p>
+    <span class="tag have">fixed</span>
+    <h3>Source lists were parsed before the ordinal and target</h3>
+    <p class="where">was crates/rea-core/src/le.rs, source-list flag 0x20</p>
+    <p>The count replaces the single <code>i16</code> offset. The offsets come after the ordinal and the target, not before them. The old code read the offsets immediately, so the ordinal and target were taken from the list and the rest of that page shifted.</p>
   </article>
 
   <article class="issue">
-    <span class="tag bug">bug</span>
-    <h3>Skipped records do not consume their tail</h3>
-    <p class="where">crates/rea-core/src/le.rs:324</p>
-    <p>Imports, a bad object number, and 16-bit selector fixups <code>continue</code> without finishing the record. The next iteration treats the middle of that record as a new fixup and can patch the image. Selector internals have no target-offset field, but the parser always reads one before rejecting them. Reads are not clamped to the page’s fixup range, so a long record steals the next page’s bytes. <code>load_le</code> drops the <code>Result</code> (<code>loader.rs:40</code>), and <code>apply_fixups</code> never returns <code>Err</code>.</p>
-    <p>Decode a record to its end before deciding to apply it. If a read would pass the page, abandon the rest of that page. Surface a real parse failure from <code>load_le</code>.</p>
+    <span class="tag have">fixed</span>
+    <h3>Skipped records did not consume their tail</h3>
+    <p class="where">was crates/rea-core/src/le.rs, import and selector tails</p>
+    <p>Imports, a bad object number, and selector fixups used to <code>continue</code> without finishing the record. The next iteration treated the middle of that record as a new fixup. Bit <code>0x08</code> is not a chain. <code>load_le</code> used to drop the <code>Result</code>. Short reads now return <code>Err</code>, and the loader propagates it.</p>
   </article>
 
   <article class="issue">
-    <span class="tag bug">bug</span>
-    <h3>Page bases are keyed by file page, then indexed by logical page</h3>
-    <p class="where">crates/rea-core/src/le.rs:240</p>
-    <p><code>page_vaddr</code> is filled with the file page number from the object page table. Fixups are applied with the logical page index. Those match only for an identity map, which WAR.EXE has and scattered maps do not. An oversized <code>mapsize</code> indexes off <code>self.pages.pages</code> and panics inside <code>load</code>. Address 0 is also used as the “unset” sentinel. A 32-bit store that crosses a page writes four file-contiguous bytes; adjacent virtual pages are not adjacent in the file unless the map is identity.</p>
-    <p>Build one virtual address per logical page, the same way <code>translate</code> uses <code>pagemap</code>. Bounds-check and return <code>Err</code>. Split stores that cross a page.</p>
+    <span class="tag have">fixed</span>
+    <h3>Page bases were keyed by file page, then indexed by logical page</h3>
+    <p class="where">was crates/rea-core/src/le.rs, page_vaddr</p>
+    <p>Those numbers match only for an identity map, which <code>WAR.EXE</code> has. The walker now uses the object page map, the same way <code>translate</code> does. An oversized <code>mapsize</code> returns <code>Err</code> instead of panicking. Stores go through <code>pages.translate</code> one byte at a time.</p>
   </article>
 
   <article class="issue">
-    <span class="tag bug">bug</span>
-    <h3>16-bit offset fixups store a truncated linear address</h3>
-    <p class="where">crates/rea-core/src/le.rs:395</p>
-    <p>Source type 5 stores the object-relative offset, and only when it fits in a <code>u16</code>. This writes the low 16 bits of <code>object.base + offset</code>. That matches the object offset only when the base is 64K-aligned and the offset is below 64K, which is why WAR.EXE hides it.</p>
-    <p>For source type 5, write <code>target_offset + additive</code> and skip the site when the sum does not fit in <code>u16</code>. Keep the linear address for source type 7.</p>
+    <span class="tag have">fixed</span>
+    <h3>16-bit offset fixups stored a truncated linear address</h3>
+    <p class="where">source type 5</p>
+    <p>Source type 5 stores the object-relative offset, and only when it fits in a <code>u16</code>. The old code wrote the low 16 bits of <code>object.base + offset</code>. Source type 7 still stores the linear <code>u32</code>. Source type 8 stores <code>(base + rel).wrapping_sub(src_vaddr + 4)</code>.</p>
   </article>
 
   <article class="issue">
-    <span class="tag sugg">suggestion</span>
-    <h3>The header comment and the tests still describe the old scope</h3>
-    <p class="where">crates/rea-core/src/le.rs:7</p>
-    <p>The module comment says fixups are not handled. <code>synthetic()</code> never sets the fixup tables, so the bugs above are invisible. Source type 8 (32-bit self-relative) is skipped even though the stored dword is <code>target - (src + 4)</code>. The additive flag means “add to the bytes already at the source”; this always overwrites. Non-additive type-7 records, which Watcom usually emits, are unaffected.</p>
-    <p>Update the comment. Extend <code>synthetic()</code> with one internal type-7 record, one source-list record, and one non-identity page.</p>
-  </article>
-
-  <article class="issue">
-    <span class="tag nit">nit</span>
-    <h3>The stats example clones an unused buffer and can panic</h3>
-    <p class="where">crates/rea-core/examples/le_fixup_stats.rs:8</p>
-    <p><code>bytes</code> is cloned and then unused. The sample read panics when <code>translate</code> returns an offset in the last three bytes. The hardcoded address <code>0x109eb</code> only means anything for one binary.</p>
-    <p>Move <code>bytes</code> into <code>patched</code>, and print the sample only when <code>off + 4 &lt;= patched.len()</code>.</p>
+    <span class="tag have">fixed</span>
+    <h3>The header comment, the tests, and the stats example</h3>
+    <p class="where">le.rs module comment, synthetic fixtures, examples/le_fixup_stats.rs</p>
+    <p>The module comment now says internal fixups are in scope and that entry bundles and iterated pages are not. The stats example no longer clones an unused buffer, and the 4-byte read at <code>0x109eb</code> is bounds-checked.</p>
   </article>
 
   <footer>
-    <p>User-facing page. The agent review notes remain at the session scratch file <code>grok-review-e8c97a14.md</code>. Upstream names: <a href="https://github.com/morluto/rea">github.com/morluto/rea</a> <code>src/contracts/*ToolContracts.ts</code> on main. This page was not committed.</p>
+    <p>Upstream names: <a href="https://github.com/morluto/rea">github.com/morluto/rea</a> <code>src/contracts/*ToolContracts.ts</code> on main. The LE findings above are the record of that review.</p>
   </footer>
 </main>
 </body>

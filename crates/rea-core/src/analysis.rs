@@ -1,16 +1,18 @@
 //! Static analysis: function discovery, call graph, and cross-references.
 //!
 //! Approach is deliberately simple and format-agnostic:
-//! - Function starts come from the entry point, every direct `call` target
-//!   reachable from already-known functions, and `push ebp; mov ebp, esp`
-//!   prologues found by scanning code sections (catches callbacks the call
-//!   graph misses).
-//! - Function bodies are linear disassembly runs ending at `ret`/`jmp`.
-//! - Data cross-references come from searching code bytes for the 4-byte
-//!   little-endian address (covers `mov reg, [addr]`, `push [addr]`, and
-//!   immediate loads — the dominant patterns in 32-bit flat code).
+//! - Function starts come from the entry point, local/export symbols in text
+//!   sections, every direct `call`/`bl` target reachable from already-known
+//!   functions, and frame prologues scanned in code sections (x86 `push ebp;
+//!   mov ebp, esp`, x86_64 `push rbp; mov rbp, rsp`, arm64 `stp x29, x30,
+//!   [sp, #imm]`).
+//! - Function bodies follow forward unconditional jumps (`jmp`, `b`) and
+//!   stop at `ret`, indirect or backward jumps, and invalid bytes.
+//! - Data cross-references come from searching code bytes for the
+//!   little-endian address: 4 bytes when `bits < 64`, 8 bytes otherwise
+//!   (covers `mov reg, [addr]`, `push [addr]`, and immediate loads).
 
-use crate::{disasm, strings, Arch, Target};
+use crate::{disasm, strings, Arch, SymbolKind, Target};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -35,11 +37,12 @@ fn code_sections(target: &Target) -> impl Iterator<Item = &crate::Section> {
     target.sections.iter().filter(|s| s.size > 0)
 }
 
-/// Linear-sweep a code section, returning every direct `call` target found.
+/// Linear-sweep a code section, returning every direct `call`/`bl` target.
 /// Recovers from invalid bytes by advancing one byte, so the whole section
-/// gets covered (mixed code/data in flat 32-bit images).
+/// gets covered (mixed code/data in flat 32-bit images). `blr` is indirect
+/// and is not recorded. Arm and unknown arches have no sweep.
 fn sweep_call_targets(target: &Target, sec: &crate::Section) -> Vec<u64> {
-    if target.arch != Arch::X86 {
+    if !matches!(target.arch, Arch::X86 | Arch::X86_64 | Arch::Arm64) {
         return Vec::new();
     }
     let Ok(mut cs) = disasm::build_capstone(target.arch) else {
@@ -63,11 +66,9 @@ fn sweep_call_targets(target: &Target, sec: &crate::Section) -> Vec<u64> {
                 let mut consumed = 0usize;
                 for ins in insns.iter() {
                     consumed += ins.bytes().len();
-                    if ins.mnemonic().unwrap_or("") == "call" {
-                        if let Some(op) = ins.op_str().unwrap_or("").strip_prefix("0x") {
-                            if let Ok(t) = u64::from_str_radix(op, 16) {
-                                targets.push(t);
-                            }
+                    if matches!(ins.mnemonic().unwrap_or(""), "call" | "bl") {
+                        if let Some(t) = direct_target(ins.op_str().unwrap_or("")) {
+                            targets.push(t);
                         }
                     }
                 }
@@ -79,34 +80,75 @@ fn sweep_call_targets(target: &Target, sec: &crate::Section) -> Vec<u64> {
     targets
 }
 
-/// Find `push ebp; mov ebp, esp` prologues in a code section.
+/// Frame-pointer prologues in a code section.
+/// x86: `push ebp; mov ebp, esp`. x86_64: `push rbp; mov rbp, rsp`.
+/// arm64: `stp x29, x30, [sp, #imm]!` or `stp x29, x30, [sp, #imm]`,
+/// at 4-byte-aligned virtual addresses. Arm and unknown yield nothing.
 fn prologue_starts(target: &Target, sec: &crate::Section) -> Vec<u64> {
-    if target.arch != Arch::X86 {
-        return Vec::new();
-    }
     let start = sec.file_offset as usize;
     let end = start + sec.size as usize;
-    let mut out = Vec::new();
     if end > target.bytes.len() {
-        return out;
+        return Vec::new();
     }
-    let needle = [0x55u8, 0x8b, 0xec];
+    match target.arch {
+        Arch::X86 => scan_prologue_bytes(target, sec, start, end, &[0x55, 0x8b, 0xec]),
+        Arch::X86_64 => scan_prologue_bytes(target, sec, start, end, &[0x55, 0x48, 0x89, 0xe5]),
+        Arch::Arm64 => scan_arm64_stp_prologues(target, sec, start, end),
+        Arch::Arm | Arch::Unknown => Vec::new(),
+    }
+}
+
+fn scan_prologue_bytes(
+    target: &Target,
+    sec: &crate::Section,
+    start: usize,
+    end: usize,
+    needle: &[u8],
+) -> Vec<u64> {
+    let mut out = Vec::new();
     let mut i = start;
-    while i + 3 <= end {
-        if &target.bytes[i..i + 3] == needle {
+    while i + needle.len() <= end {
+        if &target.bytes[i..i + needle.len()] == needle {
             out.push(sec.addr + (i - start) as u64);
-            i += 1;
-        } else {
-            i += 1;
         }
+        i += 1;
+    }
+    out
+}
+
+fn scan_arm64_stp_prologues(
+    target: &Target,
+    sec: &crate::Section,
+    start: usize,
+    end: usize,
+) -> Vec<u64> {
+    let mut out = Vec::new();
+    // Instructions are 4-byte aligned. Skip a leading unaligned byte or two
+    // so the first word sits on an aligned virtual address.
+    let misalign = (sec.addr as usize) % 4;
+    let mut i = start + if misalign == 0 { 0 } else { 4 - misalign };
+    while i + 4 <= end {
+        let word = u32::from_le_bytes([
+            target.bytes[i],
+            target.bytes[i + 1],
+            target.bytes[i + 2],
+            target.bytes[i + 3],
+        ]);
+        let masked = word & 0xFFC0_7FFF;
+        // pre-index `stp x29, x30, [sp, #imm]!` or signed-offset form.
+        if masked == 0xA980_7BFD || masked == 0xA900_7BFD {
+            out.push(sec.addr + (i - start) as u64);
+        }
+        i += 4;
     }
     out
 }
 
 /// Follow control flow from `start`, returning (body extent, call targets).
-/// Unlike a plain linear run this handles forward `jmp`s (chunks), stops at
-/// `ret`, indirect jumps (jump tables), and invalid bytes — so functions no
-/// longer bleed into padding or the next function.
+/// Unlike a plain linear run this handles forward unconditional jumps
+/// (`jmp`, `b`), stops at `ret`, indirect jumps (`br` / register `jmp`),
+/// and invalid bytes — so functions no longer bleed into padding or the
+/// next function. Conditional branches fall through.
 fn function_body(target: &Target, start: u64, max: u64) -> (u64, Vec<u64>) {
     let mut visited: BTreeSet<u64> = BTreeSet::new();
     let mut calls: Vec<u64> = Vec::new();
@@ -127,7 +169,8 @@ fn function_body(target: &Target, start: u64, max: u64) -> (u64, Vec<u64>) {
             visited.insert(ins.addr);
             end = end.max(ins.addr + ins.size as u64);
             match ins.mnemonic.as_str() {
-                "call" => {
+                // Exact mnemonics: `b` must not swallow `bl` or `b.ne`.
+                "call" | "bl" | "blr" => {
                     if let Some(t) = direct_target(&ins.operands) {
                         calls.push(t);
                     }
@@ -136,7 +179,7 @@ fn function_body(target: &Target, start: u64, max: u64) -> (u64, Vec<u64>) {
                     jumped = false;
                     break;
                 }
-                "jmp" => {
+                "jmp" | "b" | "br" => {
                     jumped = false;
                     if let Some(t) = direct_target(&ins.operands) {
                         if t > ins.addr && t < start + max {
@@ -166,17 +209,49 @@ fn function_body(target: &Target, start: u64, max: u64) -> (u64, Vec<u64>) {
     (end.saturating_sub(start).min(max), calls)
 }
 
+/// First operand when it is a bare hex immediate (`0x…` or Capstone's `#0x…`).
+/// Memory operands (`qword ptr [rip + 0x10]`) and anything non-hex are rejected.
 fn direct_target(operands: &str) -> Option<u64> {
-    operands
-        .strip_prefix("0x")
-        .and_then(|t| u64::from_str_radix(t, 16).ok())
+    let token = operands
+        .split(|c: char| c == ',' || c == ' ' || c == '\t')
+        .next()
+        .unwrap_or("");
+    let token = token.strip_prefix('#').unwrap_or(token);
+    let hex = token.strip_prefix("0x")?;
+    if hex.is_empty() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u64::from_str_radix(hex, 16).ok()
 }
 
-/// Discover functions: entry point + prologue scan, expanded through direct
-/// call edges. Returns functions sorted by address.
+/// Local and export symbols that lie in a text section (`__text`, `.text`,
+/// `CODE`, `.init`, `.fini`). Imports, address 0, and other section names
+/// (including LE `code0` / `data0`) are not seeds.
+fn symbol_seeds(target: &Target) -> Vec<u64> {
+    target
+        .symbols
+        .iter()
+        .filter(|sym| matches!(sym.kind, SymbolKind::Local | SymbolKind::Export) && sym.addr != 0)
+        .filter(|sym| {
+            target.sections.iter().any(|sec| {
+                matches!(sec.name.as_str(), "__text" | ".text" | "CODE" | ".init" | ".fini")
+                    && sym.addr >= sec.addr
+                    && sym.addr < sec.addr + sec.size
+            })
+        })
+        .map(|sym| sym.addr)
+        .collect()
+}
+
+/// Discover functions: entry point, symbol seeds in text sections, and
+/// prologue scan, expanded through direct call edges. Returns functions
+/// sorted by address.
 pub fn discover_functions(target: &Target) -> Vec<Function> {
     let mut seeds: BTreeSet<u64> = BTreeSet::new();
     seeds.insert(target.entry);
+    for addr in symbol_seeds(target) {
+        seeds.insert(addr);
+    }
     for sec in code_sections(target) {
         for s in prologue_starts(target, sec) {
             seeds.insert(s);
@@ -213,19 +288,61 @@ pub fn discover_functions(target: &Target) -> Vec<Function> {
     funcs.into_values().collect()
 }
 
-/// Find code locations that reference `addr` as a 32-bit immediate or
-/// displacement. This over-matches (any byte pattern equal to the address),
-/// which is acceptable for flat 32-bit code where such patterns are rare
-/// unless intentional.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CallEdge {
+    pub from: u64,
+    pub to: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CallGraph {
+    pub edges: Vec<CallEdge>,
+    /// callee address -> caller addresses, both sorted
+    pub callers: BTreeMap<u64, Vec<u64>>,
+}
+
+/// Direct calls whose target is the address of a function in `functions`.
+/// Calls outside that set are dropped. Edges are sorted by `(from, to)` and
+/// deduplicated; `callers` lists the sorted unique callers of each callee.
+pub fn call_graph(functions: &[Function]) -> CallGraph {
+    let known: BTreeSet<u64> = functions.iter().map(|f| f.addr).collect();
+    let mut edges: Vec<CallEdge> = Vec::new();
+    for f in functions {
+        for &to in &f.calls {
+            if known.contains(&to) {
+                edges.push(CallEdge { from: f.addr, to });
+            }
+        }
+    }
+    edges.sort_by(|a, b| a.from.cmp(&b.from).then(a.to.cmp(&b.to)));
+    edges.dedup_by(|a, b| a.from == b.from && a.to == b.to);
+
+    let mut callers: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+    for edge in &edges {
+        let callers_of = callers.entry(edge.to).or_default();
+        if callers_of.last() != Some(&edge.from) {
+            callers_of.push(edge.from);
+        }
+    }
+    CallGraph { edges, callers }
+}
+
+/// Find locations that reference `addr`. The needle is 8 little-endian bytes
+/// when `bits >= 64`, otherwise the 4-byte little-endian value. This
+/// over-matches (any byte pattern equal to the address). A 4-byte prefix is
+/// not a hit on a 64-bit target.
 pub fn data_xrefs(target: &Target, addr: u64) -> Vec<XRef> {
-    let needle = (addr as u32).to_le_bytes();
+    let needle8 = addr.to_le_bytes();
+    let needle4 = (addr as u32).to_le_bytes();
+    let needle: &[u8] = if target.bits >= 64 { &needle8 } else { &needle4 };
+    let width = needle.len();
     let mut out = Vec::new();
     for sec in code_sections(target) {
         let start = sec.file_offset as usize;
         let end = (start + sec.size as usize).min(target.bytes.len());
         let mut i = start;
-        while i + 4 <= end {
-            if &target.bytes[i..i + 4] == needle {
+        while i + width <= end {
+            if &target.bytes[i..i + width] == needle {
                 out.push(XRef {
                     from: sec.addr + (i - start) as u64,
                     to: addr,
@@ -237,24 +354,43 @@ pub fn data_xrefs(target: &Target, addr: u64) -> Vec<XRef> {
     out
 }
 
-/// Index every 4-byte little-endian value in code sections with the code
-/// address where it occurs. One pass; used for string/reference lookup.
-fn code_pointer_index(target: &Target) -> BTreeMap<u32, Vec<u64>> {
-    let mut index: BTreeMap<u32, Vec<u64>> = BTreeMap::new();
+/// Index every pointer-width little-endian value in sections with the address
+/// where it occurs. 8 bytes when `bits >= 64`; otherwise 4, zero-extended
+/// into the `u64` key. One pass; used for string/reference lookup.
+fn code_pointer_index(target: &Target) -> BTreeMap<u64, Vec<u64>> {
+    let wide = target.bits >= 64;
+    let mut index: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
     for sec in code_sections(target) {
         let start = sec.file_offset as usize;
         let end = (start + sec.size as usize).min(target.bytes.len());
         if start >= end {
             continue;
         }
-        for i in start..end.saturating_sub(3) {
-            let v = u32::from_le_bytes([
-                target.bytes[i],
-                target.bytes[i + 1],
-                target.bytes[i + 2],
-                target.bytes[i + 3],
-            ]);
-            index.entry(v).or_default().push(sec.addr + (i - start) as u64);
+        let width = if wide { 8 } else { 4 };
+        for i in start..end.saturating_sub(width - 1) {
+            let key = if wide {
+                u64::from_le_bytes([
+                    target.bytes[i],
+                    target.bytes[i + 1],
+                    target.bytes[i + 2],
+                    target.bytes[i + 3],
+                    target.bytes[i + 4],
+                    target.bytes[i + 5],
+                    target.bytes[i + 6],
+                    target.bytes[i + 7],
+                ])
+            } else {
+                u32::from_le_bytes([
+                    target.bytes[i],
+                    target.bytes[i + 1],
+                    target.bytes[i + 2],
+                    target.bytes[i + 3],
+                ]) as u64
+            };
+            index
+                .entry(key)
+                .or_default()
+                .push(sec.addr + (i - start) as u64);
         }
     }
     index
@@ -281,7 +417,12 @@ pub fn strings_with_xrefs(target: &Target, min_len: usize) -> Vec<AnnotatedStrin
         let mut refs: Vec<u64> = Vec::new();
         let mut p = lo;
         while p <= hi {
-            if let Some(locs) = index.get(&(p as u32)) {
+            let key = if target.bits >= 64 {
+                p
+            } else {
+                u64::from(p as u32)
+            };
+            if let Some(locs) = index.get(&key) {
                 refs.extend_from_slice(locs);
             }
             p += 1;
@@ -335,5 +476,183 @@ mod tests {
         let refs = data_xrefs(&target, 0x1000);
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].from, 0x1002);
+    }
+
+    #[test]
+    fn call_graph_drops_unknown_targets() {
+        let a = 0x1000;
+        let b = 0x2000;
+        let functions = [
+            Function {
+                addr: a,
+                size: 16,
+                calls: vec![b, 0xdead],
+            },
+            Function {
+                addr: b,
+                size: 16,
+                calls: vec![a],
+            },
+        ];
+        let graph = call_graph(&functions);
+        assert_eq!(graph.edges.len(), 2);
+        assert_eq!((graph.edges[0].from, graph.edges[0].to), (a, b));
+        assert_eq!((graph.edges[1].from, graph.edges[1].to), (b, a));
+        assert_eq!(graph.callers.get(&a).map(Vec::as_slice), Some(&[b][..]));
+        assert_eq!(graph.callers.get(&b).map(Vec::as_slice), Some(&[a][..]));
+        assert!(!graph.callers.contains_key(&0xdead));
+    }
+
+    /// `disassemble` reads 4096 bytes at the start address. Pad the file so a
+    /// read that begins inside `code` succeeds, but keep the section sized to
+    /// the real bytes so the sweep does not walk the pad.
+    fn synthetic_code(arch: Arch, bits: u8, code: &[u8]) -> Target {
+        let mut bytes = code.to_vec();
+        bytes.resize(code.len() + 4096, 0);
+        Target {
+            path: "synthetic".into(),
+            format: crate::Format::Elf,
+            arch,
+            bits,
+            little_endian: true,
+            entry: 0x1000,
+            sections: vec![crate::Section {
+                name: "code0".into(),
+                addr: 0x1000,
+                size: code.len() as u64,
+                file_offset: 0,
+            }],
+            symbols: vec![],
+            bytes,
+            page_map: None,
+        }
+    }
+
+    #[test]
+    fn direct_target_parses_hex_immediates() {
+        assert_eq!(direct_target("0x1000"), Some(0x1000));
+        assert_eq!(direct_target("#0xabc"), Some(0xabc));
+        assert_eq!(direct_target("qword ptr [rip + 0x10]"), None);
+        assert_eq!(direct_target(""), None);
+    }
+
+    #[test]
+    fn discovers_x86_64_prologue_and_call() {
+        // push rbp; mov rbp, rsp; call 0x100f; ret; nops; ret
+        let code = [
+            0x55, 0x48, 0x89, 0xe5, 0xe8, 0x06, 0x00, 0x00, 0x00, 0xc3, 0x90, 0x90, 0x90, 0x90,
+            0x90, 0xc3,
+        ];
+        let funcs = discover_functions(&synthetic_code(Arch::X86_64, 64, &code));
+        let entry = funcs.iter().find(|f| f.addr == 0x1000).expect("entry");
+        assert_eq!(entry.calls, vec![0x100f]);
+        assert!(funcs.iter().any(|f| f.addr == 0x100f));
+    }
+
+    #[test]
+    fn discovers_arm64_prologue_and_bl() {
+        // stp x29, x30, [sp, #-16]!; bl 0x1010; ret; nop; ret
+        let code = [
+            0xfd, 0x7b, 0xbf, 0xa9, 0x03, 0x00, 0x00, 0x94, 0xc0, 0x03, 0x5f, 0xd6, 0x1f, 0x20,
+            0x03, 0xd5, 0xc0, 0x03, 0x5f, 0xd6,
+        ];
+        let funcs = discover_functions(&synthetic_code(Arch::Arm64, 64, &code));
+        let entry = funcs.iter().find(|f| f.addr == 0x1000).expect("entry");
+        assert_eq!(entry.calls, vec![0x1010]);
+        assert!(funcs.iter().any(|f| f.addr == 0x1010));
+    }
+
+    #[test]
+    fn arm64_forward_branch_extends_body() {
+        // b 0x1008; ret; ret — body must follow the branch through the ret.
+        let code = [
+            0x02, 0x00, 0x00, 0x14, 0xc0, 0x03, 0x5f, 0xd6, 0xc0, 0x03, 0x5f, 0xd6,
+        ];
+        let funcs = discover_functions(&synthetic_code(Arch::Arm64, 64, &code));
+        let entry = funcs.iter().find(|f| f.addr == 0x1000).expect("entry");
+        assert!(entry.size >= 12, "size {}", entry.size);
+    }
+
+    fn padded_ret_target(section_name: &str, kind: crate::SymbolKind) -> Target {
+        let mut bytes = vec![0u8; 4096];
+        bytes[0] = 0xc3;
+        Target {
+            path: "synthetic".into(),
+            format: crate::Format::MachO,
+            arch: Arch::X86,
+            bits: 32,
+            little_endian: true,
+            entry: 0,
+            sections: vec![crate::Section {
+                name: section_name.into(),
+                addr: 0x1000,
+                size: 1,
+                file_offset: 0,
+            }],
+            symbols: vec![crate::Symbol {
+                addr: 0x1000,
+                size: 0,
+                name: "f".into(),
+                kind,
+            }],
+            bytes,
+            page_map: None,
+        }
+    }
+
+    #[test]
+    fn symbol_in_text_is_a_function_seed() {
+        let funcs = discover_functions(&padded_ret_target("__text", crate::SymbolKind::Local));
+        assert!(funcs.iter().any(|f| f.addr == 0x1000));
+    }
+
+    #[test]
+    fn import_and_non_text_symbol_are_not_seeds() {
+        let funcs = discover_functions(&padded_ret_target("__cstring", crate::SymbolKind::Import));
+        assert!(funcs.is_empty());
+        // A defined symbol in a non-text section is not a seed either.
+        let local = discover_functions(&padded_ret_target("__cstring", crate::SymbolKind::Local));
+        assert!(local.is_empty());
+    }
+
+    fn pointer_target(arch: Arch, bits: u8, bytes: &[u8]) -> Target {
+        Target {
+            path: "synthetic".into(),
+            format: crate::Format::Elf,
+            arch,
+            bits,
+            little_endian: true,
+            entry: 0,
+            sections: vec![crate::Section {
+                name: ".text".into(),
+                addr: 0x1000,
+                size: bytes.len() as u64,
+                file_offset: 0,
+            }],
+            symbols: vec![],
+            bytes: bytes.to_vec(),
+            page_map: None,
+        }
+    }
+
+    #[test]
+    fn data_xref_on_64bit_is_eight_bytes() {
+        let bytes = [0x08, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let target = pointer_target(Arch::Arm64, 64, &bytes);
+        assert_eq!(data_xrefs(&target, 0x1008).len(), 1);
+
+        let short = pointer_target(Arch::Arm64, 64, &[0x08, 0x10, 0x00, 0x00]);
+        assert!(data_xrefs(&short, 0x1008).is_empty());
+    }
+
+    #[test]
+    fn string_xref_follows_64bit_pointer() {
+        let mut bytes = vec![0x08, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        bytes.extend_from_slice(b"hello\0");
+        bytes.extend_from_slice(&[0u8; 16]);
+        let target = pointer_target(Arch::Arm64, 64, &bytes);
+        let hits = strings_with_xrefs(&target, 4);
+        let hello = hits.iter().find(|s| s.value == "hello").expect("hello");
+        assert!(hello.refs.contains(&0x1000));
     }
 }

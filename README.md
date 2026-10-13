@@ -38,19 +38,39 @@ rea strings /bin/ls --min-length 6
 rea disasm /bin/ls --count 32
 rea disasm /bin/ls --address 0x100003f80
 
+# Functions, calls, and references
+rea funcs /bin/ls
+rea callgraph /bin/ls
+rea xrefs /bin/ls 0x100003f80
+
+# Format-specific facts
+rea macho /bin/ls
+rea wasm module.wasm
+rea goinfo go-binary
+rea pe program.exe
+rea elf /path/to/elf
+
 # All commands emit JSON — pipe anywhere
 rea strings /bin/ls | jq '.count'
 ```
 
 ## MCP server
 
-`rea mcp` speaks JSON-RPC 2.0 over stdio and exposes five tools:
+`rea mcp` speaks JSON-RPC 2.0 over stdio and exposes thirteen tools:
 
 - `rea_info` — format, architecture, entry point, section/symbol counts
 - `rea_sections` — section names, virtual addresses, sizes, file offsets
 - `rea_symbols` — imports, exports, and locals, filterable by kind
-- `rea_strings` — printable strings with file offsets
+- `rea_strings` — printable strings with file offsets; optional `xrefs` annotates code references
 - `rea_disasm` — instruction-level disassembly at any virtual address
+- `rea_funcs` — function boundaries from the entry point, direct calls, and prologues
+- `rea_xrefs` — code locations referencing an address (32-bit data xrefs)
+- `rea_call_graph` — direct calls between discovered functions
+- `rea_wasm` — WASM section ids, imports, and exports
+- `rea_go` — Go 1.18+ build info (version and module text)
+- `rea_macho` — dylibs and UUID
+- `rea_pe` — data directories, CLR header presence, root resource type ids
+- `rea_elf` — interpreter, needed libraries, soname, and GNU build-id
 
 Register it with any MCP-capable agent, e.g. Claude Code:
 
@@ -89,9 +109,9 @@ Or in an MCP client config:
 
 ## Roadmap
 
-- [ ] .NET assembly inspection
-- [ ] WASM module inspection
-- [ ] Function boundary detection and cross-reference resolution
+- [ ] .NET assembly inspection (`rea pe` only reports whether a CLR header is present)
+- [x] WASM module inspection — section ids, imports, and exports (`rea wasm`). No decode to WAT and no execution
+- [x] Function boundary detection and cross-reference resolution — Capstone sweep (entry, direct calls, prologues) plus 32-bit data xrefs, exposed as `rea funcs`, `rea xrefs`, `rea callgraph`, and the MCP tools
 - [ ] Export as C/C++ headers from recovered definitions
 
 ## License

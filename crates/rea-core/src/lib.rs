@@ -3,9 +3,14 @@
 
 pub mod analysis;
 pub mod disasm;
+pub mod elf_meta;
+pub mod goinfo;
 pub mod le;
 pub mod loader;
+pub mod macho_meta;
+pub mod pe_meta;
 pub mod strings;
+pub mod wasm;
 
 /// Executable file format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

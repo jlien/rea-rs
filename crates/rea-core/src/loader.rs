@@ -37,7 +37,7 @@ fn load_le(bytes: Vec<u8>, path: String) -> Result<Target> {
     // Apply internal fixups so analysis sees relocated pointers (the file
     // stores unrelocated values; DOS/4GW patches them at load time).
     let mut patched = bytes;
-    let _ = img.apply_fixups(&mut patched);
+    img.apply_fixups(&mut patched)?;
     let page_map = img.pages;
     Ok(Target {
         path,
