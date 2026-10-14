@@ -122,28 +122,116 @@
     border-radius: 3px;
   }
   footer { color: var(--muted); font-size: 0.85rem; margin-top: 2.5rem; font-family: "Avenir Next", "Segoe UI", sans-serif; }
+  details.archive {
+    border: 1px solid var(--line);
+    background: var(--sheet);
+    padding: 0.7rem 1rem 0.4rem;
+    margin: 1.6rem 0 0.4rem;
+  }
+  details.archive > summary {
+    font-family: "Avenir Next", "Segoe UI", sans-serif;
+    font-weight: 600;
+    margin-bottom: 0.5rem;
+  }
 </style>
 </head>
 <body>
 <header class="top">
-  <span>rea-rs · 13 Oct 2026</span>
+  <span>rea-rs · 14 Oct 2026</span>
   <nav>
-    <a href="#progress">Progress</a>
+    <a href="#now">Now</a>
+    <a href="#done">Done</a>
+    <a href="#commands">Commands</a>
     <a href="#fidelity">Fidelity</a>
     <a href="#overlap">Overlap</a>
     <a href="#gaps">Gaps</a>
+    <a href="#log">Log</a>
     <a href="#review">LE review</a>
   </nav>
 </header>
 <main>
-  <h1>rea-rs progress</h1>
-  <p class="lede">The in-process static slice grew. It still tracks the pitch of <a href="https://github.com/morluto/rea">morluto/rea</a>, not the product. API compatibility is none.</p>
-  <p class="meta">Compared with <code>morluto/rea</code> <code>main</code> on 12 Oct 2026. Upstream tool names were read from <code>src/contracts</code>. GLM 5.3 Flash wrote the new parsers; this page is the integration record.</p>
-
-  <h2 id="progress">What landed</h2>
+  <h1>rea-rs, as of this tree</h1>
+  <p class="lede">Local static inspection of Mach-O, ELF, PE, and LE. It follows the pitch of <a href="https://github.com/morluto/rea">morluto/rea</a>. API compatibility is none.</p>
+  <p class="meta" id="now">14 Oct 2026. Commit <code>42f7022</code> on local <code>main</code>, nine commits ahead of <code>origin/main</code> (<code>edb709d</code>). Not pushed. Upstream tool names were read from <code>morluto/rea</code> <code>src/contracts</code> on 12 Oct 2026.</p>
   <div class="banner">
-    <p>Workspace tests this round: <code>cargo test --workspace --offline</code> — rea-core 73 passed, rea-mcp 5 passed, CLI compiled. The pre-existing unused <code>mut</code> on the Capstone handle in <code>disasm.rs</code> is still a warning.</p>
+    <p><code>cargo test --workspace --offline</code> — rea-core 73 passed, rea-mcp 5 passed, CLI compiled. <code>disasm.rs</code> still warns about an unused <code>mut</code> on the Capstone handle.</p>
   </div>
+
+  <h2 id="done">Since the public commit</h2>
+  <p><code>origin/main</code> is <code>edb709d</code>: multi-arch analysis, WASM sections, Go 1.18+ build info, Mach-O dylibs and UUID, PE directories, ELF notes, and the LE fixup walker. The nine commits below are local only.</p>
+  <table>
+    <thead><tr><th>Commit</th><th>What it added</th></tr></thead>
+    <tbody>
+      <tr><td><code>42f7022</code></td><td>MemberRef names. InterfaceImpl is skipped so those names stay aligned.</td></tr>
+      <tr><td><code>a9f4622</code></td><td>Removed the game-specific notes. The LE loader stays described as Watcom/DOS/4GW.</td></tr>
+      <tr><td><code>de23f4f</code></td><td>Param names on each method. ParamPtr is skipped.</td></tr>
+      <tr><td><code>1c900f4</code></td><td>Field names on each TypeDef. FieldPtr is skipped.</td></tr>
+      <tr><td><code>0acca9e</code></td><td>MethodDef names on each TypeDef.</td></tr>
+      <tr><td><code>3ec7fdf</code></td><td>Module, TypeRef, and TypeDef names.</td></tr>
+      <tr><td><code>462b853</code></td><td>CLR table row counts from <code>#~</code>, or <code>#-</code> when <code>#~</code> is absent.</td></tr>
+      <tr><td><code>335dd1e</code></td><td><code>sqlite_schema</code> objects from the page-1 b-tree.</td></tr>
+      <tr><td><code>7268c65</code></td><td>Thumb discovery, PC-relative xrefs, Mach-O build version and fat arches, the CLR stream directory, the SQLite header, section <code>rwx</code>, and a CodeView PDB path.</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="commands">What you can run</h2>
+  <p>Each row is one command and the matching MCP tool. The third column is the limit of that command.</p>
+  <table>
+    <thead><tr><th>Command</th><th>Reads</th><th>Stops before</th></tr></thead>
+    <tbody>
+      <tr><td><code>rea info</code><br><code>rea_info</code></td><td>Format, architecture, bits, entry, section count, symbol count. Fat Mach-O uses the host slice.</td><td>A second architecture's code.</td></tr>
+      <tr><td><code>rea sections</code><br><code>rea_sections</code></td><td>Name, virtual address, size, file offset, and an <code>rwx</code> string. Mach-O permissions come from the segment.</td><td>Overlays.</td></tr>
+      <tr><td><code>rea symbols</code><br><code>rea_symbols</code></td><td>Imports, exports, and locals.</td><td>Demangling and stab filtering.</td></tr>
+      <tr><td><code>rea strings</code><br><code>rea_strings</code></td><td>Printable runs. <code>--xrefs</code> adds code references at the binary's pointer width, plus arm64 ADRP and x86_64 RIP-relative loads in <code>__text</code> or <code>.text</code>.</td><td>PC-relative loads on other architectures.</td></tr>
+      <tr><td><code>rea disasm</code><br><code>rea_disasm</code></td><td>Capstone at a virtual address. Modes: x86, x86_64, Thumb, arm64.</td><td>Decompilation.</td></tr>
+      <tr><td><code>rea funcs</code><br><code>rea callgraph</code><br><code>rea_funcs</code><br><code>rea_call_graph</code></td><td>Functions from the entry, text-section symbols, prologues, and direct calls. Bodies follow a forward <code>jmp</code> or arm64 <code>b</code>.</td><td>A ground-truth procedure list. Counts are a heuristic.</td></tr>
+      <tr><td><code>rea xrefs</code><br><code>rea_xrefs</code></td><td>Absolute pointers, 8 bytes on 64-bit targets and 4 bytes otherwise, plus those PC-relative loads.</td><td>The low 32 bits of a 64-bit pointer.</td></tr>
+      <tr><td><code>rea macho</code><br><code>rea_macho</code></td><td>Dylibs, UUID, platform, min OS, SDK, a code-signature flag, and fat architecture offset and size.</td><td>The CMS signature blob.</td></tr>
+      <tr><td><code>rea pe</code><br><code>rea_pe</code></td><td>Data directories, CLR header, stream directory, table row counts, the names in the CLR table below, a CodeView PDB path, and root resource type ids.</td><td>Signatures, IL, and every metadata row the CLR table does not name.</td></tr>
+      <tr><td><code>rea elf</code><br><code>rea_elf</code></td><td>Interpreter, needed libraries, soname, GNU build-id.</td><td>A system ELF on this Mac. <code>/bin/ls</code> is Mach-O, so the command errors.</td></tr>
+      <tr><td><code>rea wasm</code><br><code>rea_wasm</code></td><td>Section ids, imports, and exports. The loader still rejects WASM, so the command reads the file itself.</td><td>WAT and execution.</td></tr>
+      <tr><td><code>rea goinfo</code><br><code>rea_go</code></td><td>Go 1.18+ inline build info.</td><td>Pre-1.18 pointer build info. That form returns an error and is not dereferenced.</td></tr>
+      <tr><td><code>rea sqlite</code><br><code>rea_sqlite</code></td><td>Database header and <code>sqlite_schema</code> objects: kind, name, table, root page, SQL. The loader still rejects a database.</td><td>Table rows and WAL replay.</td></tr>
+      <tr><td><code>rea mcp</code></td><td>The fourteen tools above. Failures are text <code>error: …</code>. Unknown methods are JSON-RPC <code>-32601</code>.</td><td>Evidence records, sessions, and progress notifications.</td></tr>
+    </tbody>
+  </table>
+
+  <h3 id="clr">CLR names inside <code>rea pe</code></h3>
+  <p>Table row counts come from the <code>#~</code> stream, or <code>#-</code> when <code>#~</code> is absent. A short stream yields no counts. Names come from <code>#Strings</code>. No string heap means no names, and the counts still appear.</p>
+  <table>
+    <thead><tr><th>Metadata</th><th>Stored</th><th>Left unread</th></tr></thead>
+    <tbody>
+      <tr><td><code>Module</code>, <code>TypeRef</code>, <code>TypeDef</code></td><td>Table name, namespace, and type name on each <code>types</code> entry.</td><td></td></tr>
+      <tr><td><code>Field</code></td><td>Field names on the owning <code>TypeDef</code>, split by its 1-based <code>FieldList</code>.</td><td>The field signature. <code>FieldPtr</code> is skipped and not applied.</td></tr>
+      <tr><td><code>MethodDef</code></td><td>Method name on the owning <code>TypeDef</code>, split by its 1-based <code>MethodList</code>.</td><td>RVA and the method signature. <code>MethodPtr</code> is skipped and not applied.</td></tr>
+      <tr><td><code>Param</code></td><td>Parameter names on that method, split by its 1-based <code>ParamList</code>.</td><td>Sequence numbers. <code>ParamPtr</code> is skipped and not applied.</td></tr>
+      <tr><td><code>MemberRef</code></td><td>The name, in <code>member_refs</code>.</td><td>The parent index and the signature. <code>InterfaceImpl</code> is skipped so the names stay aligned.</td></tr>
+      <tr><td>Every other table</td><td>The row count, when the valid bit is set.</td><td>The row bodies, and all IL.</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Measured on this machine</h3>
+  <table>
+    <thead><tr><th>Check</th><th>Result</th></tr></thead>
+    <tbody>
+      <tr><td><code>rea callgraph /bin/ls</code></td><td>143 functions, 499 edges.</td></tr>
+      <tr><td><code>rea strings /bin/ls --xrefs --min-length 6</code></td><td>20 strings, including <code>bin/ls</code> and <code>COLUMNS</code>.</td></tr>
+      <tr><td><code>rea sections /bin/ls</code></td><td><code>__text</code> is <code>r-x</code>. <code>__data</code> is <code>rw-</code>. <code>__cstring</code> inside <code>__TEXT</code> is also <code>r-x</code>.</td></tr>
+      <tr><td><code>rea macho /bin/ls</code></td><td>Dylibs self, libutil, libncurses.5.4, libSystem.B. UUID <code>322cb148c4013ea0a0234b21a104d42f</code>. macOS 11.0.0, SDK 26.3.0, code signature present. x86_64 at offset 16384 size 48112, arm64 at offset 65536 size 89088.</td></tr>
+      <tr><td><code>rea goinfo /bin/ls</code></td><td><code>{found:false}</code>.</td></tr>
+      <tr><td><code>rea elf /bin/ls</code></td><td><code>parse error: elf: Invalid magic number</code>. No system ELF and no system assembly were on this machine.</td></tr>
+      <tr><td>CLR fixtures</td><td>Module <code>Hello</code>, type <code>World.App</code>. <code>Ns.App</code> owns field <code>Fld</code> and method <code>Run</code>. <code>Other</code> owns field <code>More</code> and method <code>Done</code>. <code>Run</code> takes <code>a</code> and <code>b</code>. <code>Stop</code> takes <code>c</code>. Member refs <code>Write</code> and <code>Read</code>.</td></tr>
+      <tr><td><code>rea sqlite</code></td><td>A 512-byte-page sqlite3 file matched <code>sqlite_master</code>: table <code>notes</code> root 2, index <code>notes_body</code> root 3, view <code>v</code> with 926 bytes of SQL.</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Out of this tree</h3>
+  <p>Hopper, Ghidra, IDA, JEB, Frida, browser and CDP, Android and adb, evidence sessions, decompilation, WAT execution, and pre-1.18 Go pointer chasing. Also signatures, IL, the unread metadata rows, SQLite table rows, and WAL replay.</p>
+
+  <details class="archive" id="log">
+    <summary>Evidence log — how each check was recorded</summary>
+    <p>The tables above are the current limit of each command. This log is the same evidence, kept by the round it landed. Open it when a number above needs a source.</p>
+    <h3>What landed</h3>
   <table>
     <thead><tr><th>Slice</th><th>Where it shows up</th><th>Check</th><th></th></tr></thead>
     <tbody>
@@ -233,18 +321,11 @@
       <tr><td>CLR header</td><td>Fixture: runtime 2.5, entry <code>0x06000001</code>, version <code>v4.0.30319</code>. A bad BSJB signature keeps the runtime fields and leaves the version empty. A header shorter than 24 bytes does not fail the PE parse.</td></tr>
     </tbody>
   </table>
-
-  <h3>In-process static slice</h3>
-  <div class="banner">
-    <p>Thumb discovery, Mach-O fat architectures, build version, and the code-signature flag, the CLR stream directory, metadata table row counts, <code>Module</code> / <code>TypeRef</code> / <code>TypeDef</code> names, <code>Field</code> and <code>MethodDef</code> names on each type, <code>Param</code> names on each method, and <code>MemberRef</code> names, SQLite <code>sqlite_schema</code>, section <code>rwx</code> permissions, and a CodeView PDB path are in this tree. The rows below that stay partial are still cousins of the upstream tools, not drop-in replacements. Hopper, Ghidra, IDA, JEB, Frida, browser and CDP, Android and adb, evidence sessions, decompilation, WAT execution, pre-1.18 Go pointer chasing, the other metadata rows, signatures, IL, SQLite table rows, and WAL replay are not in this tree.</p>
-  </div>
-
-  <h3>Still out of scope</h3>
-  <p>Hopper, Ghidra, IDA, JEB, Frida, browser and CDP, Android and adb, evidence sessions, decompilation, WAT execution, and pre-1.18 Go pointer chasing.</p>
+  </details>
 
   <div class="verdict" id="fidelity">
     <strong>Fidelity</strong>
-    <p>Shared idea: a local stdio MCP and a JSON CLI for static inspection of native binaries. That slice is wider than the first review (five tools then, fourteen now). It covers function discovery on x86, x86_64, arm64, and Thumb, a direct call graph, WASM sections, Go 1.18+ build info, Mach-O dylibs, UUID, build version, a code-signature flag, and fat architectures, a PE directory skim plus a CLR header, stream directory, table row counts, type names, field names, method names, parameter names, and member-ref names, ELF interpreter and build-id, a SQLite header and <code>sqlite_schema</code>, and a real LE fixup pass. It is still a different program. Tool names do not match. There is no Evidence record, no provider session, and the protocol stays <code>2024-11-05</code> with text results. LE / DOS/4GW is original work. Upstream has no Watcom LE contract.</p>
+    <p>This is a different program from <a href="https://github.com/morluto/rea">morluto/rea</a>. Tool names do not match. There is no Evidence record and no provider session. The protocol stays <code>2024-11-05</code> with text results. LE / DOS/4GW is original work. Upstream has no Watcom LE contract. The commit list and the command table above are what this tree reads.</p>
   </div>
 
   <h2>What each side is</h2>
