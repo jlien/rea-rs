@@ -152,16 +152,17 @@
 <main>
   <h1>rea-rs, as of this tree</h1>
   <p class="lede">Local static inspection of Mach-O, ELF, PE, and LE. It follows the pitch of <a href="https://github.com/morluto/rea">morluto/rea</a>. API compatibility is none.</p>
-  <p class="meta" id="now">14 Oct 2026. Commit <code>42f7022</code> on local <code>main</code>, nine commits ahead of <code>origin/main</code> (<code>edb709d</code>). Not pushed. Upstream tool names were read from <code>morluto/rea</code> <code>src/contracts</code> on 12 Oct 2026.</p>
+  <p class="meta" id="now">14 Oct 2026. Newest code commit is <code>42f7022</code>. <code>origin/main</code> is <code>edb709d</code>. Not pushed. The Done table is the local history, newest first. Upstream tool names were read from <code>morluto/rea</code> <code>src/contracts</code> on 12 Oct 2026.</p>
   <div class="banner">
     <p><code>cargo test --workspace --offline</code> — rea-core 73 passed, rea-mcp 5 passed, CLI compiled. <code>disasm.rs</code> still warns about an unused <code>mut</code> on the Capstone handle.</p>
   </div>
 
   <h2 id="done">Since the public commit</h2>
-  <p><code>origin/main</code> is <code>edb709d</code>: multi-arch analysis, WASM sections, Go 1.18+ build info, Mach-O dylibs and UUID, PE directories, ELF notes, and the LE fixup walker. The nine commits below are local only.</p>
+  <p><code>origin/main</code> is <code>edb709d</code>: multi-arch analysis, WASM sections, Go 1.18+ build info, Mach-O dylibs and UUID, PE directories, ELF notes, and the LE fixup walker. The commits below are local only. The first row is this page. The rest are code.</p>
   <table>
     <thead><tr><th>Commit</th><th>What it added</th></tr></thead>
     <tbody>
+      <tr><td><code>9f930b9</code></td><td>This page. The rows below are the code. Round-by-round checks sit in the evidence log.</td></tr>
       <tr><td><code>42f7022</code></td><td>MemberRef names. InterfaceImpl is skipped so those names stay aligned.</td></tr>
       <tr><td><code>a9f4622</code></td><td>Removed the game-specific notes. The LE loader stays described as Watcom/DOS/4GW.</td></tr>
       <tr><td><code>de23f4f</code></td><td>Param names on each method. ParamPtr is skipped.</td></tr>
