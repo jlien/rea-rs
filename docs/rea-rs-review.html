@@ -154,7 +154,7 @@
   <p class="lede">Local static inspection of Mach-O, ELF, PE, and LE. It follows the pitch of <a href="https://github.com/morluto/rea">morluto/rea</a>. API compatibility is none.</p>
   <p class="meta" id="now">14 Oct 2026. Newest code commit is <code>42f7022</code>. <code>origin/main</code> is <code>edb709d</code>. Not pushed. The Done table is the local history, newest first. Upstream tool names were read from <code>morluto/rea</code> <code>src/contracts</code> on 12 Oct 2026.</p>
   <div class="banner">
-    <p><code>cargo test --workspace --offline</code> — rea-core 73 passed, rea-mcp 5 passed, CLI compiled. <code>disasm.rs</code> still warns about an unused <code>mut</code> on the Capstone handle.</p>
+    <p><code>cargo test --workspace --offline</code> — rea-core 74 passed, rea-mcp 5 passed, CLI compiled. <code>disasm.rs</code> still warns about an unused <code>mut</code> on the Capstone handle.</p>
   </div>
 
   <h2 id="done">Since the public commit</h2>
@@ -181,7 +181,7 @@
     <thead><tr><th>Command</th><th>Reads</th><th>Stops before</th></tr></thead>
     <tbody>
       <tr><td><code>rea info</code><br><code>rea_info</code></td><td>Format, architecture, bits, entry, section count, symbol count. Fat Mach-O uses the host slice.</td><td>A second architecture's code.</td></tr>
-      <tr><td><code>rea sections</code><br><code>rea_sections</code></td><td>Name, virtual address, size, file offset, and an <code>rwx</code> string. Mach-O permissions come from the segment.</td><td>Overlays.</td></tr>
+      <tr><td><code>rea sections</code><br><code>rea_sections</code></td><td>Name, virtual address, size, file offset, and an <code>rwx</code> string. Mach-O permissions come from the segment. ELF names come from the section-header string table.</td><td>Overlays.</td></tr>
       <tr><td><code>rea symbols</code><br><code>rea_symbols</code></td><td>Imports, exports, and locals.</td><td>Demangling and stab filtering.</td></tr>
       <tr><td><code>rea strings</code><br><code>rea_strings</code></td><td>Printable runs. <code>--xrefs</code> adds code references at the binary's pointer width, plus arm64 ADRP and x86_64 RIP-relative loads in <code>__text</code> or <code>.text</code>.</td><td>PC-relative loads on other architectures.</td></tr>
       <tr><td><code>rea disasm</code><br><code>rea_disasm</code></td><td>Capstone at a virtual address. Modes: x86, x86_64, Thumb, arm64.</td><td>Decompilation.</td></tr>
@@ -221,6 +221,7 @@
       <tr><td><code>rea macho /bin/ls</code></td><td>Dylibs self, libutil, libncurses.5.4, libSystem.B. UUID <code>322cb148c4013ea0a0234b21a104d42f</code>. macOS 11.0.0, SDK 26.3.0, code signature present. x86_64 at offset 16384 size 48112, arm64 at offset 65536 size 89088.</td></tr>
       <tr><td><code>rea goinfo /bin/ls</code></td><td><code>{found:false}</code>.</td></tr>
       <tr><td><code>rea elf /bin/ls</code></td><td><code>parse error: elf: Invalid magic number</code>. No system ELF and no system assembly were on this machine.</td></tr>
+      <tr><td>ELF section names</td><td>Fixture sections are the empty name, <code>.text</code> (<code>r-x</code> at <code>0x1000</code>), and <code>.shstrtab</code>. The name is the string-table offset, so <code>.shstrtab</code> is not read as <code>text</code>.</td></tr>
       <tr><td>CLR fixtures</td><td>Module <code>Hello</code>, type <code>World.App</code>. <code>Ns.App</code> owns field <code>Fld</code> and method <code>Run</code>. <code>Other</code> owns field <code>More</code> and method <code>Done</code>. <code>Run</code> takes <code>a</code> and <code>b</code>. <code>Stop</code> takes <code>c</code>. Member refs <code>Write</code> and <code>Read</code>.</td></tr>
       <tr><td><code>rea sqlite</code></td><td>A 512-byte-page sqlite3 file matched <code>sqlite_master</code>: table <code>notes</code> root 2, index <code>notes_body</code> root 3, view <code>v</code> with 926 bytes of SQL.</td></tr>
     </tbody>

@@ -172,11 +172,10 @@ fn load_elf(bytes: Vec<u8>, path: String) -> Result<Target> {
     let sections: Vec<Section> = elf
         .section_headers
         .iter()
-        .enumerate()
-        .map(|(i, sh)| {
+        .map(|sh| {
             let flags = sh.sh_flags;
             Section {
-                name: shstr.get_at(i).unwrap_or("").to_string(),
+                name: shstr.get_at(sh.sh_name).unwrap_or("").to_string(),
                 addr: sh.sh_addr,
                 size: sh.sh_size,
                 file_offset: sh.sh_offset,
@@ -290,4 +289,63 @@ fn load_pe(bytes: Vec<u8>, path: String) -> Result<Target> {
         bytes,
         page_map: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::load_elf;
+
+    #[test]
+    fn elf_section_names_use_the_string_table_offset() {
+        let target = load_elf(elf_with_named_sections(), "fixture.elf".into()).unwrap();
+        let names: Vec<_> = target.sections.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["", ".text", ".shstrtab"]);
+        assert_eq!(target.sections[1].perms, "r-x");
+        assert_eq!(target.sections[1].addr, 0x1000);
+    }
+
+    /// `.shstrtab` starts at offset 7. Using the section index would read `text`.
+    fn elf_with_named_sections() -> Vec<u8> {
+        let shstr = b"\0.text\0.shstrtab\0";
+        let shstr_off = 64u64;
+        let shoff = shstr_off + shstr.len() as u64;
+        let mut file = vec![0u8; shoff as usize + 3 * 64];
+        file[0..4].copy_from_slice(b"\x7fELF");
+        file[4] = 2;
+        file[5] = 1;
+        file[6] = 1;
+        file[16..18].copy_from_slice(&1u16.to_le_bytes());
+        file[18..20].copy_from_slice(&62u16.to_le_bytes());
+        file[20..24].copy_from_slice(&1u32.to_le_bytes());
+        file[40..48].copy_from_slice(&shoff.to_le_bytes());
+        file[52..54].copy_from_slice(&64u16.to_le_bytes());
+        file[58..60].copy_from_slice(&64u16.to_le_bytes());
+        file[60..62].copy_from_slice(&3u16.to_le_bytes());
+        file[62..64].copy_from_slice(&2u16.to_le_bytes());
+        file[shstr_off as usize..shstr_off as usize + shstr.len()].copy_from_slice(shstr);
+        write_shdr(&mut file, shoff, 1, 1, 1, 6, 0x1000, 0, 0);
+        write_shdr(&mut file, shoff, 2, 7, 3, 0, 0, shstr_off, shstr.len() as u64);
+        file
+    }
+
+    fn write_shdr(
+        buf: &mut [u8],
+        shoff: u64,
+        index: usize,
+        name: u32,
+        ty: u32,
+        flags: u64,
+        addr: u64,
+        off: u64,
+        size: u64,
+    ) {
+        let at = shoff as usize + index * 64;
+        buf[at..at + 4].copy_from_slice(&name.to_le_bytes());
+        buf[at + 4..at + 8].copy_from_slice(&ty.to_le_bytes());
+        buf[at + 8..at + 16].copy_from_slice(&flags.to_le_bytes());
+        buf[at + 16..at + 24].copy_from_slice(&addr.to_le_bytes());
+        buf[at + 24..at + 32].copy_from_slice(&off.to_le_bytes());
+        buf[at + 32..at + 40].copy_from_slice(&size.to_le_bytes());
+        buf[at + 48..at + 56].copy_from_slice(&1u64.to_le_bytes());
+    }
 }
