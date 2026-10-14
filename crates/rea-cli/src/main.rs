@@ -34,7 +34,7 @@ enum Command {
     Info { path: String },
     /// List sections with addresses, sizes, and file offsets.
     Sections { path: String },
-    /// List symbols, optionally filtered.
+    /// List symbols, optionally filtered. Mach-O stabs are omitted.
     Symbols {
         path: String,
         #[arg(value_enum, default_value_t = SymKind::All)]

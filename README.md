@@ -61,7 +61,7 @@ rea strings /bin/ls | jq '.count'
 
 - `rea_info` — format, architecture, entry point, section/symbol counts
 - `rea_sections` — section names, virtual addresses, sizes, file offsets, and `rwx` permissions
-- `rea_symbols` — imports, exports, and locals, filterable by kind
+- `rea_symbols` — imports, exports, and locals, filterable by kind. Mach-O stab symbols are omitted. Names are not demangled.
 - `rea_strings` — printable strings with file offsets; optional `xrefs` annotates code references
 - `rea_disasm` — instruction-level disassembly at any virtual address
 - `rea_funcs` — function boundaries from the entry point, direct calls, and prologues

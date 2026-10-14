@@ -258,7 +258,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "rea_symbols",
-            "description": "List symbols; optionally filter by kind: imports, exports, or locals.",
+            "description": "List symbols; optionally filter by kind: imports, exports, or locals. Mach-O stab symbols are omitted. Names are not demangled.",
             "inputSchema": schema(false, json!({
                 "kind": { "type": "string", "enum": ["all", "imports", "exports", "locals"] }
             }), &[]),

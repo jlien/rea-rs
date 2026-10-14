@@ -122,6 +122,9 @@ fn macho_target(mo: goblin::mach::MachO, bytes: Vec<u8>, path: String) -> Result
 
     let mut symbols = Vec::new();
     for (name, nlist) in mo.symbols().flatten() {
+        if nlist.is_stab() {
+            continue;
+        }
         let kind = if nlist.n_type & goblin::mach::symbols::N_TYPE
             == goblin::mach::symbols::N_UNDF
         {
@@ -293,7 +296,8 @@ fn load_pe(bytes: Vec<u8>, path: String) -> Result<Target> {
 
 #[cfg(test)]
 mod tests {
-    use super::load_elf;
+    use super::{load_elf, load_macho};
+    use crate::SymbolKind;
 
     #[test]
     fn elf_section_names_use_the_string_table_offset() {
@@ -347,5 +351,55 @@ mod tests {
         buf[at + 24..at + 32].copy_from_slice(&off.to_le_bytes());
         buf[at + 32..at + 40].copy_from_slice(&size.to_le_bytes());
         buf[at + 48..at + 56].copy_from_slice(&1u64.to_le_bytes());
+    }
+
+    #[test]
+    fn macho_symbols_skip_stabs() {
+        let target = load_macho(macho_with_stab(), "fixture.o".into()).unwrap();
+        let got: Vec<_> = target
+            .symbols
+            .iter()
+            .map(|s| (s.name.as_str(), s.kind, s.addr))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("main", SymbolKind::Local, 0x1000),
+                ("printf", SymbolKind::Import, 0),
+            ]
+        );
+    }
+
+    /// `file.c` is an `N_SO` stab (`n_type` 0x64). A defined `main` and an undefined `printf` stay.
+    fn macho_with_stab() -> Vec<u8> {
+        let strs = b"\0main\0file.c\0printf\0";
+        let symoff = 56u32;
+        let nsyms = 3u32;
+        let stroff = symoff + nsyms * 16;
+        let mut file = vec![0u8; stroff as usize + strs.len()];
+        file[0..4].copy_from_slice(&0xfeedfacfu32.to_le_bytes());
+        file[4..8].copy_from_slice(&0x01000007u32.to_le_bytes());
+        file[12..16].copy_from_slice(&1u32.to_le_bytes());
+        file[16..20].copy_from_slice(&1u32.to_le_bytes());
+        file[20..24].copy_from_slice(&24u32.to_le_bytes());
+        file[32..36].copy_from_slice(&2u32.to_le_bytes());
+        file[36..40].copy_from_slice(&24u32.to_le_bytes());
+        file[40..44].copy_from_slice(&symoff.to_le_bytes());
+        file[44..48].copy_from_slice(&nsyms.to_le_bytes());
+        file[48..52].copy_from_slice(&stroff.to_le_bytes());
+        file[52..56].copy_from_slice(&(strs.len() as u32).to_le_bytes());
+        write_nlist(&mut file, symoff as usize, 1, 0x0e, 1, 0x1000);
+        write_nlist(&mut file, symoff as usize + 16, 6, 0x64, 0, 0);
+        write_nlist(&mut file, symoff as usize + 32, 13, 0x01, 0, 0);
+        let at = stroff as usize;
+        file[at..at + strs.len()].copy_from_slice(strs);
+        file
+    }
+
+    fn write_nlist(buf: &mut [u8], at: usize, strx: u32, n_type: u8, n_sect: u8, value: u64) {
+        buf[at..at + 4].copy_from_slice(&strx.to_le_bytes());
+        buf[at + 4] = n_type;
+        buf[at + 5] = n_sect;
+        buf[at + 8..at + 16].copy_from_slice(&value.to_le_bytes());
     }
 }

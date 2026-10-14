@@ -154,7 +154,7 @@
   <p class="lede">Local static inspection of Mach-O, ELF, PE, and LE. It follows the pitch of <a href="https://github.com/morluto/rea">morluto/rea</a>. API compatibility is none.</p>
   <p class="meta" id="now">14 Oct 2026. Newest code commit is <code>b067956</code>. These commits are on <code>origin/main</code>. The Done table lists them newest first. Upstream tool names were read from <code>morluto/rea</code> <code>src/contracts</code> on 12 Oct 2026.</p>
   <div class="banner">
-    <p><code>cargo test --workspace --offline</code> — rea-core 74 passed, rea-mcp 5 passed, CLI compiled. <code>disasm.rs</code> still warns about an unused <code>mut</code> on the Capstone handle.</p>
+    <p><code>cargo test --workspace --offline</code> — rea-core 75 passed, rea-mcp 5 passed, CLI compiled. <code>disasm.rs</code> still warns about an unused <code>mut</code> on the Capstone handle.</p>
   </div>
 
   <h2 id="done">Since <code>edb709d</code></h2>
@@ -183,7 +183,7 @@
     <tbody>
       <tr><td><code>rea info</code><br><code>rea_info</code></td><td>Format, architecture, bits, entry, section count, symbol count. Fat Mach-O uses the host slice.</td><td>A second architecture's code.</td></tr>
       <tr><td><code>rea sections</code><br><code>rea_sections</code></td><td>Name, virtual address, size, file offset, and an <code>rwx</code> string. Mach-O permissions come from the segment. ELF names come from the section-header string table.</td><td>Overlays.</td></tr>
-      <tr><td><code>rea symbols</code><br><code>rea_symbols</code></td><td>Imports, exports, and locals.</td><td>Demangling and stab filtering.</td></tr>
+      <tr><td><code>rea symbols</code><br><code>rea_symbols</code></td><td>Imports, exports, and locals. Mach-O stab symbols are omitted.</td><td>Demangling.</td></tr>
       <tr><td><code>rea strings</code><br><code>rea_strings</code></td><td>Printable runs. <code>--xrefs</code> adds code references at the binary's pointer width, plus arm64 ADRP and x86_64 RIP-relative loads in <code>__text</code> or <code>.text</code>.</td><td>PC-relative loads on other architectures.</td></tr>
       <tr><td><code>rea disasm</code><br><code>rea_disasm</code></td><td>Capstone at a virtual address. Modes: x86, x86_64, Thumb, arm64.</td><td>Decompilation.</td></tr>
       <tr><td><code>rea funcs</code><br><code>rea callgraph</code><br><code>rea_funcs</code><br><code>rea_call_graph</code></td><td>Functions from the entry, text-section symbols, prologues, and direct calls. Bodies follow a forward <code>jmp</code> or arm64 <code>b</code>.</td><td>A ground-truth procedure list. Counts are a heuristic.</td></tr>
@@ -223,6 +223,7 @@
       <tr><td><code>rea goinfo /bin/ls</code></td><td><code>{found:false}</code>.</td></tr>
       <tr><td><code>rea elf /bin/ls</code></td><td><code>parse error: elf: Invalid magic number</code>. No system ELF and no system assembly were on this machine.</td></tr>
       <tr><td>ELF section names</td><td>Fixture sections are the empty name, <code>.text</code> (<code>r-x</code> at <code>0x1000</code>), and <code>.shstrtab</code>. The name is the string-table offset, so <code>.shstrtab</code> is not read as <code>text</code>.</td></tr>
+      <tr><td>Mach-O stabs</td><td>A fixture keeps local <code>main</code> at <code>0x1000</code> and import <code>printf</code>. The <code>N_SO</code> stab <code>file.c</code> is omitted.</td></tr>
       <tr><td>CLR fixtures</td><td>Module <code>Hello</code>, type <code>World.App</code>. <code>Ns.App</code> owns field <code>Fld</code> and method <code>Run</code>. <code>Other</code> owns field <code>More</code> and method <code>Done</code>. <code>Run</code> takes <code>a</code> and <code>b</code>. <code>Stop</code> takes <code>c</code>. Member refs <code>Write</code> and <code>Read</code>.</td></tr>
       <tr><td><code>rea sqlite</code></td><td>A 512-byte-page sqlite3 file matched <code>sqlite_master</code>: table <code>notes</code> root 2, index <code>notes_body</code> root 3, view <code>v</code> with 926 bytes of SQL.</td></tr>
     </tbody>
@@ -364,7 +365,7 @@
       </tr>
       <tr>
         <td>Symbols</td>
-        <td><code>rea_symbols</code> — import / export / local</td>
+        <td><code>rea_symbols</code> — import / export / local. Mach-O stabs are omitted. Names are not demangled.</td>
         <td><code>list_names</code>, <code>search_procedures</code>, Swift demangling</td>
         <td><span class="tag part">partial</span></td>
       </tr>
