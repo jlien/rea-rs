@@ -308,7 +308,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "rea_macho",
-            "description": "Mach-O dylibs, UUID, build version, code signature, and fat architectures. Slice facts use the host slice. Architectures come from the original file.",
+            "description": "Mach-O dylibs, UUID, build version, code-directory identifier, hash type, team id, and fat architectures. Slice facts use the host slice. Architectures come from the original file. The CMS blob and the hash slots are not read.",
             "inputSchema": schema(true, json!({}), &[]),
         }),
         json!({

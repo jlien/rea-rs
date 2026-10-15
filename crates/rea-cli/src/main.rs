@@ -72,7 +72,7 @@ enum Command {
     Wasm { path: String },
     /// Go 1.18+ build info embedded in a binary. Pre-1.18 pointer blobs error.
     Goinfo { path: String },
-    /// Mach-O dylibs, UUID, build version, code signature, and architectures.
+    /// Mach-O dylibs, UUID, build version, code-directory identifier, hash type, team id, and architectures. The CMS blob is not read.
     Macho { path: String },
     /// PE data directories, CLR header, metadata streams, table row counts, type names, field names, method names, parameter names, member-ref names, CodeView PDB path, root resource type ids, the name under each type, the language id under each name, and the data-entry size and code page.
     Pe { path: String },
