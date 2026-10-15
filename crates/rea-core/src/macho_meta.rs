@@ -1,4 +1,4 @@
-//! Load-command facts for one Mach-O slice, plus fat-archive architecture headers.
+//! Load-command facts for one Mach-O slice, plus each fat slice's code directory.
 
 use crate::{Error, Result};
 
@@ -30,6 +30,8 @@ pub struct MachoArch {
     pub cpu: String, // "arm64", "x86_64", "arm", "x86", or "cpu-{n}"
     pub offset: u64,
     pub size: u64,
+    /// Code directory of this slice. `None` when the slice bytes are absent or the directory does not fit.
+    pub signature: Option<MachoSignature>,
 }
 
 /// Parse one Mach-O slice (not a fat archive). Fat input returns Error::Parse.
@@ -170,7 +172,8 @@ fn hash_name(hash_type: u8) -> String {
 }
 
 /// Architecture headers from the original file, which may be a fat archive.
-/// Fat slices themselves are not parsed.
+///
+/// Each slice that is present contributes its code directory. A missing or unreadable slice leaves that signature empty and does not fail the parse. The CMS blob and the hash slots are not read.
 pub fn architectures(bytes: &[u8]) -> Result<Vec<MachoArch>> {
     match goblin::mach::Mach::parse(bytes).map_err(|e| Error::Parse(format!("mach-o: {e}")))? {
         goblin::mach::Mach::Fat(multi) => {
@@ -190,6 +193,7 @@ pub fn architectures(bytes: &[u8]) -> Result<Vec<MachoArch>> {
                         cpu: cpu_name(cputype),
                         offset: u64::from(offset),
                         size: u64::from(size),
+                        signature: slice_signature(arch.slice(bytes)),
                     }
                 })
                 .collect())
@@ -198,8 +202,23 @@ pub fn architectures(bytes: &[u8]) -> Result<Vec<MachoArch>> {
             cpu: cpu_name(mo.header.cputype()),
             offset: 0,
             size: bytes.len() as u64,
+            signature: slice_signature(bytes),
         }]),
     }
+}
+
+/// Code directory of one slice. An empty or unreadable slice is `None`.
+fn slice_signature(slice: &[u8]) -> Option<MachoSignature> {
+    if slice.is_empty() {
+        return None;
+    }
+    let mo = goblin::mach::MachO::parse(slice, 0).ok()?;
+    mo.load_commands.iter().find_map(|cmd| match &cmd.command {
+        goblin::mach::load_command::CommandVariant::CodeSignature(linkedit) => {
+            code_directory(slice, linkedit.dataoff, linkedit.datasize)
+        }
+        _ => None,
+    })
 }
 
 fn platform_name(platform: u32) -> String {
@@ -262,6 +281,7 @@ mod tests {
                 cpu: "arm64".into(),
                 offset: 0x4000,
                 size: 0x100,
+                signature: None,
             }]
         );
     }
@@ -287,6 +307,7 @@ mod tests {
                 cpu: "arm64".into(),
                 offset: 0,
                 size: bytes.len() as u64,
+                signature: None,
             }]
         );
     }
@@ -322,6 +343,83 @@ mod tests {
         let got = facts(&cms_only).unwrap();
         assert!(got.has_code_signature);
         assert_eq!(got.signature, None);
+
+        let arches = architectures(&bytes).unwrap();
+        assert_eq!(arches[0].signature, Some(got_signature()));
+        assert!(!format!("{arches:?}").contains("CMS-BLOB"));
+        assert_eq!(architectures(&cms_only).unwrap()[0].signature, None);
+    }
+
+    #[test]
+    fn fat_slices_keep_their_own_code_directories() {
+        let arm = signed_macho();
+        let intel = retarget(signed_macho(), b"com.example.cmd\0", b"TEAM654321\0");
+        let bytes = fat_two(&arm, &intel);
+        let arches = architectures(&bytes).unwrap();
+        assert!(facts(&bytes).is_err());
+        assert_eq!(arches[0].cpu, "arm64");
+        assert_eq!(arches[0].signature, Some(got_signature()));
+        assert_eq!(arches[1].cpu, "x86_64");
+        assert_eq!(
+            arches[1].signature,
+            Some(MachoSignature {
+                identifier: "com.example.cmd".into(),
+                hash_type: "sha256".into(),
+                team_id: Some("TEAM654321".into()),
+            })
+        );
+        assert!(!format!("{arches:?}").contains("CMS-BLOB"));
+    }
+
+    #[test]
+    fn unreadable_fat_slice_leaves_the_code_directory_empty() {
+        let bytes = fat_two(&signed_macho(), b"not-a-slice");
+        let arches = architectures(&bytes).unwrap();
+        assert_eq!(
+            arches[0].signature.as_ref().map(|sig| sig.identifier.as_str()),
+            Some("com.example.app")
+        );
+        assert_eq!(arches[1].cpu, "x86_64");
+        assert_eq!(arches[1].signature, None);
+    }
+
+    fn got_signature() -> MachoSignature {
+        MachoSignature {
+            identifier: "com.example.app".into(),
+            hash_type: "sha256".into(),
+            team_id: Some("TEAM123456".into()),
+        }
+    }
+
+    fn retarget(mut bytes: Vec<u8>, ident: &[u8], team: &[u8]) -> Vec<u8> {
+        let ident_at = bytes
+            .windows(ident.len())
+            .position(|window| window == b"com.example.app\0")
+            .expect("identifier");
+        let team_at = bytes
+            .windows(team.len())
+            .position(|window| window == b"TEAM123456\0")
+            .expect("team id");
+        bytes[ident_at..ident_at + ident.len()].copy_from_slice(ident);
+        bytes[team_at..team_at + team.len()].copy_from_slice(team);
+        bytes
+    }
+
+    fn fat_two(first: &[u8], second: &[u8]) -> Vec<u8> {
+        let off1 = 64u32;
+        let off2 = off1 + first.len() as u32;
+        let mut out = vec![0u8; off2 as usize + second.len()];
+        write_be(&mut out, 0, 0xcafe_babe);
+        write_be(&mut out, 4, 2);
+        write_be(&mut out, 8, 0x0100_000c);
+        write_be(&mut out, 16, off1);
+        write_be(&mut out, 20, first.len() as u32);
+        write_be(&mut out, 28, 0x0100_0007);
+        write_be(&mut out, 36, off2);
+        write_be(&mut out, 40, second.len() as u32);
+        out[off1 as usize..off1 as usize + first.len()].copy_from_slice(first);
+        out[off2 as usize..off2 as usize + second.len()].copy_from_slice(second);
+        out
     }
 
     /// Little-endian 64-bit Mach-O. `with_meta` adds `LC_BUILD_VERSION` (iOS 15.4.1,

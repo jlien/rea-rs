@@ -154,7 +154,7 @@
   <p class="lede">Local static inspection of Mach-O, ELF, PE, and LE. It follows the pitch of <a href="https://github.com/morluto/rea">morluto/rea</a>. API compatibility is none.</p>
   <p class="meta" id="now">15 Oct 2026. Newest code commit is <code>000eb68</code>. These commits are on <code>origin/main</code>. The Done table lists them newest first. Upstream tool names were read from <code>morluto/rea</code> <code>src/contracts</code> on 12 Oct 2026.</p>
   <div class="banner">
-    <p><code>cargo test --workspace --offline</code> — rea-core 81 passed, rea-mcp 5 passed, CLI compiled. <code>disasm.rs</code> still warns about an unused <code>mut</code> on the Capstone handle.</p>
+    <p><code>cargo test --workspace --offline</code> — rea-core 83 passed, rea-mcp 5 passed, CLI compiled. <code>disasm.rs</code> still warns about an unused <code>mut</code> on the Capstone handle.</p>
   </div>
 
   <h2 id="done">Since <code>edb709d</code></h2>
@@ -194,7 +194,7 @@
       <tr><td><code>rea disasm</code><br><code>rea_disasm</code></td><td>Capstone at a virtual address. Modes: x86, x86_64, Thumb, arm64.</td><td>Decompilation.</td></tr>
       <tr><td><code>rea funcs</code><br><code>rea callgraph</code><br><code>rea_funcs</code><br><code>rea_call_graph</code></td><td>Functions from the entry, text-section symbols, prologues, and direct calls. Bodies follow a forward <code>jmp</code> or arm64 <code>b</code>.</td><td>A ground-truth procedure list. Counts are a heuristic.</td></tr>
       <tr><td><code>rea xrefs</code><br><code>rea_xrefs</code></td><td>Absolute pointers, 8 bytes on 64-bit targets and 4 bytes otherwise, plus those PC-relative loads.</td><td>The low 32 bits of a 64-bit pointer.</td></tr>
-      <tr><td><code>rea macho</code><br><code>rea_macho</code></td><td>Dylibs, UUID, platform, min OS, SDK, a code-signature flag, the code-directory identifier, hash type, and team id, and fat architecture offset and size.</td><td>The CMS signature blob and the hash slots.</td></tr>
+      <tr><td><code>rea macho</code><br><code>rea_macho</code></td><td>Dylibs, UUID, platform, min OS, SDK, a code-signature flag, the code-directory identifier, hash type, and team id, and fat architecture offset and size. Each architecture whose bytes are in the file includes that slice's code directory.</td><td>The CMS signature blob and the hash slots. A slice that is missing or unreadable has an empty code directory.</td></tr>
       <tr><td><code>rea pe</code><br><code>rea_pe</code></td><td>Data directories, CLR header, stream directory, table row counts, the names in the CLR table below, a CodeView PDB path, root resource type ids, the name under each type, the language id under each name, and the data-entry size and code page.</td><td>Signatures, IL, unread metadata rows, and the resource payload.</td></tr>
       <tr><td><code>rea elf</code><br><code>rea_elf</code></td><td>Interpreter, needed libraries, soname, GNU build-id.</td><td>A system ELF on this Mac. <code>/bin/ls</code> is Mach-O, so the command errors.</td></tr>
       <tr><td><code>rea wasm</code><br><code>rea_wasm</code></td><td>Section ids, imports, exports, the defined function count, memory min and max, and the start index. The loader still rejects WASM, so the command reads the file itself.</td><td>Function bodies, type signatures, WAT, and execution.</td></tr>
@@ -225,13 +225,13 @@
       <tr><td><code>rea callgraph /bin/ls</code></td><td>143 functions, 499 edges.</td></tr>
       <tr><td><code>rea strings /bin/ls --xrefs --min-length 6</code></td><td>20 strings, including <code>bin/ls</code> and <code>COLUMNS</code>.</td></tr>
       <tr><td><code>rea sections /bin/ls</code></td><td><code>__text</code> is <code>r-x</code>. <code>__data</code> is <code>rw-</code>. <code>__cstring</code> inside <code>__TEXT</code> is also <code>r-x</code>.</td></tr>
-      <tr><td><code>rea macho /bin/ls</code></td><td>Dylibs self, libutil, libncurses.5.4, libSystem.B. UUID <code>322cb148c4013ea0a0234b21a104d42f</code>. macOS 11.0.0, SDK 26.3.0. Host-slice code directory identifier <code>com.apple.ls</code>, hash type <code>sha256</code>, no team id. x86_64 at offset 16384 size 48112, arm64 at offset 65536 size 89088.</td></tr>
+      <tr><td><code>rea macho /bin/ls</code></td><td>Dylibs self, libutil, libncurses.5.4, libSystem.B. UUID <code>322cb148c4013ea0a0234b21a104d42f</code>. macOS 11.0.0, SDK 26.3.0. x86_64 at offset 16384 size 48112 and arm64 at offset 65536 size 89088. Both slices report identifier <code>com.apple.ls</code>, hash type <code>sha256</code>, no team id.</td></tr>
       <tr><td><code>rea goinfo /bin/ls</code></td><td><code>{found:false}</code>.</td></tr>
       <tr><td>WASM function count</td><td>Fixture sections 5 and 8: one memory, min 1, max 2, start index 3, and no defined functions. The export fixture still has one defined function. Section 10 is not decoded. A second start section is <code>duplicate wasm start section</code>.</td></tr>
       <tr><td><code>rea elf /bin/ls</code></td><td><code>parse error: elf: Invalid magic number</code>. No system ELF and no system assembly were on this machine.</td></tr>
       <tr><td>ELF section names</td><td>Fixture sections are the empty name, <code>.text</code> (<code>r-x</code> at <code>0x1000</code>), and <code>.shstrtab</code>. The name is the string-table offset, so <code>.shstrtab</code> is not read as <code>text</code>.</td></tr>
       <tr><td>Mach-O stabs</td><td>A fixture keeps local <code>main</code> at <code>0x1000</code> and import <code>printf</code>. The <code>N_SO</code> stab <code>file.c</code> is omitted.</td></tr>
-      <tr><td>Mach-O code directory</td><td>Fixture identifier <code>com.example.app</code>, hash type <code>sha256</code>, team id <code>TEAM123456</code>. The CMS marker stays absent. A CMS-only blob keeps the flag and leaves the code directory empty.</td></tr>
+      <tr><td>Mach-O code directory</td><td>Fixture identifier <code>com.example.app</code>, hash type <code>sha256</code>, team id <code>TEAM123456</code>. The CMS marker stays absent. A CMS-only blob keeps the flag and leaves the code directory empty. In a fat fixture the arm64 slice stays <code>com.example.app</code> and the x86_64 slice is <code>com.example.cmd</code>, team <code>TEAM654321</code>. An unreadable slice leaves its code directory empty.</td></tr>
       <tr><td>PE resource names</td><td>Fixture type <code>VER</code> has name <code>2</code> and no language. Type <code>16</code> has <code>App</code> with no language. Name <code>1</code> has language <code>1033</code> with no data entry, and language <code>1040</code> with size 4 and code page 1252. The payload <code>SECRET</code> and the id <code>9999</code> stay absent. Integer root ids stay <code>[16]</code>.</td></tr>
       <tr><td>CLR fixtures</td><td>Module <code>Hello</code>, type <code>World.App</code>. <code>Ns.App</code> owns field <code>Fld</code> and method <code>Run</code>. <code>Other</code> owns field <code>More</code> and method <code>Done</code>. <code>Run</code> takes <code>a</code> and <code>b</code>. <code>Stop</code> takes <code>c</code>. Member refs <code>Write</code> and <code>Read</code>.</td></tr>
       <tr><td><code>rea sqlite</code></td><td>A 512-byte-page sqlite3 file matched <code>sqlite_master</code>: table <code>notes</code> root 2, index <code>notes_body</code> root 3, view <code>v</code> with 926 bytes of SQL.</td></tr>
@@ -404,7 +404,7 @@
       </tr>
       <tr>
         <td>Mach-O facts</td>
-        <td><code>rea_macho</code> — dylibs, UUID, build version, code-directory identifier, hash type, team id, and fat architecture offsets. The CMS blob and the hash slots are not read.</td>
+        <td><code>rea_macho</code> — dylibs, UUID, build version, the host slice's code directory, and each present slice's code-directory identifier, hash type, and team id. The CMS blob and the hash slots are not read.</td>
         <td><code>inspect_macho</code> and a much wider header and signature surface</td>
         <td><span class="tag part">partial</span></td>
       </tr>
@@ -449,7 +449,7 @@
       <tr><td>Hopper / Ghidra / IDA bridge</td><td>40</td><td><span class="tag low">out of scope</span></td></tr>
       <tr><td>Enhanced native (overview, ObjC, Swift, value and UI trace)</td><td>12</td><td><span class="tag part">local call graph on x86, x86_64, arm64, Thumb</span></td></tr>
       <tr><td>Session, evidence, comparisons</td><td>21</td><td><span class="tag low">out of scope</span></td></tr>
-      <tr><td>File-level extras (signature, plist, crash, layout, PE resources)</td><td>12</td><td><span class="tag part">section rwx; Mach-O UUID, build version, code-directory identifier, fat arches; ELF build-id; PE directories, CodeView PDB path, and resource type, name, language id, and data-entry size. No CMS blob, hash slots, or resource payload</span></td></tr>
+      <tr><td>File-level extras (signature, plist, crash, layout, PE resources)</td><td>12</td><td><span class="tag part">section rwx; Mach-O UUID, build version, each slice's code-directory identifier, fat arches; ELF build-id; PE directories, CodeView PDB path, and resource type, name, language id, and data-entry size. No CMS blob, hash slots, or resource payload</span></td></tr>
       <tr><td>JavaScript, Electron, web, browser</td><td>32</td><td><span class="tag low">out of scope</span></td></tr>
       <tr><td>Android, adb, apktool, JEB</td><td>35</td><td><span class="tag low">out of scope</span></td></tr>
       <tr><td>.NET / managed</td><td>7</td><td><span class="tag part">CLR header, streams, table counts, type names, Field and MethodDef names, Param names, MemberRef names. No other rows, signatures, or IL</span></td></tr>
