@@ -152,7 +152,7 @@
 <main>
   <h1>rea-rs, as of this tree</h1>
   <p class="lede">Local static inspection of Mach-O, ELF, PE, and LE. It follows the pitch of <a href="https://github.com/morluto/rea">morluto/rea</a>. API compatibility is none.</p>
-  <p class="meta" id="now">15 Oct 2026. Newest code commit is <code>73027ee</code>. These commits are on <code>origin/main</code>. The Done table lists them newest first. Upstream tool names were read from <code>morluto/rea</code> <code>src/contracts</code> on 12 Oct 2026.</p>
+  <p class="meta" id="now">15 Oct 2026. Newest code commit is <code>f80929a</code>. These commits are on <code>origin/main</code>. The Done table lists them newest first. Upstream tool names were read from <code>morluto/rea</code> <code>src/contracts</code> on 12 Oct 2026.</p>
   <div class="banner">
     <p><code>cargo test --workspace --offline</code> — rea-core 77 passed, rea-mcp 5 passed, CLI compiled. <code>disasm.rs</code> still warns about an unused <code>mut</code> on the Capstone handle.</p>
   </div>
@@ -162,6 +162,7 @@
   <table>
     <thead><tr><th>Commit</th><th>What it added</th></tr></thead>
     <tbody>
+      <tr><td><code>f80929a</code></td><td>PE resource language ids under each name. The data under a language id stays unread.</td></tr>
       <tr><td><code>73027ee</code></td><td>PE resource names, one level under each type. Language ids and resource bytes stay unread.</td></tr>
       <tr><td><code>0fa4873</code></td><td>Mach-O stab symbols are omitted. A defined symbol and an undefined import stay. Names are not demangled.</td></tr>
       <tr><td><code>b067956</code></td><td>ELF section names come from the section-header string table. <code>.shstrtab</code> is no longer read as <code>text</code>.</td></tr>
