@@ -152,7 +152,7 @@
 <main>
   <h1>rea-rs, as of this tree</h1>
   <p class="lede">Local static inspection of Mach-O, ELF, PE, and LE. It follows the pitch of <a href="https://github.com/morluto/rea">morluto/rea</a>. API compatibility is none.</p>
-  <p class="meta" id="now">15 Oct 2026. Newest code commit is <code>000eb68</code>. These commits are on <code>origin/main</code>. The Done table lists them newest first. Upstream tool names were read from <code>morluto/rea</code> <code>src/contracts</code> on 12 Oct 2026.</p>
+  <p class="meta" id="now">15 Oct 2026. Newest code commit is <code>ca2c2a2</code>. These commits are on <code>origin/main</code>. The Done table lists them newest first. Upstream tool names were read from <code>morluto/rea</code> <code>src/contracts</code> on 12 Oct 2026.</p>
   <div class="banner">
     <p><code>cargo test --workspace --offline</code> — rea-core 83 passed, rea-mcp 5 passed, CLI compiled. <code>disasm.rs</code> still warns about an unused <code>mut</code> on the Capstone handle.</p>
   </div>
@@ -162,6 +162,7 @@
   <table>
     <thead><tr><th>Commit</th><th>What it added</th></tr></thead>
     <tbody>
+      <tr><td><code>ca2c2a2</code></td><td>Each Mach-O slice's code-directory identifier, hash type, and team id. A missing slice stays empty. The CMS blob and the hash slots stay unread.</td></tr>
       <tr><td><code>000eb68</code></td><td>WASM defined function count, memory min and max, and the start index. Function bodies and type signatures stay unread.</td></tr>
       <tr><td><code>dc50170</code></td><td>Mach-O code-directory identifier, hash type, and team id. The CMS blob and the hash slots stay unread.</td></tr>
       <tr><td><code>cd43e10</code></td><td>PE resource data-entry size and code page. The payload stays unread.</td></tr>
