@@ -1,4 +1,4 @@
-//! WebAssembly binary inspector. Parses imports, exports, the function count, memory limits, and the start index. Does not decode function bodies or execute.
+//! WebAssembly binary inspector. Parses imports, exports, the function count, memory limits, table limits, and the start index. Does not decode function bodies, element segments, or execute.
 
 use crate::{Error, Result};
 
@@ -24,6 +24,14 @@ pub struct WasmMemory {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct WasmTable {
+    /// `funcref`, `externref`, or `ref-{n}`.
+    pub kind: String,
+    pub min: u32,
+    pub max: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct WasmModule {
     pub version: u32,
     pub sections: Vec<u8>, // section ids in order
@@ -33,6 +41,8 @@ pub struct WasmModule {
     pub functions: u32,
     /// Memories declared in the memory section. Imported memories stay on `imports`.
     pub memories: Vec<WasmMemory>,
+    /// Tables declared in the table section. Imported tables stay on `imports`.
+    pub tables: Vec<WasmTable>,
     /// Start function index, when the start section is present.
     pub start: Option<u32>,
 }
@@ -53,9 +63,11 @@ pub fn inspect(bytes: &[u8]) -> Result<WasmModule> {
     let mut exports = Vec::new();
     let mut functions = 0;
     let mut memories = Vec::new();
+    let mut tables = Vec::new();
     let mut start = None;
     let mut saw_functions = false;
     let mut saw_memories = false;
+    let mut saw_tables = false;
     let mut saw_start = false;
 
     while !r.eof() {
@@ -71,6 +83,13 @@ pub fn inspect(bytes: &[u8]) -> Result<WasmModule> {
                 }
                 saw_functions = true;
                 functions = decode_function_count(payload)?;
+            }
+            4 => {
+                if saw_tables {
+                    return Err(Error::Parse("duplicate wasm table section".into()));
+                }
+                saw_tables = true;
+                tables = decode_tables(payload)?;
             }
             5 => {
                 if saw_memories {
@@ -98,8 +117,38 @@ pub fn inspect(bytes: &[u8]) -> Result<WasmModule> {
         exports,
         functions,
         memories,
+        tables,
         start,
     })
+}
+
+fn decode_tables(payload: &[u8]) -> Result<Vec<WasmTable>> {
+    let mut r = Reader::new(payload);
+    let count = r.read_u32_leb()?;
+    let mut out = Vec::new();
+    for _ in 0..count {
+        let kind = ref_name(r.read_u8()?);
+        let flags = r.read_u8()?;
+        let min = r.read_u32_leb()?;
+        let max = if flags & 1 != 0 {
+            Some(r.read_u32_leb()?)
+        } else {
+            None
+        };
+        out.push(WasmTable { kind, min, max });
+    }
+    if !r.eof() {
+        return Err(Error::Parse("trailing bytes in wasm table section".into()));
+    }
+    Ok(out)
+}
+
+fn ref_name(byte: u8) -> String {
+    match byte {
+        0x70 => "funcref".to_string(),
+        0x6f => "externref".to_string(),
+        n => format!("ref-{n}"),
+    }
 }
 
 fn decode_function_count(payload: &[u8]) -> Result<u32> {
@@ -305,6 +354,7 @@ mod tests {
         assert!(m.exports.is_empty());
         assert_eq!(m.functions, 0);
         assert!(m.memories.is_empty());
+        assert!(m.tables.is_empty());
         assert_eq!(m.start, None);
     }
 
@@ -372,6 +422,7 @@ mod tests {
         let table = inspect(&hex("0061736d010000000209010165017401700001")).unwrap();
         assert_eq!(table.imports[0].kind, "table");
         assert_eq!(table.imports[0].index, 1);
+        assert!(table.tables.is_empty());
 
         // Global: consume valtype and mut, record index 0.
         let global = inspect(&hex("0061736d01000000020e0201650167037f01016501660005")).unwrap();
@@ -408,6 +459,37 @@ mod tests {
         );
         assert_eq!(m.start, Some(3));
         assert_eq!(m.functions, 0);
+    }
+
+    #[test]
+    fn table_limits_leave_the_element_section_unread() {
+        // Section 4: funcref min 1 max 4, externref min 2. Section 9 is present and ignored.
+        let m = inspect(&hex("0061736d01000000040802700101046f00020903010000")).unwrap();
+        assert_eq!(m.sections, vec![4, 9]);
+        assert_eq!(
+            m.tables,
+            vec![
+                WasmTable {
+                    kind: "funcref".into(),
+                    min: 1,
+                    max: Some(4),
+                },
+                WasmTable {
+                    kind: "externref".into(),
+                    min: 2,
+                    max: None,
+                },
+            ]
+        );
+        let elem = inspect(&hex("0061736d010000000903010000")).unwrap();
+        assert_eq!(elem.sections, vec![9]);
+        assert!(elem.tables.is_empty());
+    }
+
+    #[test]
+    fn duplicate_table_is_an_error() {
+        let err = inspect(&hex("0061736d01000000040401700000040401700001")).unwrap_err();
+        assert!(matches!(err, Error::Parse(ref msg) if msg == "duplicate wasm table section"));
     }
 
     #[test]

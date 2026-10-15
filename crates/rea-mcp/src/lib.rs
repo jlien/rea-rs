@@ -298,7 +298,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "rea_wasm",
-            "description": "List WASM section ids, imports, exports, the defined function count, memory limits, and the start index. Does not decode function bodies or execute the module.",
+            "description": "List WASM section ids, imports, exports, the defined function count, memory limits, table limits, and the start index. Does not decode function bodies, element segments, or execute the module.",
             "inputSchema": schema(true, json!({}), &[]),
         }),
         json!({

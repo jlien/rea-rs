@@ -154,7 +154,7 @@
   <p class="lede">Local static inspection of Mach-O, ELF, PE, and LE. It follows the pitch of <a href="https://github.com/morluto/rea">morluto/rea</a>. API compatibility is none.</p>
   <p class="meta" id="now">15 Oct 2026. Newest code commit is <code>ca2c2a2</code>. These commits are on <code>origin/main</code>. The Done table lists them newest first. Upstream tool names were read from <code>morluto/rea</code> <code>src/contracts</code> on 12 Oct 2026.</p>
   <div class="banner">
-    <p><code>cargo test --workspace --offline</code> — rea-core 83 passed, rea-mcp 5 passed, CLI compiled. <code>disasm.rs</code> still warns about an unused <code>mut</code> on the Capstone handle.</p>
+    <p><code>cargo test --workspace --offline</code> — rea-core 85 passed, rea-mcp 5 passed, CLI compiled. <code>disasm.rs</code> still warns about an unused <code>mut</code> on the Capstone handle.</p>
   </div>
 
   <h2 id="done">Since <code>edb709d</code></h2>
@@ -198,7 +198,7 @@
       <tr><td><code>rea macho</code><br><code>rea_macho</code></td><td>Dylibs, UUID, platform, min OS, SDK, a code-signature flag, the code-directory identifier, hash type, and team id, and fat architecture offset and size. Each architecture whose bytes are in the file includes that slice's code directory.</td><td>The CMS signature blob and the hash slots. A slice that is missing or unreadable has an empty code directory.</td></tr>
       <tr><td><code>rea pe</code><br><code>rea_pe</code></td><td>Data directories, CLR header, stream directory, table row counts, the names in the CLR table below, a CodeView PDB path, root resource type ids, the name under each type, the language id under each name, and the data-entry size and code page.</td><td>Signatures, IL, unread metadata rows, and the resource payload.</td></tr>
       <tr><td><code>rea elf</code><br><code>rea_elf</code></td><td>Interpreter, needed libraries, soname, GNU build-id.</td><td>A system ELF on this Mac. <code>/bin/ls</code> is Mach-O, so the command errors.</td></tr>
-      <tr><td><code>rea wasm</code><br><code>rea_wasm</code></td><td>Section ids, imports, exports, the defined function count, memory min and max, and the start index. The loader still rejects WASM, so the command reads the file itself.</td><td>Function bodies, type signatures, WAT, and execution.</td></tr>
+      <tr><td><code>rea wasm</code><br><code>rea_wasm</code></td><td>Section ids, imports, exports, the defined function count, memory min and max, table kind with min and max, and the start index. The loader still rejects WASM, so the command reads the file itself.</td><td>Function bodies, element segments, type signatures, WAT, and execution.</td></tr>
       <tr><td><code>rea goinfo</code><br><code>rea_go</code></td><td>Go 1.18+ inline build info.</td><td>Pre-1.18 pointer build info. That form returns an error and is not dereferenced.</td></tr>
       <tr><td><code>rea sqlite</code><br><code>rea_sqlite</code></td><td>Database header and <code>sqlite_schema</code> objects: kind, name, table, root page, SQL. The loader still rejects a database.</td><td>Table rows and WAL replay.</td></tr>
       <tr><td><code>rea mcp</code></td><td>The fourteen tools above. Failures are text <code>error: …</code>. Unknown methods are JSON-RPC <code>-32601</code>.</td><td>Evidence records, sessions, and progress notifications.</td></tr>
@@ -229,6 +229,7 @@
       <tr><td><code>rea macho /bin/ls</code></td><td>Dylibs self, libutil, libncurses.5.4, libSystem.B. UUID <code>322cb148c4013ea0a0234b21a104d42f</code>. macOS 11.0.0, SDK 26.3.0. x86_64 at offset 16384 size 48112 and arm64 at offset 65536 size 89088. Both slices report identifier <code>com.apple.ls</code>, hash type <code>sha256</code>, no team id.</td></tr>
       <tr><td><code>rea goinfo /bin/ls</code></td><td><code>{found:false}</code>.</td></tr>
       <tr><td>WASM function count</td><td>Fixture sections 5 and 8: one memory, min 1, max 2, start index 3, and no defined functions. The export fixture still has one defined function. Section 10 is not decoded. A second start section is <code>duplicate wasm start section</code>.</td></tr>
+      <tr><td>WASM tables</td><td>Fixture section 4: <code>funcref</code> min 1 max 4, and <code>externref</code> min 2. Section 9 is present and adds no table. An imported table stays on the import list. A second table section is <code>duplicate wasm table section</code>.</td></tr>
       <tr><td><code>rea elf /bin/ls</code></td><td><code>parse error: elf: Invalid magic number</code>. No system ELF and no system assembly were on this machine.</td></tr>
       <tr><td>ELF section names</td><td>Fixture sections are the empty name, <code>.text</code> (<code>r-x</code> at <code>0x1000</code>), and <code>.shstrtab</code>. The name is the string-table offset, so <code>.shstrtab</code> is not read as <code>text</code>.</td></tr>
       <tr><td>Mach-O stabs</td><td>A fixture keeps local <code>main</code> at <code>0x1000</code> and import <code>printf</code>. The <code>N_SO</code> stab <code>file.c</code> is omitted.</td></tr>
@@ -240,7 +241,7 @@
   </table>
 
   <h3>Out of this tree</h3>
-  <p>Hopper, Ghidra, IDA, JEB, Frida, browser and CDP, Android and adb, evidence sessions, decompilation, WASM function bodies, WAT execution, and pre-1.18 Go pointer chasing. Also signatures, IL, the unread metadata rows, SQLite table rows, and WAL replay.</p>
+  <p>Hopper, Ghidra, IDA, JEB, Frida, browser and CDP, Android and adb, evidence sessions, decompilation, WASM function bodies, element segments, WAT execution, and pre-1.18 Go pointer chasing. Also signatures, IL, the unread metadata rows, SQLite table rows, and WAL replay.</p>
 
   <details class="archive" id="log">
     <summary>Evidence log — how each check was recorded</summary>
@@ -269,8 +270,8 @@
       </tr>
       <tr>
         <td>WASM module facts</td>
-        <td><code>rea wasm</code>, <code>rea_wasm</code>. Reads the file itself. Loader still rejects WASM. The function section contributes a count. The memory section contributes min and max. The start section contributes an index.</td>
-        <td>Sample <code>0061736d…</code>: version 1, sections 1, 3, 7, 10, one defined function, export <code>f</code> func 0. Sections 5 and 8: memory min 1 max 2, start index 3. Section 10 is not decoded.</td>
+        <td><code>rea wasm</code>, <code>rea_wasm</code>. Reads the file itself. Loader still rejects WASM. The function section contributes a count. The memory and table sections contribute min and max. The start section contributes an index.</td>
+        <td>Sample <code>0061736d…</code>: version 1, sections 1, 3, 7, 10, one defined function, export <code>f</code> func 0. Sections 5 and 8: memory min 1 max 2, start index 3. Section 4: <code>funcref</code> min 1 max 4 and <code>externref</code> min 2. Sections 9 and 10 are not decoded.</td>
         <td><span class="tag have">landed</span></td>
       </tr>
       <tr>
@@ -417,7 +418,7 @@
       </tr>
       <tr>
         <td>Go and WASM</td>
-        <td><code>rea_go</code> (1.18+ inline build info), <code>rea_wasm</code> (section ids, imports, exports, defined function count, memory min/max, start index; function bodies unread), <code>rea_sqlite</code> (header and <code>sqlite_schema</code>)</td>
+        <td><code>rea_go</code> (1.18+ inline build info), <code>rea_wasm</code> (section ids, imports, exports, defined function count, memory min/max, table min/max, start index; function bodies and element segments unread), <code>rea_sqlite</code> (header and <code>sqlite_schema</code>)</td>
         <td><code>inspect_go_binary</code>, <code>inspect_wasm_artifact</code></td>
         <td><span class="tag part">partial</span></td>
       </tr>
@@ -455,7 +456,7 @@
       <tr><td>Android, adb, apktool, JEB</td><td>35</td><td><span class="tag low">out of scope</span></td></tr>
       <tr><td>.NET / managed</td><td>7</td><td><span class="tag part">CLR header, streams, table counts, type names, Field and MethodDef names, Param names, MemberRef names. No other rows, signatures, or IL</span></td></tr>
       <tr><td>Frida</td><td>9</td><td><span class="tag low">out of scope</span></td></tr>
-      <tr><td>Go, WASM, EVM, SQLite, firmware, Flutter, packets, signals</td><td>11</td><td><span class="tag part">Go 1.18+, WASM function count and memory limits, SQLite schema. No function bodies or table rows</span></td></tr>
+      <tr><td>Go, WASM, EVM, SQLite, firmware, Flutter, packets, signals</td><td>11</td><td><span class="tag part">Go 1.18+, WASM function count, memory limits, and table limits, SQLite schema. No function bodies, element segments, or SQLite table rows</span></td></tr>
       <tr><td>Artifact inventory (bundles, nibs, asset catalogs)</td><td>6</td><td><span class="tag low">missing</span></td></tr>
     </tbody>
   </table>
