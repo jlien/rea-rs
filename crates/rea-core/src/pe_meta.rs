@@ -1,4 +1,4 @@
-//! PE data directories, CLR runtime header, CodeView PDB path, and resource type and name ids.
+//! PE data directories, CLR runtime header, CodeView PDB path, and resource type, name, and language ids.
 
 use crate::{Error, Result};
 
@@ -18,19 +18,28 @@ pub struct PeFacts {
     pub clr: Option<ClrHeader>,
     /// Root resource-directory type ids (the low 16 bits) when the entry is an integer id. Named entries are skipped. Empty if there is no resource directory.
     pub resource_type_ids: Vec<u32>,
-    /// One level of the resource directory: each root type, then the names under it. Integer ids are decimal strings. Named entries are UTF-16. Language directories and data are not read.
+    /// Resource directory through the language id. Integer ids are decimal strings. Named entries are UTF-16. Resource bytes are not read.
     pub resources: Vec<PeResource>,
     /// First CodeView PDB 7.0 or 2.0 record in the debug directory. Other debug types are skipped. `None` when the directory is absent, unmapped, or has no CodeView path.
     pub pdb: Option<PePdb>,
 }
 
-/// One resource type and the name level under it.
+/// One resource type, the names under it, and the language id under each name.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct PeResource {
     /// Integer type id as a decimal string, or the UTF-16 name when the root entry is named.
     pub ty: String,
-    /// Name level only. Integer ids are decimal strings. Named entries are UTF-16.
-    pub names: Vec<String>,
+    /// Name level. Integer ids are decimal strings. Named entries are UTF-16.
+    pub names: Vec<PeResourceName>,
+}
+
+/// One resource name and the language ids under it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PeResourceName {
+    /// Integer id as a decimal string, or the UTF-16 name.
+    pub name: String,
+    /// Language ids. The data entry under each id is not read.
+    pub languages: Vec<String>,
 }
 
 /// A CodeView PDB filename from the debug directory.
@@ -112,26 +121,46 @@ pub(crate) fn resource_type_ids(dir: &[u8]) -> Result<Vec<u32>> {
     Ok(type_ids)
 }
 
-/// Root types and the name level under each one.
+/// Root types, the name under each type, and the language id under each name.
 ///
-/// A name-level offset that points at a language directory is not followed. A short directory or a short name is an error.
+/// A language-level offset is not followed, so a further directory and the resource bytes stay unread. A short directory or a short name is an error.
 pub(crate) fn resource_tree(dir: &[u8]) -> Result<Vec<PeResource>> {
     let mut out = Vec::new();
     for entry in directory_entries(dir, 0)? {
-        let ty = entry_label(dir, entry.name_or_id)?;
-        let names = if entry.offset & 0x8000_0000 != 0 {
-            let sub = (entry.offset & 0x7fff_ffff) as usize;
-            let mut names = Vec::new();
-            for child in directory_entries(dir, sub)? {
-                names.push(entry_label(dir, child.name_or_id)?);
-            }
-            names
-        } else {
-            Vec::new()
-        };
-        out.push(PeResource { ty, names });
+        out.push(PeResource {
+            ty: entry_label(dir, entry.name_or_id)?,
+            names: named_children(dir, entry.offset)?,
+        });
     }
     Ok(out)
+}
+
+fn named_children(dir: &[u8], offset: u32) -> Result<Vec<PeResourceName>> {
+    if offset & 0x8000_0000 == 0 {
+        return Ok(Vec::new());
+    }
+    let sub = (offset & 0x7fff_ffff) as usize;
+    let mut names = Vec::new();
+    for child in directory_entries(dir, sub)? {
+        names.push(PeResourceName {
+            name: entry_label(dir, child.name_or_id)?,
+            languages: directory_labels(dir, child.offset)?,
+        });
+    }
+    Ok(names)
+}
+
+/// Labels in the directory `offset` points at. Each entry's own offset is ignored.
+fn directory_labels(dir: &[u8], offset: u32) -> Result<Vec<String>> {
+    if offset & 0x8000_0000 == 0 {
+        return Ok(Vec::new());
+    }
+    let sub = (offset & 0x7fff_ffff) as usize;
+    let mut labels = Vec::new();
+    for child in directory_entries(dir, sub)? {
+        labels.push(entry_label(dir, child.name_or_id)?);
+    }
+    Ok(labels)
 }
 
 struct DirEntry {
@@ -1007,22 +1036,29 @@ mod tests {
     }
 
     #[test]
-    fn resource_names_stop_before_the_language_directory() {
+    fn resource_languages_stop_before_the_data() {
         let tree = resource_tree(&resource_name_fixture()).unwrap();
         assert_eq!(
             tree,
             vec![
                 PeResource {
                     ty: "VER".into(),
-                    names: vec!["2".into()],
+                    names: vec![res_name("2", &[])],
                 },
                 PeResource {
                     ty: "16".into(),
-                    names: vec!["App".into(), "1".into()],
+                    names: vec![res_name("App", &[]), res_name("1", &["1033"])],
                 },
             ]
         );
         assert_eq!(resource_type_ids(&resource_name_fixture()).unwrap(), vec![16]);
+    }
+
+    fn res_name(name: &str, languages: &[&str]) -> PeResourceName {
+        PeResourceName {
+            name: name.into(),
+            languages: languages.iter().map(|lang| (*lang).to_string()).collect(),
+        }
     }
 
     #[test]
@@ -1039,9 +1075,9 @@ mod tests {
     }
 
     /// Named type `VER` with id name `2`. Type `16` with names `App` and `1`.
-    /// The id `1` points at a language directory whose id is 1033, which must stay unread.
+    /// `1` has language id 1033. That entry points at a directory whose id is 9999, which must stay unread.
     fn resource_name_fixture() -> Vec<u8> {
-        let mut dir = vec![0u8; 128];
+        let mut dir = vec![0u8; 164];
         dir[12] = 1;
         dir[14] = 1;
         write_res_entry(&mut dir, 16, 0x8000_0000 | 88, 0x8000_0000 | 32);
@@ -1055,7 +1091,9 @@ mod tests {
         write_utf16_name(&mut dir, 88, "VER");
         write_utf16_name(&mut dir, 96, "App");
         dir[104 + 14] = 1;
-        write_res_entry(&mut dir, 120, 1033, 0);
+        write_res_entry(&mut dir, 120, 1033, 0x8000_0000 | 140);
+        dir[140 + 14] = 1;
+        write_res_entry(&mut dir, 156, 9999, 0);
         dir
     }
 
