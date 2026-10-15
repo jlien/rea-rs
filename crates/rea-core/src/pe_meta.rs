@@ -1,4 +1,4 @@
-//! PE data directories, CLR runtime header, CodeView PDB path, and root resource type ids.
+//! PE data directories, CLR runtime header, CodeView PDB path, and resource type and name ids.
 
 use crate::{Error, Result};
 
@@ -18,8 +18,19 @@ pub struct PeFacts {
     pub clr: Option<ClrHeader>,
     /// Root resource-directory type ids (the low 16 bits) when the entry is an integer id. Named entries are skipped. Empty if there is no resource directory.
     pub resource_type_ids: Vec<u32>,
+    /// One level of the resource directory: each root type, then the names under it. Integer ids are decimal strings. Named entries are UTF-16. Language directories and data are not read.
+    pub resources: Vec<PeResource>,
     /// First CodeView PDB 7.0 or 2.0 record in the debug directory. Other debug types are skipped. `None` when the directory is absent, unmapped, or has no CodeView path.
     pub pdb: Option<PePdb>,
+}
+
+/// One resource type and the name level under it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PeResource {
+    /// Integer type id as a decimal string, or the UTF-16 name when the root entry is named.
+    pub ty: String,
+    /// Name level only. Integer ids are decimal strings. Named entries are UTF-16.
+    pub names: Vec<String>,
 }
 
 /// A CodeView PDB filename from the debug directory.
@@ -92,30 +103,99 @@ pub struct ClrStream {
 ///
 /// `dir` starts at the directory. Named entries are skipped. Integer ids contribute their low 16 bits. Does not recurse.
 pub(crate) fn resource_type_ids(dir: &[u8]) -> Result<Vec<u32>> {
-    if dir.len() < 16 {
-        return Err(Error::Parse("pe: truncated resource directory".into()));
-    }
-    let named = usize::from(u16::from_le_bytes([dir[12], dir[13]]));
-    let ids = usize::from(u16::from_le_bytes([dir[14], dir[15]]));
-    let id_at = 16 + named * 8;
-    let id_bytes = ids
-        .checked_mul(8)
-        .ok_or_else(|| Error::Parse("pe: truncated resource directory".into()))?;
-    let id_end = id_at
-        .checked_add(id_bytes)
-        .ok_or_else(|| Error::Parse("pe: truncated resource directory".into()))?;
-    if dir.len() < id_end {
-        return Err(Error::Parse("pe: truncated resource directory".into()));
-    }
-    let mut type_ids = Vec::with_capacity(ids);
-    for i in 0..ids {
-        let at = id_at + i * 8;
-        let name_or_id = u32::from_le_bytes([dir[at], dir[at + 1], dir[at + 2], dir[at + 3]]);
-        if name_or_id & 0x8000_0000 == 0 {
-            type_ids.push(name_or_id & 0xffff);
+    let mut type_ids = Vec::new();
+    for entry in directory_entries(dir, 0)? {
+        if entry.name_or_id & 0x8000_0000 == 0 {
+            type_ids.push(entry.name_or_id & 0xffff);
         }
     }
     Ok(type_ids)
+}
+
+/// Root types and the name level under each one.
+///
+/// A name-level offset that points at a language directory is not followed. A short directory or a short name is an error.
+pub(crate) fn resource_tree(dir: &[u8]) -> Result<Vec<PeResource>> {
+    let mut out = Vec::new();
+    for entry in directory_entries(dir, 0)? {
+        let ty = entry_label(dir, entry.name_or_id)?;
+        let names = if entry.offset & 0x8000_0000 != 0 {
+            let sub = (entry.offset & 0x7fff_ffff) as usize;
+            let mut names = Vec::new();
+            for child in directory_entries(dir, sub)? {
+                names.push(entry_label(dir, child.name_or_id)?);
+            }
+            names
+        } else {
+            Vec::new()
+        };
+        out.push(PeResource { ty, names });
+    }
+    Ok(out)
+}
+
+struct DirEntry {
+    name_or_id: u32,
+    offset: u32,
+}
+
+fn directory_entries(dir: &[u8], at: usize) -> Result<Vec<DirEntry>> {
+    let header = dir
+        .get(at..at.saturating_add(16))
+        .filter(|h| h.len() == 16)
+        .ok_or_else(|| Error::Parse("pe: truncated resource directory".into()))?;
+    let named = usize::from(u16::from_le_bytes([header[12], header[13]]));
+    let ids = usize::from(u16::from_le_bytes([header[14], header[15]]));
+    let count = named
+        .checked_add(ids)
+        .ok_or_else(|| Error::Parse("pe: truncated resource directory".into()))?;
+    let nbytes = count
+        .checked_mul(8)
+        .ok_or_else(|| Error::Parse("pe: truncated resource directory".into()))?;
+    let start = at
+        .checked_add(16)
+        .ok_or_else(|| Error::Parse("pe: truncated resource directory".into()))?;
+    let end = start
+        .checked_add(nbytes)
+        .ok_or_else(|| Error::Parse("pe: truncated resource directory".into()))?;
+    let table = dir
+        .get(start..end)
+        .ok_or_else(|| Error::Parse("pe: truncated resource directory".into()))?;
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let e = &table[i * 8..i * 8 + 8];
+        out.push(DirEntry {
+            name_or_id: u32::from_le_bytes([e[0], e[1], e[2], e[3]]),
+            offset: u32::from_le_bytes([e[4], e[5], e[6], e[7]]),
+        });
+    }
+    Ok(out)
+}
+
+fn entry_label(dir: &[u8], name_or_id: u32) -> Result<String> {
+    if name_or_id & 0x8000_0000 == 0 {
+        return Ok((name_or_id & 0xffff).to_string());
+    }
+    let at = (name_or_id & 0x7fff_ffff) as usize;
+    let len_bytes = dir
+        .get(at..at.saturating_add(2))
+        .filter(|b| b.len() == 2)
+        .ok_or_else(|| Error::Parse("pe: truncated resource name".into()))?;
+    let nchars = usize::from(u16::from_le_bytes([len_bytes[0], len_bytes[1]]));
+    if nchars > 256 {
+        return Err(Error::Parse("pe: resource name is too long".into()));
+    }
+    let nbytes = nchars
+        .checked_mul(2)
+        .ok_or_else(|| Error::Parse("pe: truncated resource name".into()))?;
+    let raw = dir
+        .get(at + 2..at + 2 + nbytes)
+        .ok_or_else(|| Error::Parse("pe: truncated resource name".into()))?;
+    let units: Vec<u16> = raw
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    Ok(String::from_utf16_lossy(&units))
 }
 
 fn section_file_offset(
@@ -761,6 +841,7 @@ pub fn facts(bytes: &[u8]) -> Result<PeFacts> {
             has_clr: false,
             clr: None,
             resource_type_ids: Vec::new(),
+            resources: Vec::new(),
             pdb: None,
         });
     };
@@ -785,20 +866,21 @@ pub fn facts(bytes: &[u8]) -> Result<PeFacts> {
         });
         parse_clr(header, bytes, metadata_off)
     });
-    let resource_type_ids = if let Some(dir) = optional.data_directories.get_resource_table() {
-        let off = section_file_offset(&pe.sections, dir.virtual_address).ok_or_else(|| {
-            Error::Parse(format!(
-                "pe: resource directory RVA {:#x} is not in a section",
-                dir.virtual_address
-            ))
-        })?;
-        let blob = bytes
-            .get(off..)
-            .ok_or_else(|| Error::Parse("pe: truncated resource directory".into()))?;
-        resource_type_ids(blob)?
-    } else {
-        Vec::new()
-    };
+    let (resource_type_ids, resources) =
+        if let Some(dir) = optional.data_directories.get_resource_table() {
+            let off = section_file_offset(&pe.sections, dir.virtual_address).ok_or_else(|| {
+                Error::Parse(format!(
+                    "pe: resource directory RVA {:#x} is not in a section",
+                    dir.virtual_address
+                ))
+            })?;
+            let blob = bytes
+                .get(off..)
+                .ok_or_else(|| Error::Parse("pe: truncated resource directory".into()))?;
+            (resource_type_ids(blob)?, resource_tree(blob)?)
+        } else {
+            (Vec::new(), Vec::new())
+        };
     let pdb = optional.data_directories.get_debug_table().and_then(|dir| {
         if dir.size == 0 {
             return None;
@@ -812,6 +894,7 @@ pub fn facts(bytes: &[u8]) -> Result<PeFacts> {
         has_clr,
         clr,
         resource_type_ids,
+        resources,
         pdb,
     })
 }
@@ -921,6 +1004,73 @@ mod tests {
     fn truncated_directory_is_parse_error() {
         let err = resource_type_ids(&[0u8; 15]).unwrap_err();
         assert!(matches!(err, Error::Parse(_)));
+    }
+
+    #[test]
+    fn resource_names_stop_before_the_language_directory() {
+        let tree = resource_tree(&resource_name_fixture()).unwrap();
+        assert_eq!(
+            tree,
+            vec![
+                PeResource {
+                    ty: "VER".into(),
+                    names: vec!["2".into()],
+                },
+                PeResource {
+                    ty: "16".into(),
+                    names: vec!["App".into(), "1".into()],
+                },
+            ]
+        );
+        assert_eq!(resource_type_ids(&resource_name_fixture()).unwrap(), vec![16]);
+    }
+
+    #[test]
+    fn resource_name_longer_than_256_chars_is_an_error() {
+        let mut dir = vec![0u8; 16];
+        dir[12] = 1;
+        dir.extend_from_slice(&0x8000_0020u32.to_le_bytes());
+        dir.extend_from_slice(&0u32.to_le_bytes());
+        dir.resize(32 + 2, 0);
+        dir[32] = 1;
+        dir[33] = 1;
+        let err = resource_tree(&dir).unwrap_err();
+        assert!(matches!(err, Error::Parse(ref msg) if msg == "pe: resource name is too long"));
+    }
+
+    /// Named type `VER` with id name `2`. Type `16` with names `App` and `1`.
+    /// The id `1` points at a language directory whose id is 1033, which must stay unread.
+    fn resource_name_fixture() -> Vec<u8> {
+        let mut dir = vec![0u8; 128];
+        dir[12] = 1;
+        dir[14] = 1;
+        write_res_entry(&mut dir, 16, 0x8000_0000 | 88, 0x8000_0000 | 32);
+        write_res_entry(&mut dir, 24, 16, 0x8000_0000 | 56);
+        dir[32 + 14] = 1;
+        write_res_entry(&mut dir, 48, 2, 0);
+        dir[56 + 12] = 1;
+        dir[56 + 14] = 1;
+        write_res_entry(&mut dir, 72, 0x8000_0000 | 96, 0);
+        write_res_entry(&mut dir, 80, 1, 0x8000_0000 | 104);
+        write_utf16_name(&mut dir, 88, "VER");
+        write_utf16_name(&mut dir, 96, "App");
+        dir[104 + 14] = 1;
+        write_res_entry(&mut dir, 120, 1033, 0);
+        dir
+    }
+
+    fn write_res_entry(buf: &mut [u8], at: usize, name_or_id: u32, offset: u32) {
+        buf[at..at + 4].copy_from_slice(&name_or_id.to_le_bytes());
+        buf[at + 4..at + 8].copy_from_slice(&offset.to_le_bytes());
+    }
+
+    fn write_utf16_name(buf: &mut [u8], at: usize, name: &str) {
+        let units: Vec<u16> = name.encode_utf16().collect();
+        buf[at..at + 2].copy_from_slice(&(units.len() as u16).to_le_bytes());
+        for (i, unit) in units.iter().enumerate() {
+            let pos = at + 2 + i * 2;
+            buf[pos..pos + 2].copy_from_slice(&unit.to_le_bytes());
+        }
     }
 
     #[test]

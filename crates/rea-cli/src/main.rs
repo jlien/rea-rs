@@ -74,7 +74,7 @@ enum Command {
     Goinfo { path: String },
     /// Mach-O dylibs, UUID, build version, code signature, and architectures.
     Macho { path: String },
-    /// PE data directories, CLR header, metadata streams, table row counts, type names, field names, method names, parameter names, member-ref names, CodeView PDB path, and root resource type ids.
+    /// PE data directories, CLR header, metadata streams, table row counts, type names, field names, method names, parameter names, member-ref names, CodeView PDB path, root resource type ids, and the name under each resource type.
     Pe { path: String },
     /// ELF interpreter, needed libraries, soname, and GNU build-id.
     Elf { path: String },

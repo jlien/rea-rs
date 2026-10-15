@@ -70,7 +70,7 @@ rea strings /bin/ls | jq '.count'
 - `rea_wasm` — WASM section ids, imports, and exports
 - `rea_go` — Go 1.18+ build info (version and module text)
 - `rea_macho` — dylibs, UUID, build version, code signature, and fat architectures
-- `rea_pe` — data directories, CLR runtime header, metadata version, stream directory, table row counts, Module/TypeRef/TypeDef names, Field and MethodDef names on each TypeDef, Param names on each method, MemberRef names, CodeView PDB path, root resource type ids
+- `rea_pe` — data directories, CLR runtime header, metadata version, stream directory, table row counts, Module/TypeRef/TypeDef names, Field and MethodDef names on each TypeDef, Param names on each method, MemberRef names, CodeView PDB path, root resource type ids, and the name under each resource type. Language ids and resource bytes are not read.
 - `rea_elf` — interpreter, needed libraries, soname, and GNU build-id
 - `rea_sqlite` — database header and `sqlite_schema` objects. No table rows and no WAL replay.
 
