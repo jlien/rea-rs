@@ -1,4 +1,4 @@
-//! PE data directories, CLR runtime header, CodeView PDB path, and resource type, name, and language ids.
+//! PE data directories, CLR runtime header, CodeView PDB path, and resource type, name, language, and data-entry size.
 
 use crate::{Error, Result};
 
@@ -18,7 +18,7 @@ pub struct PeFacts {
     pub clr: Option<ClrHeader>,
     /// Root resource-directory type ids (the low 16 bits) when the entry is an integer id. Named entries are skipped. Empty if there is no resource directory.
     pub resource_type_ids: Vec<u32>,
-    /// Resource directory through the language id. Integer ids are decimal strings. Named entries are UTF-16. Resource bytes are not read.
+    /// Resource directory through the data-entry header. Integer ids are decimal strings. Named entries are UTF-16. The resource payload is not read.
     pub resources: Vec<PeResource>,
     /// First CodeView PDB 7.0 or 2.0 record in the debug directory. Other debug types are skipped. `None` when the directory is absent, unmapped, or has no CodeView path.
     pub pdb: Option<PePdb>,
@@ -33,13 +33,24 @@ pub struct PeResource {
     pub names: Vec<PeResourceName>,
 }
 
-/// One resource name and the language ids under it.
+/// One resource name and the language entries under it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct PeResourceName {
     /// Integer id as a decimal string, or the UTF-16 name.
     pub name: String,
-    /// Language ids. The data entry under each id is not read.
-    pub languages: Vec<String>,
+    /// Language level. Each entry may carry a data-entry size and code page.
+    pub languages: Vec<PeResourceLang>,
+}
+
+/// One language id and the `IMAGE_RESOURCE_DATA_ENTRY` header under it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PeResourceLang {
+    /// Integer id as a decimal string, or the UTF-16 name.
+    pub lang: String,
+    /// `Size` from the data entry. `None` when this level is not a data entry.
+    pub size: Option<u32>,
+    /// `CodePage` from the data entry. `None` when this level is not a data entry.
+    pub code_page: Option<u32>,
 }
 
 /// A CodeView PDB filename from the debug directory.
@@ -123,7 +134,7 @@ pub(crate) fn resource_type_ids(dir: &[u8]) -> Result<Vec<u32>> {
 
 /// Root types, the name under each type, and the language id under each name.
 ///
-/// A language-level offset is not followed, so a further directory and the resource bytes stay unread. A short directory or a short name is an error.
+/// A language entry that points at a data entry contributes its size and code page. The `OffsetToData` RVA is not followed, and a further directory under a language id stays unread. A short directory, name, or data entry is an error.
 pub(crate) fn resource_tree(dir: &[u8]) -> Result<Vec<PeResource>> {
     let mut out = Vec::new();
     for entry in directory_entries(dir, 0)? {
@@ -144,23 +155,47 @@ fn named_children(dir: &[u8], offset: u32) -> Result<Vec<PeResourceName>> {
     for child in directory_entries(dir, sub)? {
         names.push(PeResourceName {
             name: entry_label(dir, child.name_or_id)?,
-            languages: directory_labels(dir, child.offset)?,
+            languages: language_entries(dir, child.offset)?,
         });
     }
     Ok(names)
 }
 
-/// Labels in the directory `offset` points at. Each entry's own offset is ignored.
-fn directory_labels(dir: &[u8], offset: u32) -> Result<Vec<String>> {
+/// Language ids in the directory `offset` points at.
+///
+/// A data-entry offset contributes size and code page. An offset with the subdirectory bit set records the id only.
+fn language_entries(dir: &[u8], offset: u32) -> Result<Vec<PeResourceLang>> {
     if offset & 0x8000_0000 == 0 {
         return Ok(Vec::new());
     }
     let sub = (offset & 0x7fff_ffff) as usize;
-    let mut labels = Vec::new();
+    let mut langs = Vec::new();
     for child in directory_entries(dir, sub)? {
-        labels.push(entry_label(dir, child.name_or_id)?);
+        let data = data_entry(dir, child.offset)?;
+        langs.push(PeResourceLang {
+            lang: entry_label(dir, child.name_or_id)?,
+            size: data.map(|d| d.0),
+            code_page: data.map(|d| d.1),
+        });
     }
-    Ok(labels)
+    Ok(langs)
+}
+
+/// `Size` and `CodePage` from an `IMAGE_RESOURCE_DATA_ENTRY`.
+///
+/// Offset 0 and a subdirectory offset are not data entries. `OffsetToData` is not used.
+fn data_entry(dir: &[u8], offset: u32) -> Result<Option<(u32, u32)>> {
+    if offset & 0x8000_0000 != 0 || offset == 0 {
+        return Ok(None);
+    }
+    let at = offset as usize;
+    let raw = dir
+        .get(at..at.saturating_add(16))
+        .filter(|b| b.len() == 16)
+        .ok_or_else(|| Error::Parse("pe: truncated resource data".into()))?;
+    let size = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]);
+    let code_page = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]);
+    Ok(Some((size, code_page)))
 }
 
 struct DirEntry {
@@ -1036,8 +1071,9 @@ mod tests {
     }
 
     #[test]
-    fn resource_languages_stop_before_the_data() {
-        let tree = resource_tree(&resource_name_fixture()).unwrap();
+    fn resource_data_entry_keeps_size_and_skips_payload() {
+        let bytes = resource_name_fixture();
+        let tree = resource_tree(&bytes).unwrap();
         assert_eq!(
             tree,
             vec![
@@ -1047,18 +1083,46 @@ mod tests {
                 },
                 PeResource {
                     ty: "16".into(),
-                    names: vec![res_name("App", &[]), res_name("1", &["1033"])],
+                    names: vec![
+                        res_name("App", &[]),
+                        res_name(
+                            "1",
+                            &[("1033", None, None), ("1040", Some(4), Some(1252))],
+                        ),
+                    ],
                 },
             ]
         );
-        assert_eq!(resource_type_ids(&resource_name_fixture()).unwrap(), vec![16]);
+        assert_eq!(resource_type_ids(&bytes).unwrap(), vec![16]);
+        assert!(!format!("{tree:?}").contains("SECRET"));
+        assert!(!format!("{tree:?}").contains("9999"));
     }
 
-    fn res_name(name: &str, languages: &[&str]) -> PeResourceName {
+    fn res_name(name: &str, languages: &[(&str, Option<u32>, Option<u32>)]) -> PeResourceName {
         PeResourceName {
             name: name.into(),
-            languages: languages.iter().map(|lang| (*lang).to_string()).collect(),
+            languages: languages
+                .iter()
+                .map(|(lang, size, code_page)| PeResourceLang {
+                    lang: (*lang).into(),
+                    size: *size,
+                    code_page: *code_page,
+                })
+                .collect(),
         }
+    }
+
+    #[test]
+    fn truncated_resource_data_is_an_error() {
+        let mut dir = vec![0u8; 100];
+        dir[14] = 1;
+        write_res_entry(&mut dir, 16, 16, 0x8000_0000 | 32);
+        dir[32 + 14] = 1;
+        write_res_entry(&mut dir, 48, 1, 0x8000_0000 | 64);
+        dir[64 + 14] = 1;
+        write_res_entry(&mut dir, 80, 1033, 90);
+        let err = resource_tree(&dir).unwrap_err();
+        assert!(matches!(err, Error::Parse(ref msg) if msg == "pe: truncated resource data"));
     }
 
     #[test]
@@ -1075,9 +1139,10 @@ mod tests {
     }
 
     /// Named type `VER` with id name `2`. Type `16` with names `App` and `1`.
-    /// `1` has language id 1033. That entry points at a directory whose id is 9999, which must stay unread.
+    /// `1` has language `1033`, which points at a directory containing `9999`, and language `1040`,
+    /// whose data entry reports size 4 and code page 1252. The payload bytes are `SECRET`.
     fn resource_name_fixture() -> Vec<u8> {
-        let mut dir = vec![0u8; 164];
+        let mut dir = vec![0u8; 202];
         dir[12] = 1;
         dir[14] = 1;
         write_res_entry(&mut dir, 16, 0x8000_0000 | 88, 0x8000_0000 | 32);
@@ -1090,10 +1155,15 @@ mod tests {
         write_res_entry(&mut dir, 80, 1, 0x8000_0000 | 104);
         write_utf16_name(&mut dir, 88, "VER");
         write_utf16_name(&mut dir, 96, "App");
-        dir[104 + 14] = 1;
+        dir[104 + 14] = 2;
         write_res_entry(&mut dir, 120, 1033, 0x8000_0000 | 140);
+        write_res_entry(&mut dir, 128, 1040, 180);
         dir[140 + 14] = 1;
         write_res_entry(&mut dir, 156, 9999, 0);
+        dir[180..184].copy_from_slice(&0x2000u32.to_le_bytes());
+        dir[184..188].copy_from_slice(&4u32.to_le_bytes());
+        dir[188..192].copy_from_slice(&1252u32.to_le_bytes());
+        dir[196..202].copy_from_slice(b"SECRET");
         dir
     }
 

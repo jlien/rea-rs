@@ -313,7 +313,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "rea_pe",
-            "description": "PE data directories, CLR runtime header, metadata version, stream names, table row counts, Module/TypeRef/TypeDef names, Field and MethodDef names on each TypeDef, Param names on each method, MemberRef names, CodeView PDB path, root resource type ids, the name under each type, and the language id under each name. Resource bytes are not read.",
+            "description": "PE data directories, CLR runtime header, metadata version, stream names, table row counts, Module/TypeRef/TypeDef names, Field and MethodDef names on each TypeDef, Param names on each method, MemberRef names, CodeView PDB path, root resource type ids, the name under each type, the language id under each name, and the data-entry size and code page. The resource payload is not read.",
             "inputSchema": schema(true, json!({}), &[]),
         }),
         json!({
