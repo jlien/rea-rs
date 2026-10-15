@@ -1,4 +1,4 @@
-//! WebAssembly binary inspector (MVP). Parses imports and exports; does not execute.
+//! WebAssembly binary inspector. Parses imports, exports, the function count, memory limits, and the start index. Does not decode function bodies or execute.
 
 use crate::{Error, Result};
 
@@ -18,11 +18,23 @@ pub struct WasmExport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct WasmMemory {
+    pub min: u32,
+    pub max: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct WasmModule {
     pub version: u32,
     pub sections: Vec<u8>, // section ids in order
     pub imports: Vec<WasmImport>,
     pub exports: Vec<WasmExport>,
+    /// Count of type indexes in the function section. The code section is not decoded.
+    pub functions: u32,
+    /// Memories declared in the memory section. Imported memories stay on `imports`.
+    pub memories: Vec<WasmMemory>,
+    /// Start function index, when the start section is present.
+    pub start: Option<u32>,
 }
 
 /// Inspect a WebAssembly binary. Rejects a bad magic, a truncated section,
@@ -39,6 +51,12 @@ pub fn inspect(bytes: &[u8]) -> Result<WasmModule> {
     let mut sections = Vec::new();
     let mut imports = Vec::new();
     let mut exports = Vec::new();
+    let mut functions = 0;
+    let mut memories = Vec::new();
+    let mut start = None;
+    let mut saw_functions = false;
+    let mut saw_memories = false;
+    let mut saw_start = false;
 
     while !r.eof() {
         let id = r.read_u8()?;
@@ -47,7 +65,28 @@ pub fn inspect(bytes: &[u8]) -> Result<WasmModule> {
         sections.push(id);
         match id {
             2 => imports.extend(decode_imports(payload)?),
+            3 => {
+                if saw_functions {
+                    return Err(Error::Parse("duplicate wasm function section".into()));
+                }
+                saw_functions = true;
+                functions = decode_function_count(payload)?;
+            }
+            5 => {
+                if saw_memories {
+                    return Err(Error::Parse("duplicate wasm memory section".into()));
+                }
+                saw_memories = true;
+                memories = decode_memories(payload)?;
+            }
             7 => exports.extend(decode_exports(payload)?),
+            8 => {
+                if saw_start {
+                    return Err(Error::Parse("duplicate wasm start section".into()));
+                }
+                saw_start = true;
+                start = Some(decode_start(payload)?);
+            }
             _ => {}
         }
     }
@@ -57,7 +96,51 @@ pub fn inspect(bytes: &[u8]) -> Result<WasmModule> {
         sections,
         imports,
         exports,
+        functions,
+        memories,
+        start,
     })
+}
+
+fn decode_function_count(payload: &[u8]) -> Result<u32> {
+    let mut r = Reader::new(payload);
+    let count = r.read_u32_leb()?;
+    for _ in 0..count {
+        let _type_index = r.read_u32_leb()?;
+    }
+    if !r.eof() {
+        return Err(Error::Parse("trailing bytes in wasm function section".into()));
+    }
+    Ok(count)
+}
+
+fn decode_memories(payload: &[u8]) -> Result<Vec<WasmMemory>> {
+    let mut r = Reader::new(payload);
+    let count = r.read_u32_leb()?;
+    let mut out = Vec::new();
+    for _ in 0..count {
+        let flags = r.read_u8()?;
+        let min = r.read_u32_leb()?;
+        let max = if flags & 1 != 0 {
+            Some(r.read_u32_leb()?)
+        } else {
+            None
+        };
+        out.push(WasmMemory { min, max });
+    }
+    if !r.eof() {
+        return Err(Error::Parse("trailing bytes in wasm memory section".into()));
+    }
+    Ok(out)
+}
+
+fn decode_start(payload: &[u8]) -> Result<u32> {
+    let mut r = Reader::new(payload);
+    let index = r.read_u32_leb()?;
+    if !r.eof() {
+        return Err(Error::Parse("trailing bytes in wasm start section".into()));
+    }
+    Ok(index)
 }
 
 fn decode_imports(payload: &[u8]) -> Result<Vec<WasmImport>> {
@@ -220,6 +303,9 @@ mod tests {
         assert!(m.sections.is_empty());
         assert!(m.imports.is_empty());
         assert!(m.exports.is_empty());
+        assert_eq!(m.functions, 0);
+        assert!(m.memories.is_empty());
+        assert_eq!(m.start, None);
     }
 
     #[test]
@@ -230,6 +316,7 @@ mod tests {
         .unwrap();
         assert_eq!(m.version, 1);
         assert_eq!(m.sections, vec![1, 3, 7, 10]);
+        assert_eq!(m.functions, 1);
         assert!(m.imports.is_empty());
         assert_eq!(
             m.exports,
@@ -306,6 +393,27 @@ mod tests {
                 index: 3,
             }]
         );
+    }
+
+    #[test]
+    fn memory_limits_and_start_index() {
+        let m = inspect(&hex("0061736d01000000050401010102080103")).unwrap();
+        assert_eq!(m.sections, vec![5, 8]);
+        assert_eq!(
+            m.memories,
+            vec![WasmMemory {
+                min: 1,
+                max: Some(2),
+            }]
+        );
+        assert_eq!(m.start, Some(3));
+        assert_eq!(m.functions, 0);
+    }
+
+    #[test]
+    fn duplicate_start_is_an_error() {
+        let err = inspect(&hex("0061736d01000000080103080104")).unwrap_err();
+        assert!(matches!(err, Error::Parse(ref msg) if msg == "duplicate wasm start section"));
     }
 
     #[test]

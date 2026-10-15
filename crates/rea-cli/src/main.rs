@@ -68,7 +68,7 @@ enum Command {
     },
     /// Direct call graph over discovered functions.
     Callgraph { path: String },
-    /// WASM imports, exports, and section ids. Does not execute the module.
+    /// WASM section ids, imports, exports, defined function count, memory limits, and the start index. Function bodies are not decoded.
     Wasm { path: String },
     /// Go 1.18+ build info embedded in a binary. Pre-1.18 pointer blobs error.
     Goinfo { path: String },
