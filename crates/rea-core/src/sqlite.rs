@@ -15,6 +15,8 @@ pub struct SqliteHeader {
     pub text_encoding: String,
     pub schema_format: u32,
     pub user_version: u32,
+    /// Application id at header offset 68. Zero when the file does not set one.
+    pub application_id: u32,
     pub change_counter: u32,
 }
 
@@ -44,6 +46,7 @@ pub fn header(bytes: &[u8]) -> Result<SqliteHeader> {
         text_encoding,
         schema_format: u32::from_be_bytes([bytes[44], bytes[45], bytes[46], bytes[47]]),
         user_version: u32::from_be_bytes([bytes[60], bytes[61], bytes[62], bytes[63]]),
+        application_id: u32::from_be_bytes([bytes[68], bytes[69], bytes[70], bytes[71]]),
         change_counter: u32::from_be_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]),
     })
 }
@@ -441,6 +444,7 @@ mod tests {
         bytes[44..48].copy_from_slice(&4u32.to_be_bytes());
         bytes[56..60].copy_from_slice(&1u32.to_be_bytes());
         bytes[60..64].copy_from_slice(&9u32.to_be_bytes());
+        bytes[68..72].copy_from_slice(&0x0102_0304u32.to_be_bytes());
         bytes
     }
 
@@ -454,6 +458,7 @@ mod tests {
         assert_eq!(got.text_encoding, "utf8");
         assert_eq!(got.schema_format, 4);
         assert_eq!(got.user_version, 9);
+        assert_eq!(got.application_id, 0x0102_0304);
         assert_eq!(got.change_counter, 7);
     }
 
