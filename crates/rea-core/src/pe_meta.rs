@@ -1,4 +1,4 @@
-//! PE data directories, CLR runtime header, CodeView PDB path, and resource type, name, language, and data-entry size.
+//! PE data directories, subsystem, image base, COFF timestamp, CLR runtime header, CodeView PDB path, and resource type, name, language, and data-entry size.
 
 use crate::{Error, Result};
 
@@ -11,6 +11,12 @@ pub struct PeDirectory {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct PeFacts {
+    /// COFF `TimeDateStamp`, seconds since the Unix epoch. Not converted to a date.
+    pub timestamp: u32,
+    /// `windows-gui`, `windows-cui`, or `subsystem-{n}`. `None` when the optional header is absent.
+    pub subsystem: Option<String>,
+    /// Optional-header image base. `None` when the optional header is absent.
+    pub image_base: Option<u64>,
     pub directories: Vec<PeDirectory>,
     /// True when the CLR runtime header data directory is present and non-zero.
     pub has_clr: bool,
@@ -899,8 +905,12 @@ fn heap_string(strings: &[u8], index: u32) -> String {
 
 pub fn facts(bytes: &[u8]) -> Result<PeFacts> {
     let pe = goblin::pe::PE::parse(bytes).map_err(|e| Error::Parse(format!("pe: {e}")))?;
+    let timestamp = pe.header.coff_header.time_date_stamp;
     let Some(optional) = pe.header.optional_header else {
         return Ok(PeFacts {
+            timestamp,
+            subsystem: None,
+            image_base: None,
             directories: Vec::new(),
             has_clr: false,
             clr: None,
@@ -909,6 +919,8 @@ pub fn facts(bytes: &[u8]) -> Result<PeFacts> {
             pdb: None,
         });
     };
+    let subsystem = Some(subsystem_name(optional.windows_fields.subsystem));
+    let image_base = Some(optional.windows_fields.image_base);
 
     let directories = optional
         .data_directories
@@ -954,6 +966,9 @@ pub fn facts(bytes: &[u8]) -> Result<PeFacts> {
     });
 
     Ok(PeFacts {
+        timestamp,
+        subsystem,
+        image_base,
         directories,
         has_clr,
         clr,
@@ -961,6 +976,24 @@ pub fn facts(bytes: &[u8]) -> Result<PeFacts> {
         resources,
         pdb,
     })
+}
+
+fn subsystem_name(subsystem: u16) -> String {
+    match subsystem {
+        1 => "native".to_string(),
+        2 => "windows-gui".to_string(),
+        3 => "windows-cui".to_string(),
+        5 => "os2".to_string(),
+        7 => "posix".to_string(),
+        9 => "windows-ce".to_string(),
+        10 => "efi-application".to_string(),
+        11 => "efi-boot".to_string(),
+        12 => "efi-runtime".to_string(),
+        13 => "efi-rom".to_string(),
+        14 => "xbox".to_string(),
+        16 => "windows-boot".to_string(),
+        n => format!("subsystem-{n}"),
+    }
 }
 
 const DEBUG_ENTRY: usize = 28;
@@ -1184,6 +1217,40 @@ mod tests {
     #[test]
     fn rejects_non_pe() {
         assert!(facts(b"not a pe").is_err());
+    }
+
+    #[test]
+    fn reads_subsystem_image_base_and_timestamp() {
+        let got = facts(&minimal_pe()).unwrap();
+        assert_eq!(got.timestamp, 0x1020_3040);
+        assert_eq!(got.subsystem.as_deref(), Some("windows-cui"));
+        assert_eq!(got.image_base, Some(0x4000_00));
+        assert!(got.directories.is_empty());
+        assert!(!got.has_clr);
+        assert!(got.resources.is_empty());
+        assert_eq!(got.pdb, None);
+    }
+
+    /// PE32 with no sections and no data directories.
+    fn minimal_pe() -> Vec<u8> {
+        let mut bytes = vec![0u8; 0x80];
+        bytes[0] = b'M';
+        bytes[1] = b'Z';
+        bytes[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        bytes.extend_from_slice(b"PE\0\0");
+        bytes.extend_from_slice(&0x14c_u16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&0x1020_3040u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&96u16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        let mut optional = vec![0u8; 96];
+        optional[0..2].copy_from_slice(&0x10bu16.to_le_bytes());
+        optional[28..32].copy_from_slice(&0x0040_0000u32.to_le_bytes());
+        optional[28 + 40..28 + 42].copy_from_slice(&3u16.to_le_bytes());
+        bytes.extend_from_slice(&optional);
+        bytes
     }
 
     fn push_debug_entry(buf: &mut Vec<u8>, data_type: u32, size_of_data: u32, raw: u32) {
