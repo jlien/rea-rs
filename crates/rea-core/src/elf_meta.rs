@@ -1,12 +1,20 @@
-//! Interpreter, needed libraries, soname, and GNU build-id from an ELF.
+//! Interpreter, needed libraries, soname, rpath, runpath, file type, machine, and GNU build-id from an ELF.
 
 use crate::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ElfFacts {
+    /// `rel`, `exec`, `dyn`, `core`, or `type-{n}`.
+    pub kind: String,
+    /// `x86`, `x86_64`, `arm`, `aarch64`, or `machine-{n}`.
+    pub machine: String,
     pub interpreter: Option<String>,
     pub needed: Vec<String>,
     pub soname: Option<String>,
+    /// `DT_RPATH` strings. The paths are not searched.
+    pub rpath: Vec<String>,
+    /// `DT_RUNPATH` strings. The paths are not searched.
+    pub runpath: Vec<String>,
     pub build_id: Option<String>, // lowercase hex of the note desc, no dashes
 }
 
@@ -14,11 +22,35 @@ pub struct ElfFacts {
 pub fn facts(bytes: &[u8]) -> crate::Result<ElfFacts> {
     let elf = goblin::elf::Elf::parse(bytes).map_err(|e| Error::Parse(format!("elf: {e}")))?;
     Ok(ElfFacts {
+        kind: elf_kind(elf.header.e_type),
+        machine: elf_machine(elf.header.e_machine),
         interpreter: elf.interpreter.map(str::to_string),
         needed: elf.libraries.iter().map(|lib| (*lib).to_string()).collect(),
         soname: elf.soname.map(str::to_string),
+        rpath: elf.rpaths.iter().map(|path| (*path).to_string()).collect(),
+        runpath: elf.runpaths.iter().map(|path| (*path).to_string()).collect(),
         build_id: gnu_build_id(&elf, bytes),
     })
+}
+
+fn elf_kind(kind: u16) -> String {
+    match kind {
+        1 => "rel".to_string(),
+        2 => "exec".to_string(),
+        3 => "dyn".to_string(),
+        4 => "core".to_string(),
+        n => format!("type-{n}"),
+    }
+}
+
+fn elf_machine(machine: u16) -> String {
+    match machine {
+        3 => "x86".to_string(),
+        40 => "arm".to_string(),
+        62 => "x86_64".to_string(),
+        183 => "aarch64".to_string(),
+        n => format!("machine-{n}"),
+    }
 }
 
 fn gnu_build_id(elf: &goblin::elf::Elf<'_>, bytes: &[u8]) -> Option<String> {
@@ -54,6 +86,10 @@ mod tests {
         );
         assert_eq!(got.needed, vec!["libc.so.6".to_string()]);
         assert_eq!(got.soname.as_deref(), Some("libexample.so"));
+        assert_eq!(got.kind, "dyn");
+        assert_eq!(got.machine, "x86_64");
+        assert_eq!(got.rpath, vec!["/opt/rpath".to_string()]);
+        assert_eq!(got.runpath, vec!["/opt/run".to_string()]);
         assert_eq!(got.build_id.as_deref(), Some("01020304"));
     }
 
@@ -72,15 +108,19 @@ mod tests {
         const DT_STRTAB: u64 = 5;
         const DT_STRSZ: u64 = 10;
         const DT_SONAME: u64 = 14;
+        const DT_RPATH: u64 = 15;
+        const DT_RUNPATH: u64 = 29;
         const PHNUM: usize = 4;
         const EHSZ: usize = 64;
         const PHSZ: usize = 56;
 
         let interp = b"/lib64/ld-linux-x86-64.so.2\0";
         // Leading NUL keeps DT_NEEDED and DT_SONAME off offset 0 (goblin treats soname 0 as absent).
-        let dynstr = b"\0libc.so.6\0libexample.so\0";
+        let dynstr = b"\0libc.so.6\0libexample.so\0/opt/rpath\0/opt/run\0";
         let needed_off = 1u64;
         let soname_off = (1 + b"libc.so.6\0".len()) as u64;
+        let rpath_off = soname_off + b"libexample.so\0".len() as u64;
+        let runpath_off = rpath_off + b"/opt/rpath\0".len() as u64;
 
         let mut file = vec![0u8; EHSZ + PHNUM * PHSZ];
 
@@ -97,7 +137,7 @@ mod tests {
         let note_sz = (file.len() - note_off) as u64;
 
         let dyn_off = file.len();
-        let dyn_sz = (5 * 16) as u64;
+        let dyn_sz = (7 * 16) as u64;
         file.resize(file.len() + dyn_sz as usize, 0);
 
         let str_off = file.len() as u64;
@@ -108,6 +148,8 @@ mod tests {
             (DT_STRTAB, str_off),
             (DT_STRSZ, dynstr.len() as u64),
             (DT_SONAME, soname_off),
+            (DT_RPATH, rpath_off),
+            (DT_RUNPATH, runpath_off),
             (DT_NULL, 0),
         ];
         for (i, (tag, val)) in dyns.iter().enumerate() {
