@@ -7,12 +7,21 @@ use std::path::Path;
 /// Load and parse a binary from disk. Fat Mach-O binaries are resolved to
 /// the host-compatible slice (first entry as fallback).
 pub fn load(path: impl AsRef<Path>) -> Result<Target> {
+    load_arch(path, None)
+}
+
+/// Load `path`. `arch` selects a Mach-O slice (`arm64`, `x86_64`, `arm`, `x86`).
+/// `None` keeps the host slice. Other formats reject a selection.
+pub fn load_arch(path: impl AsRef<Path>, arch: Option<&str>) -> Result<Target> {
     let path = path.as_ref();
     let bytes = std::fs::read(path).map_err(Error::Io)?;
     let path_str = path.display().to_string();
 
     // LE images must be checked before goblin: it mispeeks them as PE.
     if le::is_le(&bytes) {
+        if arch.is_some() {
+            return Err(Error::Parse("arch selection is mach-o only".into()));
+        }
         return load_le(bytes, path_str);
     }
 
@@ -20,8 +29,14 @@ pub fn load(path: impl AsRef<Path>) -> Result<Target> {
         let mut cursor = std::io::Cursor::new(&*bytes);
         goblin::peek(&mut cursor).map_err(|e| Error::Parse(format!("peek failed: {e}")))?
     } {
-        goblin::Hint::Mach(_) | goblin::Hint::MachFat(_) => load_macho(bytes, path_str),
+        goblin::Hint::Mach(_) | goblin::Hint::MachFat(_) => load_macho_arch(bytes, path_str, arch),
+        goblin::Hint::Elf(_) if arch.is_some() => {
+            Err(Error::Parse("arch selection is mach-o only".into()))
+        }
         goblin::Hint::Elf(_) => load_elf(bytes, path_str),
+        goblin::Hint::PE if arch.is_some() => {
+            Err(Error::Parse("arch selection is mach-o only".into()))
+        }
         goblin::Hint::PE => load_pe(bytes, path_str),
         other => Err(Error::Unrecognized(format!(
             "format hint {other:?} is not supported"
@@ -53,13 +68,27 @@ fn load_le(bytes: Vec<u8>, path: String) -> Result<Target> {
     })
 }
 
+#[cfg(test)]
 fn load_macho(bytes: Vec<u8>, path: String) -> Result<Target> {
+    load_macho_arch(bytes, path, None)
+}
+
+fn load_macho_arch(bytes: Vec<u8>, path: String, arch: Option<&str>) -> Result<Target> {
     match goblin::mach::Mach::parse(&bytes)
         .map_err(|e| Error::Parse(format!("mach-o: {e}")))?
     {
-        goblin::mach::Mach::Binary(mo) => macho_target(mo, bytes.clone(), path),
+        goblin::mach::Mach::Binary(mo) => {
+            if let Some(name) = arch {
+                let want = cputype_of(name)?;
+                if mo.header.cputype() != want {
+                    return Err(Error::Parse(format!("mach-o: no {name} slice")));
+                }
+            }
+            macho_target(mo, bytes.clone(), path)
+        }
         goblin::mach::Mach::Fat(fat) => {
             // Prefer a slice matching this host's arch; else the first.
+            // An explicit arch replaces that choice and does not change the default.
             let host = if cfg!(target_arch = "aarch64") {
                 goblin::mach::constants::cputype::CPU_TYPE_ARM64
             } else if cfg!(target_arch = "x86_64") {
@@ -71,10 +100,18 @@ fn load_macho(bytes: Vec<u8>, path: String) -> Result<Target> {
                 .iter_arches()
                 .filter_map(|a| a.ok())
                 .collect();
-            let idx = arches
-                .iter()
-                .position(|a| a.cputype() == host)
-                .unwrap_or(0);
+            let idx = if let Some(name) = arch {
+                let want = cputype_of(name)?;
+                arches
+                    .iter()
+                    .position(|a| a.cputype() == want)
+                    .ok_or_else(|| Error::Parse(format!("mach-o: no {name} slice")))?
+            } else {
+                arches
+                    .iter()
+                    .position(|a| a.cputype() == host)
+                    .unwrap_or(0)
+            };
             let fa = arches
                 .get(idx)
                 .ok_or_else(|| Error::Parse("empty fat binary".into()))?;
@@ -86,6 +123,16 @@ fn load_macho(bytes: Vec<u8>, path: String) -> Result<Target> {
                 .map_err(|e| Error::Parse(format!("mach-o slice: {e}")))?;
             macho_target(mo, slice.to_vec(), path)
         }
+    }
+}
+
+fn cputype_of(name: &str) -> Result<u32> {
+    match name {
+        "arm64" => Ok(goblin::mach::constants::cputype::CPU_TYPE_ARM64),
+        "x86_64" => Ok(goblin::mach::constants::cputype::CPU_TYPE_X86_64),
+        "arm" => Ok(goblin::mach::constants::cputype::CPU_TYPE_ARM),
+        "x86" => Ok(goblin::mach::constants::cputype::CPU_TYPE_X86),
+        other => Err(Error::Parse(format!("mach-o: unknown arch {other}"))),
     }
 }
 
@@ -138,10 +185,20 @@ fn macho_target(mo: goblin::mach::MachO, bytes: Vec<u8>, path: String) -> Result
         } else {
             SymbolKind::Local
         };
+        let raw = name.to_string();
+        let demangled = crate::demangle::itanium(&raw);
+        // Keep the Itanium prefix so the raw name stays available. Other
+        // Mach-O names drop one leading underscore.
+        let stored = if raw.starts_with("_Z") {
+            raw
+        } else {
+            raw.trim_start_matches('_').to_string()
+        };
         symbols.push(Symbol {
             addr: nlist.n_value,
             size: 0,
-            name: name.trim_start_matches('_').to_string(),
+            name: stored,
+            demangled,
             kind,
         });
     }
@@ -194,17 +251,19 @@ fn load_elf(bytes: Vec<u8>, path: String) -> Result<Target> {
     let mut symbols: Vec<Symbol> = elf
         .syms
         .iter()
-        .map(|s| Symbol {
-            addr: s.st_value,
-            size: s.st_size,
-            name: elf.strtab.get_at(s.st_name).unwrap_or("").to_string(),
-            kind: if s.is_import() {
-                SymbolKind::Import
-            } else if s.st_shndx != 0 && s.st_name != 0 {
-                SymbolKind::Export
-            } else {
-                SymbolKind::Local
-            },
+        .map(|s| {
+            Symbol::new(
+                s.st_value,
+                s.st_size,
+                elf.strtab.get_at(s.st_name).unwrap_or(""),
+                if s.is_import() {
+                    SymbolKind::Import
+                } else if s.st_shndx != 0 && s.st_name != 0 {
+                    SymbolKind::Export
+                } else {
+                    SymbolKind::Local
+                },
+            )
         })
         .collect();
     for dynsym in elf.dynsyms.iter() {
@@ -213,7 +272,7 @@ fn load_elf(bytes: Vec<u8>, path: String) -> Result<Target> {
             && !name.is_empty()
             && !symbols.iter().any(|s| s.name == name)
         {
-            symbols.push(Symbol { addr: 0, size: 0, name, kind: SymbolKind::Import });
+            symbols.push(Symbol::new(0, 0, name, SymbolKind::Import));
         }
     }
 
@@ -264,20 +323,10 @@ fn load_pe(bytes: Vec<u8>, path: String) -> Result<Target> {
     let mut symbols: Vec<Symbol> = pe
         .exports
         .iter()
-        .map(|e| Symbol {
-            addr: e.rva as u64,
-            size: 0,
-            name: e.name.unwrap_or("").to_string(),
-            kind: SymbolKind::Export,
-        })
+        .map(|e| Symbol::new(e.rva as u64, 0, e.name.unwrap_or(""), SymbolKind::Export))
         .collect();
     for imp in pe.imports.iter() {
-        symbols.push(Symbol {
-            addr: 0,
-            size: 0,
-            name: imp.name.to_string(),
-            kind: SymbolKind::Import,
-        });
+        symbols.push(Symbol::new(0, 0, imp.name.clone(), SymbolKind::Import));
     }
 
     Ok(Target {
@@ -401,5 +450,138 @@ mod tests {
         buf[at + 4] = n_type;
         buf[at + 5] = n_sect;
         buf[at + 8..at + 16].copy_from_slice(&value.to_le_bytes());
+    }
+
+    #[test]
+    fn itanium_name_is_demangled_and_the_raw_name_stays() {
+        let target = load_macho(macho_with_itanium(), "fixture.o".into()).unwrap();
+        let mangled = target
+            .symbols
+            .iter()
+            .find(|s| s.name == "_Z3fooi")
+            .expect("raw name");
+        assert_eq!(mangled.demangled.as_deref(), Some("foo(int)"));
+        let plain = target.symbols.iter().find(|s| s.name == "plain").expect("plain");
+        assert_eq!(plain.demangled, None);
+        let broken = target.symbols.iter().find(|s| s.name == "_Z3").expect("broken");
+        assert_eq!(broken.demangled, None);
+        let header = crate::headers::emit(&target);
+        assert!(header.contains("foo(int)"), "{header}");
+        assert!(header.contains("plain"), "{header}");
+    }
+
+    fn macho_with_itanium() -> Vec<u8> {
+        let strs = b"\0_Z3fooi\0plain\0_Z3\0";
+        let symoff = 56u32;
+        let nsyms = 3u32;
+        let stroff = symoff + nsyms * 16;
+        let mut file = vec![0u8; stroff as usize + strs.len()];
+        file[0..4].copy_from_slice(&0xfeedfacfu32.to_le_bytes());
+        file[4..8].copy_from_slice(&0x01000007u32.to_le_bytes());
+        file[12..16].copy_from_slice(&1u32.to_le_bytes());
+        file[16..20].copy_from_slice(&1u32.to_le_bytes());
+        file[20..24].copy_from_slice(&24u32.to_le_bytes());
+        file[32..36].copy_from_slice(&2u32.to_le_bytes());
+        file[36..40].copy_from_slice(&24u32.to_le_bytes());
+        file[40..44].copy_from_slice(&symoff.to_le_bytes());
+        file[44..48].copy_from_slice(&nsyms.to_le_bytes());
+        file[48..52].copy_from_slice(&stroff.to_le_bytes());
+        file[52..56].copy_from_slice(&(strs.len() as u32).to_le_bytes());
+        write_nlist(&mut file, symoff as usize, 1, 0x0f, 1, 0x1000);
+        write_nlist(&mut file, symoff as usize + 16, 9, 0x0e, 1, 0x1100);
+        write_nlist(&mut file, symoff as usize + 32, 15, 0x0e, 1, 0x1200);
+        file[stroff as usize..stroff as usize + strs.len()].copy_from_slice(strs);
+        file
+    }
+
+    #[test]
+    fn non_host_slice_can_be_section_listed_and_disassembled() {
+        let arm = code_slice(0x0100_000c, "__arm", &[0xc0, 0x03, 0x5f, 0xd6]);
+        let intel = code_slice(0x0100_0007, "__intel", &[0xcc]);
+        let fat = fat_pair(&arm, &intel);
+        let path = std::env::temp_dir().join(format!(
+            "rea-fat-{}-{}.bin",
+            std::process::id(),
+            fat.len()
+        ));
+        std::fs::write(&path, &fat).unwrap();
+        let host = if cfg!(target_arch = "aarch64") {
+            "arm64"
+        } else {
+            "x86_64"
+        };
+        let other = if host == "arm64" { "x86_64" } else { "arm64" };
+        let host_name = if host == "arm64" { "__arm" } else { "__intel" };
+        let other_name = if other == "arm64" { "__arm" } else { "__intel" };
+        let loaded = super::load(&path).unwrap();
+        assert_eq!(loaded.sections[0].name, host_name);
+        let selected = super::load_arch(&path, Some(other)).unwrap();
+        assert_eq!(selected.sections[0].name, other_name);
+        assert_ne!(loaded.sections[0].name, selected.sections[0].name);
+        let insns = crate::disasm::disassemble(&selected, 0x1000, 1).unwrap();
+        let text = format!("{} {}", insns[0].mnemonic, insns[0].operands);
+        if other == "x86_64" {
+            assert!(text.contains("int3"), "{text}");
+        } else {
+            assert!(text.contains("ret"), "{text}");
+        }
+        let again = super::load(&path).unwrap();
+        assert_eq!(again.sections[0].name, host_name);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn code_slice(cputype: u32, sectname: &str, body: &[u8]) -> Vec<u8> {
+        let code_off = 32 + 152;
+        // Disassembly reads a 4096-byte window at the section address.
+        let filesize = code_off + 4096;
+        let mut file = vec![0u8; filesize];
+        put_le32(&mut file, 0, 0xfeed_facf);
+        put_le32(&mut file, 4, cputype);
+        put_le32(&mut file, 12, 2);
+        put_le32(&mut file, 16, 1);
+        put_le32(&mut file, 20, 152);
+        put_le32(&mut file, 32, 0x19);
+        put_le32(&mut file, 36, 152);
+        file[40..46].copy_from_slice(b"__TEXT");
+        put_le64(&mut file, 64, filesize as u64);
+        put_le64(&mut file, 80, filesize as u64);
+        put_le32(&mut file, 88, 7);
+        put_le32(&mut file, 92, 5);
+        put_le32(&mut file, 96, 1);
+        let sect = 104;
+        let name = sectname.as_bytes();
+        file[sect..sect + name.len()].copy_from_slice(name);
+        file[sect + 16..sect + 22].copy_from_slice(b"__TEXT");
+        put_le64(&mut file, sect + 32, 0x1000);
+        put_le64(&mut file, sect + 40, body.len() as u64);
+        put_le32(&mut file, sect + 48, code_off as u32);
+        file[code_off..code_off + body.len()].copy_from_slice(body);
+        file
+    }
+
+    fn fat_pair(first: &[u8], second: &[u8]) -> Vec<u8> {
+        let off1 = 0x1000u32;
+        let off2 = off1 + first.len() as u32;
+        let mut out = vec![0u8; off2 as usize + second.len()];
+        let mut push = |at: usize, v: u32| out[at..at + 4].copy_from_slice(&v.to_be_bytes());
+        push(0, 0xcafe_babe);
+        push(4, 2);
+        push(8, 0x0100_000c);
+        push(16, off1);
+        push(20, first.len() as u32);
+        push(28, 0x0100_0007);
+        push(36, off2);
+        push(40, second.len() as u32);
+        out[off1 as usize..off1 as usize + first.len()].copy_from_slice(first);
+        out[off2 as usize..].copy_from_slice(second);
+        out
+    }
+
+    fn put_le32(file: &mut [u8], at: usize, v: u32) {
+        file[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    }
+
+    fn put_le64(file: &mut [u8], at: usize, v: u64) {
+        file[at..at + 8].copy_from_slice(&v.to_le_bytes());
     }
 }

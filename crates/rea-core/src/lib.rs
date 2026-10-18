@@ -2,13 +2,18 @@
 //! across Mach-O (incl. fat), ELF, and PE.
 
 pub mod analysis;
+pub mod artifact;
+pub mod crash;
+pub mod demangle;
 pub mod disasm;
 pub mod elf_meta;
 pub mod goinfo;
+pub mod headers;
 pub mod le;
 pub mod loader;
 pub mod macho_meta;
 pub mod pe_meta;
+pub mod plist;
 pub mod sqlite;
 pub mod strings;
 pub mod wasm;
@@ -87,8 +92,48 @@ pub fn section_perms(read: bool, write: bool, exec: bool) -> String {
 pub struct Symbol {
     pub addr: u64,
     pub size: u64,
+    /// The name stored in the file. Mach-O Itanium names keep their `_Z` prefix.
+    /// A single leading underscore is removed from other Mach-O names.
     pub name: String,
+    /// Itanium C++ form, such as `foo(int)`. `None` when `name` is not mangled
+    /// or the suffix does not fit that grammar. Listing still succeeds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub demangled: Option<String>,
     pub kind: SymbolKind,
+}
+
+/// Bytes past the last mapped segment or PE raw section.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Overlay {
+    pub offset: u64,
+    pub size: u64,
+}
+
+/// Trailing bytes strictly after `image_end`. An end of zero, or a file that
+/// ends on that boundary, is `None`.
+pub fn trailing_overlay(image_end: u64, file_len: u64) -> Option<Overlay> {
+    if image_end > 0 && file_len > image_end {
+        Some(Overlay {
+            offset: image_end,
+            size: file_len - image_end,
+        })
+    } else {
+        None
+    }
+}
+
+impl Symbol {
+    pub fn new(addr: u64, size: u64, name: impl Into<String>, kind: SymbolKind) -> Self {
+        let name = name.into();
+        let demangled = demangle::itanium(&name);
+        Self {
+            addr,
+            size,
+            name,
+            demangled,
+            kind,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]

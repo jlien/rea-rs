@@ -32,9 +32,14 @@ enum SymKind {
 enum Command {
     /// Identify the binary: format, arch, entry, counts.
     Info { path: String },
-    /// List sections with addresses, sizes, and file offsets.
-    Sections { path: String },
-    /// List symbols, optionally filtered. Mach-O stabs are omitted.
+    /// List sections with addresses, sizes, and file offsets. `--arch` selects a Mach-O slice; the default stays the host slice.
+    Sections {
+        path: String,
+        /// Mach-O slice: `arm64`, `x86_64`, `arm`, or `x86`. Other formats reject this.
+        #[arg(long)]
+        arch: Option<String>,
+    },
+    /// List symbols, optionally filtered. Mach-O stabs are omitted. An Itanium C++ name is also shown demangled; the raw name stays.
     Symbols {
         path: String,
         #[arg(value_enum, default_value_t = SymKind::All)]
@@ -49,7 +54,7 @@ enum Command {
         #[arg(long)]
         xrefs: bool,
     },
-    /// Disassemble instructions at a virtual address (default: entry point).
+    /// Disassemble instructions at a virtual address (default: entry point). `--arch` selects a Mach-O slice; the default stays the host slice.
     Disasm {
         path: String,
         /// Virtual address, hex (0x…) or decimal. Defaults to entry point.
@@ -57,10 +62,13 @@ enum Command {
         address: Option<String>,
         #[arg(long, default_value_t = 32)]
         count: usize,
+        /// Mach-O slice: `arm64`, `x86_64`, `arm`, or `x86`. Other formats reject this.
+        #[arg(long)]
+        arch: Option<String>,
     },
     /// Discover functions (entry + prologue scan + call targets).
     Funcs { path: String },
-    /// Find code locations referencing an address (data xrefs).
+    /// Find code locations referencing an address. Includes arm64 ADRP, x86_64 RIP-relative, 32-bit x86, and ARM/Thumb PC-relative loads.
     Xrefs {
         path: String,
         /// Address, hex (0x…) or decimal.
@@ -72,14 +80,22 @@ enum Command {
     Wasm { path: String },
     /// Go 1.18+ build info embedded in a binary. Pre-1.18 pointer blobs error.
     Goinfo { path: String },
-    /// Mach-O dylibs, UUID, build version, rpaths, code-directory identifier, hash type, team id, and architectures. Each architecture includes that slice's uuid, dylibs, rpaths, build version, and code directory when the slice is present. The CMS blob is not read.
+    /// Mach-O dylibs, UUID, build version, rpaths, code-directory identifier, hash type, team id, hash-slot digests, the CMS blob, an embedded Info.plist, an overlay, and architectures. Each architecture includes that slice's uuid, dylibs, rpaths, build version, code directory, CMS blob, plist, and overlay when the slice is present.
     Macho { path: String },
-    /// PE subsystem, image base, COFF timestamp, data directories, CLR header, metadata streams, table row counts, type names, field names, method names, parameter names, member-ref names, CodeView PDB path, root resource type ids, the name under each type, the language id under each name, and the data-entry size and code page.
+    /// PE subsystem, image base, COFF timestamp, data directories, CLR header, metadata streams, table row counts, type names, field names, method names, parameter names, member-ref names, CodeView PDB path, root resource type ids, the name under each type, the language id under each name, the data-entry size and code page, the resource payload, and an overlay.
     Pe { path: String },
     /// ELF file type, machine, interpreter, needed libraries, soname, rpath, runpath, and GNU build-id.
     Elf { path: String },
     /// SQLite database header, including the application id, and schema objects. Does not read table rows.
     Sqlite { path: String },
+    /// C header of recovered local and export names. An Itanium demangle becomes a declaration.
+    Headers { path: String },
+    /// Identifying fields of an XML Info.plist. A binary plist or a file with none of the keys prints null.
+    Plist { path: String },
+    /// Identifying lines of a text crash report. A report with none of them prints null.
+    Crash { path: String },
+    /// Kind of an app bundle, a compiled nib, or an asset catalog. Does not reconstruct the file.
+    Artifact { path: String },
     /// Run the MCP stdio server (for agent integration).
     Mcp,
 }
@@ -122,10 +138,42 @@ fn main() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&json).unwrap());
             Ok(())
         }
+        Command::Headers { path } => {
+            let target = loader::load(path).context("failed to load target")?;
+            print!("{}", rea_core::headers::emit(&target));
+            Ok(())
+        }
+        Command::Plist { path } => {
+            let bytes = std::fs::read(path).context("failed to read target")?;
+            let json = match rea_core::plist::identify(&bytes) {
+                Some(info) => serde_json::to_value(info)?,
+                None => serde_json::json!(null),
+            };
+            println!("{}", serde_json::to_string_pretty(&json).unwrap());
+            Ok(())
+        }
+        Command::Crash { path } => {
+            let bytes = std::fs::read(path).context("failed to read target")?;
+            let json = match rea_core::crash::identify(&bytes) {
+                Some(report) => serde_json::to_value(report)?,
+                None => serde_json::json!(null),
+            };
+            println!("{}", serde_json::to_string_pretty(&json).unwrap());
+            Ok(())
+        }
+        Command::Artifact { path } => {
+            let kind = rea_core::artifact::identify(std::path::Path::new(path))
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({ "kind": kind })).unwrap()
+            );
+            Ok(())
+        }
         _ => {
             let (path, _rest): (&String, ()) = match &cli.command {
                 Command::Info { path }
-                | Command::Sections { path }
+                | Command::Sections { path, .. }
                 | Command::Symbols { path, .. }
                 | Command::Strings { path, .. }
                 | Command::Disasm { path, .. }
@@ -135,10 +183,20 @@ fn main() -> anyhow::Result<()> {
                 | Command::Macho { path }
                 | Command::Pe { path }
                 | Command::Elf { path } => (path, ()),
-                Command::Wasm { .. } | Command::Goinfo { .. } | Command::Sqlite { .. } => unreachable!(),
+                Command::Wasm { .. }
+                | Command::Goinfo { .. }
+                | Command::Sqlite { .. }
+                | Command::Headers { .. }
+                | Command::Plist { .. }
+                | Command::Crash { .. }
+                | Command::Artifact { .. } => unreachable!(),
                 Command::Mcp => unreachable!(),
             };
-            let target = loader::load(path).context("failed to load target")?;
+            let arch = match &cli.command {
+                Command::Sections { arch, .. } | Command::Disasm { arch, .. } => arch.as_deref(),
+                _ => None,
+            };
+            let target = loader::load_arch(path, arch).context("failed to load target")?;
             let json = match &cli.command {
                 Command::Info { .. } => serde_json::json!({
                     "path": target.path,
@@ -226,7 +284,14 @@ fn main() -> anyhow::Result<()> {
                         .map_err(|e| anyhow::anyhow!("{e}"))?;
                     serde_json::json!(facts)
                 }
-                Command::Mcp | Command::Wasm { .. } | Command::Goinfo { .. } | Command::Sqlite { .. } => unreachable!(),
+                Command::Mcp
+                | Command::Wasm { .. }
+                | Command::Goinfo { .. }
+                | Command::Sqlite { .. }
+                | Command::Headers { .. }
+                | Command::Plist { .. }
+                | Command::Crash { .. }
+                | Command::Artifact { .. } => unreachable!(),
             };
             println!("{}", serde_json::to_string_pretty(&json).unwrap());
             Ok(())

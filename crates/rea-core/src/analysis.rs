@@ -11,8 +11,9 @@
 //! - Data cross-references come from searching code bytes for the
 //!   little-endian address: 4 bytes when `bits < 64`, 8 bytes otherwise
 //!   (covers `mov reg, [addr]`, `push [addr]`, and immediate loads).
-//!   Arm64 and x86_64 also record PC-relative addresses in `__text` / `.text`
-//!   (`adrp` plus `add` or a load, and RIP-relative memory operands).
+//!   Text also records PC-relative addresses in `__text` / `.text`: arm64
+//!   `adrp` plus `add` or a load, x86_64 RIP-relative memory operands, 32-bit
+//!   x86 `call`/`pop`/`mov` sequences, and ARM or Thumb literal loads.
 
 use crate::{disasm, strings, Arch, SymbolKind, Target};
 use std::collections::{BTreeMap, BTreeSet};
@@ -372,10 +373,12 @@ pub fn call_graph(functions: &[Function]) -> CallGraph {
 /// register now holds the full address. `ldr` / `ldrb` / `ldrh` / `ldrsw`
 /// from a still-live page emit `page + disp`. Any other write of a mapped
 /// register drops it. x86_64 emits `insn + len + disp` for each RIP-relative
-/// memory operand with no index. Every other architecture is left alone.
+/// memory operand with no index. 32-bit x86 records a `call` to the next
+/// instruction, the following `pop`, and a later load through that register.
+/// ARM and Thumb record `ldr` / `ldrb` / `ldrh` from `pc`.
 fn pc_relative_index(target: &Target) -> BTreeMap<u64, Vec<u64>> {
     let mut index = BTreeMap::new();
-    if !matches!(target.arch, Arch::Arm64 | Arch::X86_64) {
+    if matches!(target.arch, Arch::Unknown) {
         return index;
     }
     let Ok(mut cs) = disasm::build_capstone(target.arch) else {
@@ -394,16 +397,36 @@ fn pc_relative_index(target: &Target) -> BTreeMap<u64, Vec<u64>> {
         if start >= end {
             continue;
         }
-        let Ok(insns) = cs.disasm_all(&target.bytes[start..end], sec.addr) else {
+        let code = &target.bytes[start..end];
+        let Ok(insns) = cs.disasm_all(code, sec.addr) else {
             continue;
         };
         match target.arch {
             Arch::Arm64 => collect_arm64_pc_rel(&cs, insns.as_ref(), &mut index),
             Arch::X86_64 => collect_x86_64_pc_rel(&cs, insns.as_ref(), &mut index),
-            _ => {}
+            Arch::X86 => collect_x86_32_pc_rel(&cs, insns.as_ref(), &mut index),
+            Arch::Arm => collect_arm_pc_rel(&cs, insns.as_ref(), true, &mut index),
+            Arch::Unknown => {}
+        }
+        if target.arch == Arch::Arm {
+            if let Ok(mut a32) = arm_mode_capstone() {
+                if a32.set_detail(true).is_ok() {
+                    if let Ok(insns) = a32.disasm_all(code, sec.addr) {
+                        collect_arm_pc_rel(&a32, insns.as_ref(), false, &mut index);
+                    }
+                }
+            }
         }
     }
     index
+}
+
+fn arm_mode_capstone() -> Result<capstone::Capstone, capstone::Error> {
+    use capstone::arch::BuildsCapstone;
+    capstone::Capstone::new()
+        .arm()
+        .mode(capstone::arch::arm::ArchMode::Arm)
+        .build()
 }
 
 fn collect_arm64_pc_rel(
@@ -510,11 +533,112 @@ fn collect_x86_64_pc_rel(
     }
 }
 
+/// `call` of the next instruction, then `pop reg`, then a load `[reg + disp]`.
+fn collect_x86_32_pc_rel(
+    cs: &capstone::Capstone,
+    insns: &[capstone::Insn<'_>],
+    index: &mut BTreeMap<u64, Vec<u64>>,
+) {
+    use capstone::arch::x86::X86OperandType::{Imm, Mem, Reg};
+    use capstone::arch::DetailsArchInsn;
+    let mut pending: Option<u64> = None;
+    let mut held: Option<(u16, u64)> = None;
+    for ins in insns {
+        let Ok(detail) = cs.insn_detail(ins) else {
+            pending = None;
+            continue;
+        };
+        let arch = detail.arch_detail();
+        let Some(x86) = arch.x86() else {
+            continue;
+        };
+        let ops: Vec<_> = x86.operands().map(|op| op.op_type).collect();
+        let mnem = ins.mnemonic().unwrap_or("");
+        let from = ins.address();
+        let next = from.wrapping_add(ins.bytes().len() as u64);
+        if mnem == "call" {
+            pending = match ops.first() {
+                Some(Imm(target)) if *target >= 0 && *target as u64 == next => Some(next),
+                _ => None,
+            };
+            continue;
+        }
+        if mnem == "pop" {
+            if let (Some(pc), Some(Reg(dest))) = (pending.take(), ops.first()) {
+                held = Some((dest.0, pc));
+            } else {
+                pending = None;
+            }
+            continue;
+        }
+        pending = None;
+        if let Some((reg, pc)) = held {
+            for op in &ops {
+                let Mem(mem) = op else {
+                    continue;
+                };
+                if mem.base().0 == reg && mem.index().0 == 0 {
+                    let to = pc.wrapping_add(mem.disp() as u64);
+                    index.entry(to).or_default().push(from);
+                }
+            }
+        }
+        if matches!(mnem, "mov" | "lea" | "add" | "sub" | "xor") {
+            if let Some(Reg(dest)) = ops.first() {
+                if held.is_some_and(|(reg, _)| reg == dest.0) {
+                    held = None;
+                }
+            }
+        }
+    }
+}
+
+/// Literal load from `pc`. Thumb aligns `addr + 4`. ARM adds 8.
+fn collect_arm_pc_rel(
+    cs: &capstone::Capstone,
+    insns: &[capstone::Insn<'_>],
+    thumb: bool,
+    index: &mut BTreeMap<u64, Vec<u64>>,
+) {
+    use capstone::arch::arm::ArmOperandType::Mem;
+    use capstone::arch::DetailsArchInsn;
+    const ARM_REG_PC: u16 = 11;
+    for ins in insns {
+        let Ok(detail) = cs.insn_detail(ins) else {
+            continue;
+        };
+        let arch = detail.arch_detail();
+        let Some(arm) = arch.arm() else {
+            continue;
+        };
+        let mnem = ins.mnemonic().unwrap_or("");
+        if !matches!(mnem, "ldr" | "ldrb" | "ldrh") {
+            continue;
+        }
+        let from = ins.address();
+        for op in arm.operands() {
+            let Mem(mem) = op.op_type else {
+                continue;
+            };
+            if mem.base().0 != ARM_REG_PC || mem.index().0 != 0 || mem.disp() < 0 {
+                continue;
+            }
+            let base = if thumb {
+                from.wrapping_add(4) & !3
+            } else {
+                from.wrapping_add(8)
+            };
+            let to = base.wrapping_add(mem.disp() as u64);
+            index.entry(to).or_default().push(from);
+        }
+    }
+}
+
 /// Find locations that reference `addr`. The needle is 8 little-endian bytes
 /// when `bits >= 64`, otherwise the 4-byte little-endian value. This
 /// over-matches (any byte pattern equal to the address). A 4-byte prefix is
-/// not a hit on a 64-bit target. Arm64 and x86_64 text also contribute
-/// PC-relative hits. Results are sorted by `from` and deduped.
+/// not a hit on a 64-bit target. Text also contributes PC-relative hits on
+/// arm64, x86_64, 32-bit x86, and ARM/Thumb. Results are sorted by `from` and deduped.
 pub fn data_xrefs(target: &Target, addr: u64) -> Vec<XRef> {
     let needle8 = addr.to_le_bytes();
     let needle4 = (addr as u32).to_le_bytes();
@@ -810,12 +934,7 @@ mod tests {
                 file_offset: 0,
                 perms: "---".into(),
             }],
-            symbols: vec![crate::Symbol {
-                addr: 0x1000,
-                size: 0,
-                name: "f".into(),
-                kind,
-            }],
+            symbols: vec![crate::Symbol::new(0x1000, 0, "f", kind)],
             bytes,
             page_map: None,
         }
@@ -977,6 +1096,66 @@ mod tests {
         let refs = data_xrefs(&target, 0x23bf);
         assert!(refs.iter().any(|r| r.from == 0x1000), "{refs:?}");
         assert!(data_xrefs(&target, 0x13b8).is_empty());
+    }
+
+    #[test]
+    fn x86_32_call_pop_load_is_an_xref() {
+        // call next; pop eax; mov eax, [eax + 0x10]
+        let bytes = vec![0xe8, 0x00, 0x00, 0x00, 0x00, 0x58, 0x8b, 0x40, 0x10];
+        let target = flat_target(
+            Arch::X86,
+            32,
+            vec![crate::Section {
+                name: ".text".into(),
+                addr: 0x1000,
+                size: bytes.len() as u64,
+                file_offset: 0,
+                perms: "---".into(),
+            }],
+            bytes,
+        );
+        let refs = data_xrefs(&target, 0x1015);
+        assert!(refs.iter().any(|r| r.from == 0x1006), "{refs:?}");
+    }
+
+    #[test]
+    fn thumb_literal_load_is_an_xref() {
+        // ldr r0, [pc, #4] at 0x1000. Thumb base is align(0x1004, 4) + 4.
+        let bytes = vec![0x01, 0x48];
+        let target = flat_target(
+            Arch::Arm,
+            32,
+            vec![crate::Section {
+                name: ".text".into(),
+                addr: 0x1000,
+                size: 2,
+                file_offset: 0,
+                perms: "---".into(),
+            }],
+            bytes,
+        );
+        let refs = data_xrefs(&target, 0x1008);
+        assert!(refs.iter().any(|r| r.from == 0x1000), "{refs:?}");
+    }
+
+    #[test]
+    fn arm_literal_load_is_an_xref() {
+        // ldr r0, [pc, #8]. ARM base is 0x1000 + 8 + 8.
+        let bytes = vec![0x08, 0x00, 0x9f, 0xe5];
+        let target = flat_target(
+            Arch::Arm,
+            32,
+            vec![crate::Section {
+                name: ".text".into(),
+                addr: 0x1000,
+                size: 4,
+                file_offset: 0,
+                perms: "---".into(),
+            }],
+            bytes,
+        );
+        let refs = data_xrefs(&target, 0x1010);
+        assert!(refs.iter().any(|r| r.from == 0x1000), "{refs:?}");
     }
 
     #[test]

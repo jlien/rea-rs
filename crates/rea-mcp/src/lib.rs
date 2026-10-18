@@ -114,8 +114,16 @@ fn handle_tool_call(msg: &Value) -> Result<Value, String> {
         return Ok(text_result(value.to_string()));
     }
 
+    let arch = args
+        .get("arch")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty());
     let result: Result<Value, String> = (|| {
-        let target = loader::load(path).map_err(|e| e.to_string())?;
+        let target = if matches!(name, "rea_sections" | "rea_disasm") {
+            loader::load_arch(path, arch).map_err(|e| e.to_string())?
+        } else {
+            loader::load(path).map_err(|e| e.to_string())?
+        };
         Ok(match name {
             "rea_info" => json!({
                 "path": target.path,
@@ -253,12 +261,14 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "rea_sections",
-            "description": "List sections of a binary with names, virtual addresses, sizes, file offsets, and rwx permissions.",
-            "inputSchema": schema(true, json!({}), &[]),
+            "description": "List sections of a binary with names, virtual addresses, sizes, file offsets, and rwx permissions. Optional arch selects a Mach-O slice (arm64, x86_64, arm, x86). The default is the host slice.",
+            "inputSchema": schema(false, json!({
+                "arch": { "type": "string", "description": "Mach-O slice. Default is the host slice." }
+            }), &[]),
         }),
         json!({
             "name": "rea_symbols",
-            "description": "List symbols; optionally filter by kind: imports, exports, or locals. Mach-O stab symbols are omitted. Names are not demangled.",
+            "description": "List symbols; optionally filter by kind: imports, exports, or locals. Mach-O stab symbols are omitted. An Itanium C++ name is also returned demangled. The raw name stays. Other names are unchanged.",
             "inputSchema": schema(false, json!({
                 "kind": { "type": "string", "enum": ["all", "imports", "exports", "locals"] }
             }), &[]),
@@ -273,10 +283,11 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "rea_disasm",
-            "description": "Disassemble code at a virtual address (defaults to the entry point).",
+            "description": "Disassemble code at a virtual address (defaults to the entry point). Optional arch selects a Mach-O slice. The default is the host slice.",
             "inputSchema": schema(false, json!({
                 "address": { "type": "integer", "description": "Virtual address (hex or decimal)" },
-                "count": { "type": "integer", "description": "Max instructions (default 32)" }
+                "count": { "type": "integer", "description": "Max instructions (default 32)" },
+                "arch": { "type": "string", "description": "Mach-O slice. Default is the host slice." }
             }), &[]),
         }),
         json!({
@@ -286,7 +297,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "rea_xrefs",
-            "description": "Find code locations referencing an address. Absolute pointers use the target pointer width. Text also includes arm64 ADRP and x86_64 RIP-relative loads.",
+            "description": "Find code locations referencing an address. Absolute pointers use the target pointer width. Text also includes arm64 ADRP, x86_64 RIP-relative, 32-bit x86, and ARM/Thumb PC-relative loads.",
             "inputSchema": schema(false, json!({
                 "address": { "type": "integer", "description": "Address to find references to" }
             }), &["address"]),
@@ -308,12 +319,12 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "rea_macho",
-            "description": "Mach-O dylibs, UUID, build version, rpaths, code-directory identifier, hash type, team id, and fat architectures. Slice facts use the host slice. Each architecture includes that slice's uuid, dylibs, rpaths, build version, and code directory when the bytes are present. The CMS blob and the hash slots are not read.",
+            "description": "Mach-O dylibs, UUID, build version, rpaths, code-directory identifier, hash type, team id, hash-slot digests, the CMS blob, an embedded Info.plist, an overlay, and fat architectures. Slice facts use the host slice. Each architecture includes that slice's uuid, dylibs, rpaths, build version, code directory, CMS blob, plist, and overlay when the bytes are present. A missing blob does not fail the parse.",
             "inputSchema": schema(true, json!({}), &[]),
         }),
         json!({
             "name": "rea_pe",
-            "description": "PE subsystem, image base, COFF timestamp, data directories, CLR runtime header, metadata version, stream names, table row counts, Module/TypeRef/TypeDef names, Field and MethodDef names on each TypeDef, Param names on each method, MemberRef names, CodeView PDB path, root resource type ids, the name under each type, the language id under each name, and the data-entry size and code page. The resource payload is not read.",
+            "description": "PE subsystem, image base, COFF timestamp, data directories, CLR runtime header, metadata version, stream names, table row counts, Module/TypeRef/TypeDef names, Field and MethodDef names on each TypeDef, Param names on each method, MemberRef names, CodeView PDB path, root resource type ids, the name under each type, the language id under each name, the data-entry size and code page, the resource payload, and an overlay. A missing payload does not fail the parse. The timestamp is not a date.",
             "inputSchema": schema(true, json!({}), &[]),
         }),
         json!({

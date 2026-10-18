@@ -24,10 +24,12 @@ pub struct PeFacts {
     pub clr: Option<ClrHeader>,
     /// Root resource-directory type ids (the low 16 bits) when the entry is an integer id. Named entries are skipped. Empty if there is no resource directory.
     pub resource_type_ids: Vec<u32>,
-    /// Resource directory through the data-entry header. Integer ids are decimal strings. Named entries are UTF-16. The resource payload is not read.
+    /// Resource directory through the data-entry header and, when the RVA is mapped, the payload bytes.
     pub resources: Vec<PeResource>,
     /// First CodeView PDB 7.0 or 2.0 record in the debug directory. Other debug types are skipped. `None` when the directory is absent, unmapped, or has no CodeView path.
     pub pdb: Option<PePdb>,
+    /// Bytes past the last section's raw data. `None` when the file ends on that boundary or has no raw section.
+    pub overlay: Option<crate::Overlay>,
 }
 
 /// One resource type, the names under it, and the language id under each name.
@@ -57,6 +59,8 @@ pub struct PeResourceLang {
     pub size: Option<u32>,
     /// `CodePage` from the data entry. `None` when this level is not a data entry.
     pub code_page: Option<u32>,
+    /// Payload bytes at `OffsetToData`, limited to `size`. `None` when the RVA is not mapped or the bytes do not fit. A missing payload does not fail the PE parse.
+    pub payload: Option<Vec<u8>>,
 }
 
 /// A CodeView PDB filename from the debug directory.
@@ -140,19 +144,33 @@ pub(crate) fn resource_type_ids(dir: &[u8]) -> Result<Vec<u32>> {
 
 /// Root types, the name under each type, and the language id under each name.
 ///
-/// A language entry that points at a data entry contributes its size and code page. The `OffsetToData` RVA is not followed, and a further directory under a language id stays unread. A short directory, name, or data entry is an error.
+/// A language entry that points at a data entry contributes its size and code page. `OffsetToData` is followed only when `file` and `sections` are passed. A further directory under a language id stays unread. A short directory, name, or data-entry header is an error. A payload that does not fit leaves `payload` empty.
+#[cfg(test)]
 pub(crate) fn resource_tree(dir: &[u8]) -> Result<Vec<PeResource>> {
+    walk_resources(dir, None, None)
+}
+
+fn walk_resources(
+    dir: &[u8],
+    sections: Option<&[goblin::pe::section_table::SectionTable]>,
+    file: Option<&[u8]>,
+) -> Result<Vec<PeResource>> {
     let mut out = Vec::new();
     for entry in directory_entries(dir, 0)? {
         out.push(PeResource {
             ty: entry_label(dir, entry.name_or_id)?,
-            names: named_children(dir, entry.offset)?,
+            names: named_children(dir, entry.offset, sections, file)?,
         });
     }
     Ok(out)
 }
 
-fn named_children(dir: &[u8], offset: u32) -> Result<Vec<PeResourceName>> {
+fn named_children(
+    dir: &[u8],
+    offset: u32,
+    sections: Option<&[goblin::pe::section_table::SectionTable]>,
+    file: Option<&[u8]>,
+) -> Result<Vec<PeResourceName>> {
     if offset & 0x8000_0000 == 0 {
         return Ok(Vec::new());
     }
@@ -161,7 +179,7 @@ fn named_children(dir: &[u8], offset: u32) -> Result<Vec<PeResourceName>> {
     for child in directory_entries(dir, sub)? {
         names.push(PeResourceName {
             name: entry_label(dir, child.name_or_id)?,
-            languages: language_entries(dir, child.offset)?,
+            languages: language_entries(dir, child.offset, sections, file)?,
         });
     }
     Ok(names)
@@ -170,7 +188,12 @@ fn named_children(dir: &[u8], offset: u32) -> Result<Vec<PeResourceName>> {
 /// Language ids in the directory `offset` points at.
 ///
 /// A data-entry offset contributes size and code page. An offset with the subdirectory bit set records the id only.
-fn language_entries(dir: &[u8], offset: u32) -> Result<Vec<PeResourceLang>> {
+fn language_entries(
+    dir: &[u8],
+    offset: u32,
+    sections: Option<&[goblin::pe::section_table::SectionTable]>,
+    file: Option<&[u8]>,
+) -> Result<Vec<PeResourceLang>> {
     if offset & 0x8000_0000 == 0 {
         return Ok(Vec::new());
     }
@@ -178,19 +201,39 @@ fn language_entries(dir: &[u8], offset: u32) -> Result<Vec<PeResourceLang>> {
     let mut langs = Vec::new();
     for child in directory_entries(dir, sub)? {
         let data = data_entry(dir, child.offset)?;
+        let payload = data.and_then(|(_, _, rva, size)| {
+            let sections = sections?;
+            let file = file?;
+            read_payload(sections, file, rva, size)
+        });
         langs.push(PeResourceLang {
             lang: entry_label(dir, child.name_or_id)?,
             size: data.map(|d| d.0),
             code_page: data.map(|d| d.1),
+            payload,
         });
     }
     Ok(langs)
 }
 
-/// `Size` and `CodePage` from an `IMAGE_RESOURCE_DATA_ENTRY`.
+fn read_payload(
+    sections: &[goblin::pe::section_table::SectionTable],
+    file: &[u8],
+    rva: u32,
+    size: u32,
+) -> Option<Vec<u8>> {
+    if size > 65_536 {
+        return None;
+    }
+    let off = section_file_offset(sections, rva)?;
+    let end = off.checked_add(size as usize)?;
+    file.get(off..end).map(|bytes| bytes.to_vec())
+}
+
+/// `Size`, `CodePage`, and `OffsetToData` from an `IMAGE_RESOURCE_DATA_ENTRY`.
 ///
-/// Offset 0 and a subdirectory offset are not data entries. `OffsetToData` is not used.
-fn data_entry(dir: &[u8], offset: u32) -> Result<Option<(u32, u32)>> {
+/// Offset 0 and a subdirectory offset are not data entries.
+fn data_entry(dir: &[u8], offset: u32) -> Result<Option<(u32, u32, u32, u32)>> {
     if offset & 0x8000_0000 != 0 || offset == 0 {
         return Ok(None);
     }
@@ -199,9 +242,10 @@ fn data_entry(dir: &[u8], offset: u32) -> Result<Option<(u32, u32)>> {
         .get(at..at.saturating_add(16))
         .filter(|b| b.len() == 16)
         .ok_or_else(|| Error::Parse("pe: truncated resource data".into()))?;
+    let rva = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
     let size = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]);
     let code_page = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]);
-    Ok(Some((size, code_page)))
+    Ok(Some((size, code_page, rva, size)))
 }
 
 struct DirEntry {
@@ -917,6 +961,7 @@ pub fn facts(bytes: &[u8]) -> Result<PeFacts> {
             resource_type_ids: Vec::new(),
             resources: Vec::new(),
             pdb: None,
+            overlay: None,
         });
     };
     let subsystem = Some(subsystem_name(optional.windows_fields.subsystem));
@@ -953,10 +998,14 @@ pub fn facts(bytes: &[u8]) -> Result<PeFacts> {
             let blob = bytes
                 .get(off..)
                 .ok_or_else(|| Error::Parse("pe: truncated resource directory".into()))?;
-            (resource_type_ids(blob)?, resource_tree(blob)?)
+            (
+                resource_type_ids(blob)?,
+                walk_resources(blob, Some(pe.sections.as_slice()), Some(bytes))?,
+            )
         } else {
             (Vec::new(), Vec::new())
         };
+    let overlay = crate::trailing_overlay(pe_image_end(&pe.sections), bytes.len() as u64);
     let pdb = optional.data_directories.get_debug_table().and_then(|dir| {
         if dir.size == 0 {
             return None;
@@ -975,7 +1024,18 @@ pub fn facts(bytes: &[u8]) -> Result<PeFacts> {
         resource_type_ids,
         resources,
         pdb,
+        overlay,
     })
+}
+
+fn pe_image_end(sections: &[goblin::pe::section_table::SectionTable]) -> u64 {
+    sections
+        .iter()
+        .map(|section| {
+            u64::from(section.pointer_to_raw_data).saturating_add(u64::from(section.size_of_raw_data))
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 fn subsystem_name(subsystem: u16) -> String {
@@ -1140,6 +1200,7 @@ mod tests {
                     lang: (*lang).into(),
                     size: *size,
                     code_page: *code_page,
+                    payload: None,
                 })
                 .collect(),
         }
@@ -1229,6 +1290,80 @@ mod tests {
         assert!(!got.has_clr);
         assert!(got.resources.is_empty());
         assert_eq!(got.pdb, None);
+        assert_eq!(got.overlay, None);
+    }
+
+    #[test]
+    fn reads_resource_payload_and_overlay() {
+        let bytes = pe_with_resource_payload();
+        let got = facts(&bytes).unwrap();
+        let lang = &got.resources[0].names[0].languages[0];
+        assert_eq!(lang.lang, "1033");
+        assert_eq!(lang.size, Some(4));
+        assert_eq!(lang.payload.as_deref(), Some(b"SECR".as_slice()));
+        assert_ne!(
+            lang.payload.as_deref(),
+            Some(lang.size.unwrap().to_le_bytes().as_slice())
+        );
+        let overlay = got.overlay.expect("overlay");
+        assert_eq!(overlay.size, 5);
+        assert_eq!(&bytes[overlay.offset as usize..], b"EXTRA");
+
+        let mut short = bytes.clone();
+        short.truncate(overlay.offset as usize);
+        let got = facts(&short).unwrap();
+        assert_eq!(got.overlay, None);
+        assert_eq!(
+            got.resources[0].names[0].languages[0].payload.as_deref(),
+            Some(b"SECR".as_slice())
+        );
+    }
+
+    /// One `.rsrc` section. Language 1033 points at `SECR`. `EXTRA` follows the raw section.
+    fn pe_with_resource_payload() -> Vec<u8> {
+        let mut dir = vec![0u8; 116];
+        dir[14] = 1;
+        write_res_entry(&mut dir, 16, 16, 0x8000_0000 | 32);
+        dir[32 + 14] = 1;
+        write_res_entry(&mut dir, 48, 1, 0x8000_0000 | 64);
+        dir[64 + 14] = 1;
+        write_res_entry(&mut dir, 80, 1033, 96);
+        let rva = 0x2000u32 + 112;
+        dir[96..100].copy_from_slice(&rva.to_le_bytes());
+        dir[100..104].copy_from_slice(&4u32.to_le_bytes());
+        dir[104..108].copy_from_slice(&1252u32.to_le_bytes());
+        dir[112..116].copy_from_slice(b"SECR");
+
+        let mut bytes = vec![0u8; 0x400];
+        bytes[0] = b'M';
+        bytes[1] = b'Z';
+        bytes[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        bytes[0x80..0x84].copy_from_slice(b"PE\0\0");
+        bytes[0x84..0x86].copy_from_slice(&0x14cu16.to_le_bytes());
+        bytes[0x86..0x88].copy_from_slice(&1u16.to_le_bytes());
+        bytes[0x94..0x96].copy_from_slice(&120u16.to_le_bytes());
+        let opt = 0x98;
+        bytes[opt..opt + 2].copy_from_slice(&0x10bu16.to_le_bytes());
+        bytes[opt + 28..opt + 32].copy_from_slice(&0x0040_0000u32.to_le_bytes());
+        bytes[opt + 32..opt + 36].copy_from_slice(&0x1000u32.to_le_bytes());
+        bytes[opt + 36..opt + 40].copy_from_slice(&0x200u32.to_le_bytes());
+        bytes[opt + 56..opt + 60].copy_from_slice(&0x3000u32.to_le_bytes());
+        bytes[opt + 60..opt + 64].copy_from_slice(&0x400u32.to_le_bytes());
+        bytes[opt + 68..opt + 70].copy_from_slice(&3u16.to_le_bytes());
+        bytes[opt + 92..opt + 96].copy_from_slice(&3u32.to_le_bytes());
+        bytes[opt + 112..opt + 116].copy_from_slice(&0x2000u32.to_le_bytes());
+        bytes[opt + 116..opt + 120].copy_from_slice(&(dir.len() as u32).to_le_bytes());
+        let sect = opt + 120;
+        bytes[sect..sect + 5].copy_from_slice(b".rsrc");
+        bytes[sect + 8..sect + 12].copy_from_slice(&(dir.len() as u32).to_le_bytes());
+        bytes[sect + 12..sect + 16].copy_from_slice(&0x2000u32.to_le_bytes());
+        bytes[sect + 16..sect + 20].copy_from_slice(&0x200u32.to_le_bytes());
+        bytes[sect + 20..sect + 24].copy_from_slice(&0x400u32.to_le_bytes());
+        bytes[sect + 36..sect + 40].copy_from_slice(&0x4000_0000u32.to_le_bytes());
+        bytes.resize(0x400 + 0x200, 0);
+        bytes[0x400..0x400 + dir.len()].copy_from_slice(&dir);
+        bytes.extend_from_slice(b"EXTRA");
+        bytes
     }
 
     /// PE32 with no sections and no data directories.
