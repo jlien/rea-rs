@@ -298,7 +298,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "rea_wasm",
-            "description": "List WASM section ids, imports, exports, the defined function count, memory limits, table limits, and the start index. Does not decode function bodies, element segments, or execute the module.",
+            "description": "List WASM section ids, imports, exports, the type count, defined function count, memory limits, table limits, data count, custom section names, and the start index. Does not decode function bodies, type signatures, element segments, data segments, custom payloads, or execute the module.",
             "inputSchema": schema(true, json!({}), &[]),
         }),
         json!({
@@ -308,22 +308,22 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "rea_macho",
-            "description": "Mach-O dylibs, UUID, build version, code-directory identifier, hash type, team id, and fat architectures. Slice facts use the host slice. Each architecture includes that slice's code directory when the bytes are present. The CMS blob and the hash slots are not read.",
+            "description": "Mach-O dylibs, UUID, build version, rpaths, code-directory identifier, hash type, team id, and fat architectures. Slice facts use the host slice. Each architecture includes that slice's uuid, dylibs, rpaths, build version, and code directory when the bytes are present. The CMS blob and the hash slots are not read.",
             "inputSchema": schema(true, json!({}), &[]),
         }),
         json!({
             "name": "rea_pe",
-            "description": "PE data directories, CLR runtime header, metadata version, stream names, table row counts, Module/TypeRef/TypeDef names, Field and MethodDef names on each TypeDef, Param names on each method, MemberRef names, CodeView PDB path, root resource type ids, the name under each type, the language id under each name, and the data-entry size and code page. The resource payload is not read.",
+            "description": "PE subsystem, image base, COFF timestamp, data directories, CLR runtime header, metadata version, stream names, table row counts, Module/TypeRef/TypeDef names, Field and MethodDef names on each TypeDef, Param names on each method, MemberRef names, CodeView PDB path, root resource type ids, the name under each type, the language id under each name, and the data-entry size and code page. The resource payload is not read.",
             "inputSchema": schema(true, json!({}), &[]),
         }),
         json!({
             "name": "rea_sqlite",
-            "description": "SQLite database header and sqlite_schema objects (type, name, table, root page, SQL). Does not read table rows or a WAL file.",
+            "description": "SQLite database header, including the application id, and sqlite_schema objects (type, name, table, root page, SQL). Does not read table rows or a WAL file.",
             "inputSchema": schema(true, json!({}), &[]),
         }),
         json!({
             "name": "rea_elf",
-            "description": "ELF interpreter, needed libraries, soname, and GNU build-id.",
+            "description": "ELF file type, machine, interpreter, needed libraries, soname, rpath, runpath, and GNU build-id. Rpath directories are not searched.",
             "inputSchema": schema(true, json!({}), &[]),
         }),
     ]

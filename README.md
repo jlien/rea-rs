@@ -67,12 +67,12 @@ rea strings /bin/ls | jq '.count'
 - `rea_funcs` — function boundaries from the entry point, direct calls, and prologues
 - `rea_xrefs` — code locations referencing an address (pointer-width absolutes, plus PC-relative loads in text)
 - `rea_call_graph` — direct calls between discovered functions
-- `rea_wasm` — WASM section ids, imports, exports, defined function count, memory min/max, table min/max, and the start index. Function bodies and element segments are not decoded.
+- `rea_wasm` — WASM section ids, imports, exports, type count, defined function count, memory min/max, table min/max, data count, custom section names, and the start index. Function bodies, type signatures, element segments, data segments, and custom payloads are not decoded.
 - `rea_go` — Go 1.18+ build info (version and module text)
-- `rea_macho` — dylibs, UUID, build version, code-directory identifier, hash type, team id, and fat architectures. Each architecture includes that slice's code directory when the slice is present. The CMS blob and the hash slots are not read.
-- `rea_pe` — data directories, CLR runtime header, metadata version, stream directory, table row counts, Module/TypeRef/TypeDef names, Field and MethodDef names on each TypeDef, Param names on each method, MemberRef names, CodeView PDB path, root resource type ids, the name under each type, the language id under each name, and the data-entry size and code page. The resource payload is not read.
-- `rea_elf` — interpreter, needed libraries, soname, and GNU build-id
-- `rea_sqlite` — database header and `sqlite_schema` objects. No table rows and no WAL replay.
+- `rea_macho` — dylibs, UUID, build version, rpaths, code-directory identifier, hash type, team id, and fat architectures. Each architecture includes that slice's uuid, dylibs, rpaths, build version, and code directory when the slice is present. The CMS blob and the hash slots are not read.
+- `rea_pe` — subsystem, image base, COFF timestamp, data directories, CLR runtime header, metadata version, stream directory, table row counts, Module/TypeRef/TypeDef names, Field and MethodDef names on each TypeDef, Param names on each method, MemberRef names, CodeView PDB path, root resource type ids, the name under each type, the language id under each name, and the data-entry size and code page. The resource payload is not read.
+- `rea_elf` — file type, machine, interpreter, needed libraries, soname, rpath, runpath, and GNU build-id. The paths are not searched.
+- `rea_sqlite` — database header, including the application id, and `sqlite_schema` objects. No table rows and no WAL replay.
 
 Register it with any MCP-capable agent, e.g. Claude Code:
 
@@ -112,9 +112,9 @@ Or in an MCP client config:
 ## Roadmap
 
 - [ ] .NET rows beyond Module, TypeRef, TypeDef, Field, MethodDef, Param, and MemberRef names, plus IL (`rea pe` reads the CLR header, stream directory, table row counts, those type names, each TypeDef's field and method names, each method's parameter names, and MemberRef names)
-- [x] WASM module inspection — section ids, imports, exports, defined function count, memory min/max, table min/max, and the start index (`rea wasm`). No function-body decode, no element segments, no WAT, and no execution
+- [x] WASM module inspection — section ids, imports, exports, type count, defined function count, memory min/max, table min/max, data count, custom names, and the start index (`rea wasm`). No function-body decode, no type signatures, no element or data segments, no custom payloads, no WAT, and no execution
 - [x] Function boundary detection and cross-reference resolution — Capstone sweep (entry, direct calls, prologues on x86, x86_64, arm64, and Thumb) plus pointer-width data xrefs, exposed as `rea funcs`, `rea xrefs`, `rea callgraph`, and the MCP tools
-- [x] SQLite header and `sqlite_schema` objects (`rea sqlite`). No table-row reads and no WAL replay
+- [x] SQLite header, including the application id, and `sqlite_schema` objects (`rea sqlite`). No table-row reads and no WAL replay
 - [ ] Export as C/C++ headers from recovered definitions
 
 ## License

@@ -68,17 +68,17 @@ enum Command {
     },
     /// Direct call graph over discovered functions.
     Callgraph { path: String },
-    /// WASM section ids, imports, exports, defined function count, memory limits, table limits, and the start index. Function bodies and element segments are not decoded.
+    /// WASM section ids, imports, exports, type count, defined function count, memory limits, table limits, data count, custom section names, and the start index. Function bodies, type signatures, element segments, data segments, and custom payloads are not decoded.
     Wasm { path: String },
     /// Go 1.18+ build info embedded in a binary. Pre-1.18 pointer blobs error.
     Goinfo { path: String },
-    /// Mach-O dylibs, UUID, build version, code-directory identifier, hash type, team id, and architectures. Each architecture includes that slice's code directory when the slice is present. The CMS blob is not read.
+    /// Mach-O dylibs, UUID, build version, rpaths, code-directory identifier, hash type, team id, and architectures. Each architecture includes that slice's uuid, dylibs, rpaths, build version, and code directory when the slice is present. The CMS blob is not read.
     Macho { path: String },
-    /// PE data directories, CLR header, metadata streams, table row counts, type names, field names, method names, parameter names, member-ref names, CodeView PDB path, root resource type ids, the name under each type, the language id under each name, and the data-entry size and code page.
+    /// PE subsystem, image base, COFF timestamp, data directories, CLR header, metadata streams, table row counts, type names, field names, method names, parameter names, member-ref names, CodeView PDB path, root resource type ids, the name under each type, the language id under each name, and the data-entry size and code page.
     Pe { path: String },
-    /// ELF interpreter, needed libraries, soname, and GNU build-id.
+    /// ELF file type, machine, interpreter, needed libraries, soname, rpath, runpath, and GNU build-id.
     Elf { path: String },
-    /// SQLite database header and schema objects. Does not read table rows.
+    /// SQLite database header, including the application id, and schema objects. Does not read table rows.
     Sqlite { path: String },
     /// Run the MCP stdio server (for agent integration).
     Mcp,
