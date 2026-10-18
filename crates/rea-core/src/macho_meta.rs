@@ -1,4 +1,4 @@
-//! Load-command facts for one Mach-O slice, plus each fat slice's code directory.
+//! Load-command facts for one Mach-O slice, plus each fat slice's uuid, dylibs, rpaths, build version, and code directory.
 
 use crate::{Error, Result};
 
@@ -9,6 +9,8 @@ pub struct MachoFacts {
     pub platform: Option<String>, // "macos", "ios", "tvos", "watchos", "bridgeos", or "platform-{n}"
     pub minos: Option<String>,    // "x.y.z" from LC_BUILD_VERSION
     pub sdk: Option<String>,
+    /// `LC_RPATH` paths. The directories are not searched.
+    pub rpaths: Vec<String>,
     pub has_code_signature: bool,
     /// Code-directory identifier, hash type, and team id. `None` when the load command is absent or the code directory does not fit. The CMS blob and the hash slots are not read.
     pub signature: Option<MachoSignature>,
@@ -30,6 +32,15 @@ pub struct MachoArch {
     pub cpu: String, // "arm64", "x86_64", "arm", "x86", or "cpu-{n}"
     pub offset: u64,
     pub size: u64,
+    /// UUID of this slice. `None` when the slice bytes are absent or unreadable.
+    pub uuid: Option<String>,
+    /// Dylibs of this slice. Empty when the slice bytes are absent or unreadable.
+    pub dylibs: Vec<String>,
+    /// `LC_RPATH` paths of this slice. The directories are not searched.
+    pub rpaths: Vec<String>,
+    pub platform: Option<String>,
+    pub minos: Option<String>,
+    pub sdk: Option<String>,
     /// Code directory of this slice. `None` when the slice bytes are absent or the directory does not fit.
     pub signature: Option<MachoSignature>,
 }
@@ -38,6 +49,31 @@ pub struct MachoArch {
 pub fn facts(bytes: &[u8]) -> Result<MachoFacts> {
     let mo =
         goblin::mach::MachO::parse(bytes, 0).map_err(|e| Error::Parse(format!("mach-o: {e}")))?;
+    let body = slice_body(&mo, bytes);
+    Ok(MachoFacts {
+        dylibs: body.dylibs,
+        uuid: body.uuid,
+        platform: body.platform,
+        minos: body.minos,
+        sdk: body.sdk,
+        rpaths: body.rpaths,
+        has_code_signature: body.has_code_signature,
+        signature: body.signature,
+    })
+}
+
+struct SliceBody {
+    dylibs: Vec<String>,
+    rpaths: Vec<String>,
+    uuid: Option<String>,
+    platform: Option<String>,
+    minos: Option<String>,
+    sdk: Option<String>,
+    has_code_signature: bool,
+    signature: Option<MachoSignature>,
+}
+
+fn slice_body(mo: &goblin::mach::MachO, bytes: &[u8]) -> SliceBody {
     let uuid = mo.load_commands.iter().find_map(|cmd| match &cmd.command {
         goblin::mach::load_command::CommandVariant::Uuid(uuid_cmd) => {
             Some(uuid_cmd.uuid.iter().map(|b| format!("{b:02x}")).collect())
@@ -68,15 +104,16 @@ pub fn facts(bytes: &[u8]) -> Result<MachoFacts> {
         }
         _ => None,
     });
-    Ok(MachoFacts {
+    SliceBody {
         dylibs: mo.libs.iter().map(|lib| (*lib).to_string()).collect(),
+        rpaths: mo.rpaths.iter().map(|path| (*path).to_string()).collect(),
         uuid,
         platform,
         minos,
         sdk,
         has_code_signature,
         signature,
-    })
+    }
 }
 
 const CSMAGIC_EMBEDDED_SIGNATURE: u32 = 0xfade_0cc0;
@@ -173,7 +210,7 @@ fn hash_name(hash_type: u8) -> String {
 
 /// Architecture headers from the original file, which may be a fat archive.
 ///
-/// Each slice that is present contributes its code directory. A missing or unreadable slice leaves that signature empty and does not fail the parse. The CMS blob and the hash slots are not read.
+/// Each slice that is present contributes its uuid, dylibs, rpaths, build version, and code directory. A missing or unreadable slice leaves those fields empty and does not fail the parse. The CMS blob and the hash slots are not read.
 pub fn architectures(bytes: &[u8]) -> Result<Vec<MachoArch>> {
     match goblin::mach::Mach::parse(bytes).map_err(|e| Error::Parse(format!("mach-o: {e}")))? {
         goblin::mach::Mach::Fat(multi) => {
@@ -189,36 +226,54 @@ pub fn architectures(bytes: &[u8]) -> Result<Vec<MachoArch>> {
                         size,
                         ..
                     } = arch;
-                    MachoArch {
-                        cpu: cpu_name(cputype),
-                        offset: u64::from(offset),
-                        size: u64::from(size),
-                        signature: slice_signature(arch.slice(bytes)),
-                    }
+                    arch_of(cpu_name(cputype), u64::from(offset), u64::from(size), arch.slice(bytes))
                 })
                 .collect())
         }
-        goblin::mach::Mach::Binary(mo) => Ok(vec![MachoArch {
-            cpu: cpu_name(mo.header.cputype()),
-            offset: 0,
-            size: bytes.len() as u64,
-            signature: slice_signature(bytes),
-        }]),
+        goblin::mach::Mach::Binary(mo) => {
+            Ok(vec![arch_of(cpu_name(mo.header.cputype()), 0, bytes.len() as u64, bytes)])
+        }
     }
 }
 
-/// Code directory of one slice. An empty or unreadable slice is `None`.
-fn slice_signature(slice: &[u8]) -> Option<MachoSignature> {
-    if slice.is_empty() {
-        return None;
+fn arch_of(cpu: String, offset: u64, size: u64, slice: &[u8]) -> MachoArch {
+    let body = slice_facts(slice);
+    MachoArch {
+        cpu,
+        offset,
+        size,
+        uuid: body.uuid,
+        dylibs: body.dylibs,
+        rpaths: body.rpaths,
+        platform: body.platform,
+        minos: body.minos,
+        sdk: body.sdk,
+        signature: body.signature,
     }
-    let mo = goblin::mach::MachO::parse(slice, 0).ok()?;
-    mo.load_commands.iter().find_map(|cmd| match &cmd.command {
-        goblin::mach::load_command::CommandVariant::CodeSignature(linkedit) => {
-            code_directory(slice, linkedit.dataoff, linkedit.datasize)
-        }
-        _ => None,
-    })
+}
+
+/// Identity of one slice. An empty or unreadable slice is empty and does not fail the caller.
+fn slice_facts(slice: &[u8]) -> SliceBody {
+    if slice.is_empty() {
+        return empty_slice();
+    }
+    match goblin::mach::MachO::parse(slice, 0) {
+        Ok(mo) => slice_body(&mo, slice),
+        Err(_) => empty_slice(),
+    }
+}
+
+fn empty_slice() -> SliceBody {
+    SliceBody {
+        dylibs: Vec::new(),
+        rpaths: Vec::new(),
+        uuid: None,
+        platform: None,
+        minos: None,
+        sdk: None,
+        has_code_signature: false,
+        signature: None,
+    }
 }
 
 fn platform_name(platform: u32) -> String {
@@ -281,6 +336,12 @@ mod tests {
                 cpu: "arm64".into(),
                 offset: 0x4000,
                 size: 0x100,
+                uuid: None,
+                dylibs: Vec::new(),
+                rpaths: Vec::new(),
+                platform: None,
+                minos: None,
+                sdk: None,
                 signature: None,
             }]
         );
@@ -307,6 +368,12 @@ mod tests {
                 cpu: "arm64".into(),
                 offset: 0,
                 size: bytes.len() as u64,
+                uuid: None,
+                dylibs: vec!["self".into()],
+                rpaths: Vec::new(),
+                platform: Some("ios".into()),
+                minos: Some("15.4.1".into()),
+                sdk: Some("16.0.0".into()),
                 signature: None,
             }]
         );
@@ -372,6 +439,39 @@ mod tests {
     }
 
     #[test]
+    fn fat_slices_keep_their_own_identity() {
+        let arm_uuid = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        let intel_uuid = [0xaa; 16];
+        let arm = identity_macho(
+            0x0100_000c,
+            arm_uuid,
+            "libarm.dylib",
+            "/opt/arm",
+            Some((1, 12 << 16, (13 << 16) | (1 << 8))),
+        );
+        let intel = identity_macho(0x0100_0007, intel_uuid, "libx86.dylib", "/opt/x86", None);
+        let thin = facts(&arm).unwrap();
+        assert_eq!(thin.uuid.as_deref(), Some("0102030405060708090a0b0c0d0e0f10"));
+        assert_eq!(thin.dylibs, vec!["self".to_string(), "libarm.dylib".to_string()]);
+        assert_eq!(thin.rpaths, vec!["/opt/arm".to_string()]);
+        assert_eq!(thin.platform.as_deref(), Some("macos"));
+        assert_eq!(thin.minos.as_deref(), Some("12.0.0"));
+        assert_eq!(thin.sdk.as_deref(), Some("13.1.0"));
+
+        let bytes = fat_two(&arm, &intel);
+        let arches = architectures(&bytes).unwrap();
+        assert_eq!(arches[0].uuid.as_deref(), Some("0102030405060708090a0b0c0d0e0f10"));
+        assert_eq!(arches[0].dylibs, vec!["self".to_string(), "libarm.dylib".to_string()]);
+        assert_eq!(arches[0].rpaths, vec!["/opt/arm".to_string()]);
+        assert_eq!(arches[0].platform.as_deref(), Some("macos"));
+        assert_eq!(arches[1].uuid.as_deref(), Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+        assert_eq!(arches[1].dylibs, vec!["self".to_string(), "libx86.dylib".to_string()]);
+        assert_eq!(arches[1].rpaths, vec!["/opt/x86".to_string()]);
+        assert_eq!(arches[1].platform, None);
+        assert!(facts(&bytes).is_err());
+    }
+
+    #[test]
     fn unreadable_fat_slice_leaves_the_code_directory_empty() {
         let bytes = fat_two(&signed_macho(), b"not-a-slice");
         let arches = architectures(&bytes).unwrap();
@@ -381,6 +481,81 @@ mod tests {
         );
         assert_eq!(arches[1].cpu, "x86_64");
         assert_eq!(arches[1].signature, None);
+        assert_eq!(arches[1].uuid, None);
+        assert!(arches[1].dylibs.is_empty());
+        assert!(arches[1].rpaths.is_empty());
+    }
+
+    fn identity_macho(
+        cputype: u32,
+        uuid: [u8; 16],
+        dylib: &str,
+        rpath: &str,
+        build: Option<(u32, u32, u32)>,
+    ) -> Vec<u8> {
+        let mut commands = vec![uuid_cmd(uuid), load_dylib(dylib), rpath_cmd(rpath)];
+        if let Some((platform, minos, sdk)) = build {
+            commands.push(build_version(platform, minos, sdk));
+        }
+        macho_object(cputype, &commands)
+    }
+
+    fn macho_object(cputype: u32, commands: &[Vec<u8>]) -> Vec<u8> {
+        let sizeofcmds: u32 = commands.iter().map(|cmd| cmd.len() as u32).sum();
+        let mut buf = Vec::new();
+        let mut push = |v: u32| buf.extend_from_slice(&v.to_le_bytes());
+        push(0xfeed_facf);
+        push(cputype);
+        push(0);
+        push(1);
+        push(commands.len() as u32);
+        push(sizeofcmds);
+        push(0);
+        push(0);
+        for cmd in commands {
+            buf.extend_from_slice(cmd);
+        }
+        buf
+    }
+
+    fn uuid_cmd(uuid: [u8; 16]) -> Vec<u8> {
+        let mut cmd = vec![0u8; 24];
+        cmd[0..4].copy_from_slice(&0x1bu32.to_le_bytes());
+        cmd[4..8].copy_from_slice(&24u32.to_le_bytes());
+        cmd[8..24].copy_from_slice(&uuid);
+        cmd
+    }
+
+    fn load_dylib(name: &str) -> Vec<u8> {
+        cstring_cmd(0xc, 24, 24, name)
+    }
+
+    fn rpath_cmd(path: &str) -> Vec<u8> {
+        cstring_cmd(0x8000_001c, 12, 12, path)
+    }
+
+    fn cstring_cmd(cmd: u32, header: usize, string_off: u32, value: &str) -> Vec<u8> {
+        let bytes = value.as_bytes();
+        let mut size = header + bytes.len() + 1;
+        size = size.div_ceil(8) * 8;
+        let mut out = vec![0u8; size];
+        out[0..4].copy_from_slice(&cmd.to_le_bytes());
+        out[4..8].copy_from_slice(&(size as u32).to_le_bytes());
+        out[8..12].copy_from_slice(&string_off.to_le_bytes());
+        let at = string_off as usize;
+        out[at..at + bytes.len()].copy_from_slice(bytes);
+        out
+    }
+
+    fn build_version(platform: u32, minos: u32, sdk: u32) -> Vec<u8> {
+        let mut cmd = vec![0u8; 24];
+        let mut push = |at: usize, v: u32| cmd[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        push(0, 0x32);
+        push(4, 24);
+        push(8, platform);
+        push(12, minos);
+        push(16, sdk);
+        cmd
     }
 
     fn got_signature() -> MachoSignature {
