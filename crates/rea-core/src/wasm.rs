@@ -1,4 +1,4 @@
-//! WebAssembly binary inspector. Parses imports, exports, the function count, memory limits, table limits, and the start index. Does not decode function bodies, element segments, or execute.
+//! WebAssembly binary inspector. Parses imports, exports, the type count, function count, memory limits, table limits, data count, custom section names, and the start index. Does not decode function bodies, type signatures, element segments, data segments, custom payloads, or execute.
 
 use crate::{Error, Result};
 
@@ -37,6 +37,8 @@ pub struct WasmModule {
     pub sections: Vec<u8>, // section ids in order
     pub imports: Vec<WasmImport>,
     pub exports: Vec<WasmExport>,
+    /// Count of entries in the type section. Each signature is consumed and not stored.
+    pub types: u32,
     /// Count of type indexes in the function section. The code section is not decoded.
     pub functions: u32,
     /// Memories declared in the memory section. Imported memories stay on `imports`.
@@ -45,6 +47,10 @@ pub struct WasmModule {
     pub tables: Vec<WasmTable>,
     /// Start function index, when the start section is present.
     pub start: Option<u32>,
+    /// Value from the data-count section. Data segments are not read.
+    pub data_count: Option<u32>,
+    /// Names of custom sections, in order. Bytes after each name are not read.
+    pub customs: Vec<String>,
 }
 
 /// Inspect a WebAssembly binary. Rejects a bad magic, a truncated section,
@@ -61,14 +67,19 @@ pub fn inspect(bytes: &[u8]) -> Result<WasmModule> {
     let mut sections = Vec::new();
     let mut imports = Vec::new();
     let mut exports = Vec::new();
+    let mut types = 0;
     let mut functions = 0;
     let mut memories = Vec::new();
     let mut tables = Vec::new();
     let mut start = None;
+    let mut data_count = None;
+    let mut customs = Vec::new();
+    let mut saw_types = false;
     let mut saw_functions = false;
     let mut saw_memories = false;
     let mut saw_tables = false;
     let mut saw_start = false;
+    let mut saw_data_count = false;
 
     while !r.eof() {
         let id = r.read_u8()?;
@@ -76,6 +87,14 @@ pub fn inspect(bytes: &[u8]) -> Result<WasmModule> {
         let payload = r.read_bytes(size)?;
         sections.push(id);
         match id {
+            0 => customs.push(decode_custom_name(payload)?),
+            1 => {
+                if saw_types {
+                    return Err(Error::Parse("duplicate wasm type section".into()));
+                }
+                saw_types = true;
+                types = decode_type_count(payload)?;
+            }
             2 => imports.extend(decode_imports(payload)?),
             3 => {
                 if saw_functions {
@@ -106,6 +125,13 @@ pub fn inspect(bytes: &[u8]) -> Result<WasmModule> {
                 saw_start = true;
                 start = Some(decode_start(payload)?);
             }
+            12 => {
+                if saw_data_count {
+                    return Err(Error::Parse("duplicate wasm data count section".into()));
+                }
+                saw_data_count = true;
+                data_count = Some(decode_data_count(payload)?);
+            }
             _ => {}
         }
     }
@@ -115,11 +141,55 @@ pub fn inspect(bytes: &[u8]) -> Result<WasmModule> {
         sections,
         imports,
         exports,
+        types,
         functions,
         memories,
         tables,
         start,
+        data_count,
+        customs,
     })
+}
+
+fn decode_type_count(payload: &[u8]) -> Result<u32> {
+    let mut r = Reader::new(payload);
+    let count = r.read_u32_leb()?;
+    for _ in 0..count {
+        let _form = r.read_u8()?;
+        let params = r.read_u32_leb()?;
+        for _ in 0..params {
+            let _valtype = r.read_u8()?;
+        }
+        let results = r.read_u32_leb()?;
+        for _ in 0..results {
+            let _valtype = r.read_u8()?;
+        }
+    }
+    if !r.eof() {
+        return Err(Error::Parse("trailing bytes in wasm type section".into()));
+    }
+    Ok(count)
+}
+
+fn decode_data_count(payload: &[u8]) -> Result<u32> {
+    let mut r = Reader::new(payload);
+    let count = r.read_u32_leb()?;
+    if !r.eof() {
+        return Err(Error::Parse(
+            "trailing bytes in wasm data count section".into(),
+        ));
+    }
+    Ok(count)
+}
+
+fn decode_custom_name(payload: &[u8]) -> Result<String> {
+    let mut r = Reader::new(payload);
+    let len = r.read_u32_leb()? as usize;
+    if len > 256 {
+        return Err(Error::Parse("wasm custom name is too long".into()));
+    }
+    let bytes = r.read_bytes(len)?;
+    String::from_utf8(bytes.to_vec()).map_err(|_| Error::Parse("invalid utf-8 name".into()))
 }
 
 fn decode_tables(payload: &[u8]) -> Result<Vec<WasmTable>> {
@@ -352,10 +422,13 @@ mod tests {
         assert!(m.sections.is_empty());
         assert!(m.imports.is_empty());
         assert!(m.exports.is_empty());
+        assert_eq!(m.types, 0);
         assert_eq!(m.functions, 0);
         assert!(m.memories.is_empty());
         assert!(m.tables.is_empty());
         assert_eq!(m.start, None);
+        assert_eq!(m.data_count, None);
+        assert!(m.customs.is_empty());
     }
 
     #[test]
@@ -366,7 +439,10 @@ mod tests {
         .unwrap();
         assert_eq!(m.version, 1);
         assert_eq!(m.sections, vec![1, 3, 7, 10]);
+        assert_eq!(m.types, 1);
         assert_eq!(m.functions, 1);
+        assert_eq!(m.data_count, None);
+        assert!(m.customs.is_empty());
         assert!(m.imports.is_empty());
         assert_eq!(
             m.exports,
@@ -484,6 +560,48 @@ mod tests {
         let elem = inspect(&hex("0061736d010000000903010000")).unwrap();
         assert_eq!(elem.sections, vec![9]);
         assert!(elem.tables.is_empty());
+    }
+
+    #[test]
+    fn type_count_consumes_the_signature() {
+        // One function type: one i32 parameter and one i32 result. The signature is not stored.
+        let m = inspect(&hex("0061736d0100000001060160017f017f")).unwrap();
+        assert_eq!(m.sections, vec![1]);
+        assert_eq!(m.types, 1);
+        assert!(!format!("{m:?}").contains("7f"));
+    }
+
+    #[test]
+    fn duplicate_type_is_an_error() {
+        let err = inspect(&hex("0061736d01000000010401600000010401600000")).unwrap_err();
+        assert!(matches!(err, Error::Parse(ref msg) if msg == "duplicate wasm type section"));
+    }
+
+    #[test]
+    fn data_count_ignores_the_data_section() {
+        let m = inspect(&hex("0061736d010000000b01000c0104")).unwrap();
+        assert_eq!(m.sections, vec![11, 12]);
+        assert_eq!(m.data_count, Some(4));
+    }
+
+    #[test]
+    fn duplicate_data_count_is_an_error() {
+        let err = inspect(&hex("0061736d010000000c01010c0102")).unwrap_err();
+        assert!(matches!(err, Error::Parse(ref msg) if msg == "duplicate wasm data count section"));
+    }
+
+    #[test]
+    fn custom_names_leave_the_payload_unread() {
+        let m = inspect(&hex("0061736d010000000006046e616d659900020178")).unwrap();
+        assert_eq!(m.sections, vec![0, 0]);
+        assert_eq!(m.customs, vec!["name".to_string(), "x".to_string()]);
+        assert!(!format!("{m:?}").contains("99"));
+    }
+
+    #[test]
+    fn custom_name_too_long_is_an_error() {
+        let err = inspect(&hex("0061736d0100000000028102")).unwrap_err();
+        assert!(matches!(err, Error::Parse(ref msg) if msg == "wasm custom name is too long"));
     }
 
     #[test]
