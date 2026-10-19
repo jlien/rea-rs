@@ -1,5 +1,7 @@
-//! SQLite database header and the `sqlite_schema` table.
-//! Table rows other than the schema are not read. A hot WAL file is not applied.
+//! SQLite database header, `sqlite_schema`, one named table's rows, and WAL replay.
+//!
+//! Row reads are capped by the caller. WAL replay keeps frames through the last
+//! valid commit and stops on a salt or checksum mismatch. It does not run SQL.
 
 use crate::{Error, Result};
 
@@ -64,7 +66,7 @@ pub struct SqliteObject {
 
 /// Read schema objects from the table b-tree rooted at page 1.
 ///
-/// Follows interior pages and cell overflow chains. Does not read other tables.
+/// Follows interior pages and cell overflow chains.
 pub fn schema(bytes: &[u8]) -> Result<Vec<SqliteObject>> {
     let hdr = header(bytes)?;
     let reserved = u32::from(bytes[20]);
@@ -105,6 +107,254 @@ pub fn schema(bytes: &[u8]) -> Result<Vec<SqliteObject>> {
         &mut out,
     )?;
     Ok(out)
+}
+
+/// Column strings from one table, at most `limit` rows. `limit` of 0 returns none.
+/// A missing table is an error. A root page of 0 or less returns none.
+pub fn table_rows(bytes: &[u8], name: &str, limit: usize) -> Result<Vec<Vec<String>>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let limit = limit.min(1024);
+    let table = schema(bytes)?
+        .into_iter()
+        .find(|object| object.kind == "table" && object.name == name)
+        .ok_or_else(|| Error::Parse(format!("sqlite: table {name} is missing")))?;
+    if table.root_page <= 0 {
+        return Ok(Vec::new());
+    }
+    let root = u32::try_from(table.root_page)
+        .map_err(|_| Error::Parse("sqlite: table root page does not fit".into()))?;
+    let hdr = header(bytes)?;
+    let reserved = u32::from(bytes[20]);
+    let usable = hdr
+        .page_size
+        .checked_sub(reserved)
+        .ok_or_else(|| Error::Parse("sqlite: reserved space exceeds the page size".into()))?;
+    let enc = match u32::from_be_bytes([bytes[56], bytes[57], bytes[58], bytes[59]]) {
+        1 => TextEnc::Utf8,
+        2 => TextEnc::Utf16Le,
+        3 => TextEnc::Utf16Be,
+        n => return Err(Error::Parse(format!("sqlite: unknown text encoding {n}"))),
+    };
+    let file_pages = (bytes.len() as u32) / hdr.page_size;
+    let mut seen = vec![false; file_pages as usize + 1];
+    let mut out = Vec::new();
+    walk_rows(
+        bytes,
+        root,
+        hdr.page_size,
+        usable,
+        enc,
+        0,
+        limit,
+        &mut seen,
+        &mut out,
+    )?;
+    Ok(out)
+}
+
+/// Overlay committed WAL frames onto a copy of `db`.
+///
+/// Magic `0x377f0682` checksums big-endian words. Magic `0x377f0683` checksums
+/// little-endian words. A bad magic, version, page size, or header checksum is
+/// an error. A later frame with the wrong salt or checksum ends the valid prefix.
+pub fn apply_wal(db: &[u8], wal: &[u8]) -> Result<Vec<u8>> {
+    if wal.len() < 32 {
+        return Err(Error::Parse("sqlite: wal header is truncated".into()));
+    }
+    let magic = be_u32_at(wal, 0);
+    let big = match magic {
+        0x377f_0682 => true,
+        0x377f_0683 => false,
+        _ => return Err(Error::Parse("sqlite: bad wal magic".into())),
+    };
+    if be_u32_at(wal, 4) != 3_007_000 {
+        return Err(Error::Parse("sqlite: bad wal version".into()));
+    }
+    let page_size = be_u32_at(wal, 8);
+    if page_size < 8 || page_size % 8 != 0 {
+        return Err(Error::Parse("sqlite: wal page size is not a multiple of 8".into()));
+    }
+    let salt1 = be_u32_at(wal, 16);
+    let salt2 = be_u32_at(wal, 20);
+    let (sum1, sum2) = wal_checksum(big, &wal[..24], 0, 0);
+    if sum1 != be_u32_at(wal, 24) || sum2 != be_u32_at(wal, 28) {
+        return Err(Error::Parse("sqlite: wal header checksum failed".into()));
+    }
+    let frame_len = 24 + page_size as usize;
+    let mut committed: Vec<(u32, Vec<u8>)> = Vec::new();
+    let mut pending: Vec<(u32, Vec<u8>)> = Vec::new();
+    let mut at = 32usize;
+    while at + frame_len <= wal.len() {
+        let hdr = &wal[at..at + 24];
+        let page_no = be_u32_at(hdr, 0);
+        let db_size = be_u32_at(hdr, 4);
+        if be_u32_at(hdr, 8) != salt1 || be_u32_at(hdr, 12) != salt2 {
+            break;
+        }
+        let page = &wal[at + 24..at + frame_len];
+        let (s0, s1) = wal_checksum(big, &hdr[..8], salt1, salt2);
+        let (s0, s1) = wal_checksum(big, page, s0, s1);
+        if s0 != be_u32_at(hdr, 16) || s1 != be_u32_at(hdr, 20) {
+            break;
+        }
+        if (1..=1_048_576).contains(&page_no) {
+            pending.push((page_no, page.to_vec()));
+        }
+        if db_size != 0 {
+            committed.append(&mut pending);
+        }
+        at += frame_len;
+    }
+    let mut out = db.to_vec();
+    for (page_no, page) in committed {
+        let start = (page_no as usize - 1).saturating_mul(page_size as usize);
+        let end = start + page_size as usize;
+        if end > out.len().saturating_add(wal.len()) {
+            continue;
+        }
+        if out.len() < end {
+            out.resize(end, 0);
+        }
+        out[start..end].copy_from_slice(&page);
+    }
+    Ok(out)
+}
+
+fn be_u32_at(bytes: &[u8], at: usize) -> u32 {
+    u32::from_be_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+}
+
+fn wal_checksum(big: bool, data: &[u8], mut s0: u32, mut s1: u32) -> (u32, u32) {
+    let mut i = 0;
+    while i + 8 <= data.len() {
+        let (x0, x1) = if big {
+            (
+                u32::from_be_bytes(data[i..i + 4].try_into().unwrap()),
+                u32::from_be_bytes(data[i + 4..i + 8].try_into().unwrap()),
+            )
+        } else {
+            (
+                u32::from_le_bytes(data[i..i + 4].try_into().unwrap()),
+                u32::from_le_bytes(data[i + 4..i + 8].try_into().unwrap()),
+            )
+        };
+        s0 = s0.wrapping_add(x0).wrapping_add(s1);
+        s1 = s1.wrapping_add(x1).wrapping_add(s0);
+        i += 8;
+    }
+    (s0, s1)
+}
+
+fn walk_rows(
+    bytes: &[u8],
+    page_no: u32,
+    page_size: u32,
+    usable: u32,
+    enc: TextEnc,
+    depth: u32,
+    limit: usize,
+    seen: &mut [bool],
+    out: &mut Vec<Vec<String>>,
+) -> Result<()> {
+    if out.len() >= limit {
+        return Ok(());
+    }
+    if depth > 64 {
+        return Err(Error::Parse("sqlite: table tree is too deep".into()));
+    }
+    if page_no == 0 || page_no as usize >= seen.len() {
+        return Err(Error::Parse(format!("sqlite: bad page {page_no}")));
+    }
+    if seen[page_no as usize] {
+        return Err(Error::Parse(format!("sqlite: page {page_no} repeats")));
+    }
+    seen[page_no as usize] = true;
+    let page = page_bytes(bytes, page_size, page_no)?;
+    let base = if page_no == 1 { 100 } else { 0 };
+    if page.len() < base + 8 {
+        return Err(Error::Parse(format!("sqlite: page {page_no} is truncated")));
+    }
+    let ncells = usize::from(u16::from_be_bytes([page[base + 3], page[base + 4]]));
+    match page[base] {
+        0x0d => {
+            let ptrs = base + 8;
+            for i in 0..ncells {
+                if out.len() >= limit {
+                    break;
+                }
+                let off = cell_offset(page, ptrs, i)?;
+                out.push(leaf_row(bytes, page, off, page_size, usable, enc)?);
+            }
+        }
+        0x05 => {
+            if page.len() < base + 12 {
+                return Err(Error::Parse(format!(
+                    "sqlite: interior page {page_no} is truncated"
+                )));
+            }
+            let ptrs = base + 12;
+            for i in 0..ncells {
+                if out.len() >= limit {
+                    break;
+                }
+                let off = cell_offset(page, ptrs, i)?;
+                let child = page.get(off..off + 4).ok_or_else(|| {
+                    Error::Parse("sqlite: interior cell is truncated".into())
+                })?;
+                let child = u32::from_be_bytes(child.try_into().unwrap());
+                walk_rows(
+                    bytes,
+                    child,
+                    page_size,
+                    usable,
+                    enc,
+                    depth + 1,
+                    limit,
+                    seen,
+                    out,
+                )?;
+            }
+            if out.len() < limit {
+                let right = u32::from_be_bytes(page[base + 8..base + 12].try_into().unwrap());
+                if right != 0 {
+                    walk_rows(
+                        bytes,
+                        right,
+                        page_size,
+                        usable,
+                        enc,
+                        depth + 1,
+                        limit,
+                        seen,
+                        out,
+                    )?;
+                }
+            }
+        }
+        other => {
+            return Err(Error::Parse(format!(
+                "sqlite: page {page_no} is not a table b-tree ({other:#x})"
+            )))
+        }
+    }
+    Ok(())
+}
+
+fn leaf_row(
+    file: &[u8],
+    page: &[u8],
+    cell: usize,
+    page_size: u32,
+    usable: u32,
+    enc: TextEnc,
+) -> Result<Vec<String>> {
+    let (payload_size, n1) = varint(page, cell)?;
+    let (_rowid, n2) = varint(page, cell + n1)?;
+    let payload = assemble_payload(file, page, cell + n1 + n2, payload_size, page_size, usable)?;
+    let cols = record_columns(&payload, enc)?;
+    Ok((0..cols.len()).map(|index| column_text(&cols, index)).collect())
 }
 
 #[derive(Clone, Copy)]
@@ -648,5 +898,101 @@ mod tests {
         let mut db = blank_db(512, 1);
         db[100] = 0x0a;
         assert!(schema(&db).is_err());
+    }
+
+    fn row_record(text: &str, n: u8) -> Vec<u8> {
+        let serials = [text_serial(text.len()), 1u64];
+        let mut header = Vec::new();
+        for serial in serials {
+            header.extend(put_varint(serial));
+        }
+        let mut rec = put_varint((header.len() + 1) as u64);
+        rec.extend(header);
+        rec.extend_from_slice(text.as_bytes());
+        rec.push(n);
+        rec
+    }
+
+    fn notes_db(body: &str) -> Vec<u8> {
+        let mut db = blank_db(512, 2);
+        let table = schema_record(
+            "table",
+            "notes",
+            "notes",
+            2,
+            Some("CREATE TABLE notes(body TEXT, n INT)"),
+        );
+        write_leaf(&mut db[..512], 100, &[leaf_cell(1, &table)]);
+        write_leaf(&mut db[512..], 0, &[leaf_cell(1, &row_record(body, 1))]);
+        db
+    }
+
+    #[test]
+    fn reads_rows_from_the_named_table() {
+        let db = notes_db("hello");
+        assert_eq!(
+            table_rows(&db, "notes", 32).unwrap(),
+            vec![vec!["hello".to_string(), "1".to_string()]]
+        );
+        assert!(table_rows(&db, "notes", 0).unwrap().is_empty());
+        assert!(table_rows(&db, "missing", 4).is_err());
+        let mut view = blank_db(512, 1);
+        let empty = schema_record("table", "empty", "empty", 0, Some("CREATE TABLE empty(id INT)"));
+        write_leaf(&mut view, 100, &[leaf_cell(1, &empty)]);
+        assert!(table_rows(&view, "empty", 8).unwrap().is_empty());
+    }
+
+    fn wal_file(big: bool, page_size: u32, frames: &[(u32, u32, &[u8])]) -> Vec<u8> {
+        let magic = if big { 0x377f_0682u32 } else { 0x377f_0683 };
+        let salt1 = 0x1111_1111u32;
+        let salt2 = 0x2222_2222u32;
+        let mut header = vec![0u8; 32];
+        header[0..4].copy_from_slice(&magic.to_be_bytes());
+        header[4..8].copy_from_slice(&3_007_000u32.to_be_bytes());
+        header[8..12].copy_from_slice(&page_size.to_be_bytes());
+        header[16..20].copy_from_slice(&salt1.to_be_bytes());
+        header[20..24].copy_from_slice(&salt2.to_be_bytes());
+        let (c0, c1) = wal_checksum(big, &header[..24], 0, 0);
+        header[24..28].copy_from_slice(&c0.to_be_bytes());
+        header[28..32].copy_from_slice(&c1.to_be_bytes());
+        let mut out = header;
+        for (page_no, db_size, page) in frames {
+            let mut frame = vec![0u8; 24 + page.len()];
+            frame[0..4].copy_from_slice(&page_no.to_be_bytes());
+            frame[4..8].copy_from_slice(&db_size.to_be_bytes());
+            frame[8..12].copy_from_slice(&salt1.to_be_bytes());
+            frame[12..16].copy_from_slice(&salt2.to_be_bytes());
+            frame[24..].copy_from_slice(page);
+            let (s0, s1) = wal_checksum(big, &frame[..8], salt1, salt2);
+            let (s0, s1) = wal_checksum(big, &frame[24..], s0, s1);
+            frame[16..20].copy_from_slice(&s0.to_be_bytes());
+            frame[20..24].copy_from_slice(&s1.to_be_bytes());
+            out.extend_from_slice(&frame);
+        }
+        out
+    }
+
+    #[test]
+    fn wal_replay_keeps_the_last_committed_page() {
+        let db = notes_db("old");
+        let mut page = vec![0u8; 512];
+        write_leaf(&mut page, 0, &[leaf_cell(1, &row_record("new", 2))]);
+        let applied = apply_wal(&db, &wal_file(false, 512, &[(2, 2, &page)])).unwrap();
+        assert_eq!(table_rows(&applied, "notes", 4).unwrap()[0][0], "new");
+
+        let uncommitted = apply_wal(&db, &wal_file(false, 512, &[(2, 0, &page)])).unwrap();
+        assert_eq!(table_rows(&uncommitted, "notes", 4).unwrap()[0][0], "old");
+
+        let mut bad = wal_file(false, 512, &[(2, 2, &page)]);
+        bad[32 + 24] ^= 0xff;
+        let stopped = apply_wal(&db, &bad).unwrap();
+        assert_eq!(table_rows(&stopped, "notes", 4).unwrap()[0][0], "old");
+
+        let header_only = apply_wal(&db, &wal_file(true, 512, &[])).unwrap();
+        assert_eq!(header_only, db);
+        assert!(apply_wal(&db, &vec![0u8; 32]).is_err());
+        let mut odd = wal_file(false, 512, &[]);
+        odd[8..12].copy_from_slice(&4u32.to_be_bytes());
+        assert!(apply_wal(&db, &odd).is_err());
     }
 }

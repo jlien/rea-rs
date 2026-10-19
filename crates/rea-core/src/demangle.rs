@@ -1,7 +1,199 @@
-//! A small Itanium C++ demangler for names this tree already stores.
+//! Demanglers for names this tree already stores.
 //!
-//! Swift, Rust, and MSVC schemes are left as the raw name. A name that does
-//! not fit this grammar returns `None` and does not fail symbol listing.
+//! Itanium C++, Rust v0, and a subset of MSVC. Swift stays raw. A name that
+//! does not fit returns `None` and does not fail symbol listing.
+
+/// Itanium, then Rust v0 (`_R`), then MSVC (`?`). The first match wins.
+pub fn any(name: &str) -> Option<String> {
+    if name.starts_with("_Z") {
+        itanium(name)
+    } else if name.starts_with("_R") {
+        rust_v0(name)
+    } else if name.starts_with('?') {
+        msvc(name)
+    } else {
+        None
+    }
+}
+
+/// Rust v0. `_RNvC3_foo3_bar` is `foo::bar`. A disambiguator is skipped.
+///
+/// Identifiers are a decimal length, an underscore, and that many bytes.
+/// Backrefs and other path tags return `None`.
+pub fn rust_v0(name: &str) -> Option<String> {
+    let rest = name.strip_prefix("_R")?;
+    let rest = skip_disambiguator(rest)?;
+    let (path, rest) = parse_rust_path(rest)?;
+    if rest.is_empty() {
+        return Some(path);
+    }
+    let (_, rest) = parse_rust_path(rest)?;
+    if rest.is_empty() {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+/// MSVC subset. `?foo@@YAHH@Z` is `int foo(int)`. `?bar@Foo@@YAXH@Z` is `void Foo::bar(int)`.
+pub fn msvc(name: &str) -> Option<String> {
+    let rest = name.strip_prefix('?')?;
+    let (qual, rest) = msvc_qual(rest)?;
+    let rest = rest.strip_prefix('Y')?;
+    let mut chars = rest.chars();
+    let conv = chars.next()?;
+    if !conv.is_ascii_uppercase() {
+        return None;
+    }
+    let mut rest = chars.as_str();
+    let (ret, next) = msvc_type(rest)?;
+    rest = next;
+    let mut params = Vec::new();
+    while !rest.starts_with('@') {
+        let (ty, next) = msvc_type(rest)?;
+        params.push(ty);
+        rest = next;
+    }
+    if rest != "@Z" {
+        return None;
+    }
+    Some(format!("{ret} {qual}({})", params.join(", ")))
+}
+
+fn skip_disambiguator(input: &str) -> Option<&str> {
+    let Some(after) = input.strip_prefix('s') else {
+        return Some(input);
+    };
+    let end = after.find('_')?;
+    if !after[..end].chars().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    Some(&after[end + 1..])
+}
+
+fn parse_rust_path(input: &str) -> Option<(String, &str)> {
+    let mut chars = input.chars();
+    let tag = chars.next()?;
+    let rest = chars.as_str();
+    match tag {
+        'C' => parse_rust_ident(rest),
+        'N' => {
+            let mut chars = rest.chars();
+            chars.next()?;
+            let rest = chars.as_str();
+            let (parent, rest) = parse_rust_path(rest)?;
+            let (ident, rest) = parse_rust_ident(rest)?;
+            Some((format!("{parent}::{ident}"), rest))
+        }
+        'I' => {
+            let (parent, mut rest) = parse_rust_path(rest)?;
+            let mut args = Vec::new();
+            while !rest.starts_with('E') {
+                let (ty, next) = rust_type(rest)?;
+                args.push(ty);
+                rest = next;
+            }
+            let rest = rest.strip_prefix('E')?;
+            Some((format!("{parent}<{}>", args.join(", ")), rest))
+        }
+        _ => None,
+    }
+}
+
+fn parse_rust_ident(input: &str) -> Option<(String, &str)> {
+    let rest = skip_disambiguator(input)?;
+    let rest = if let Some(puny) = rest.strip_prefix('u') {
+        if puny.starts_with(|c: char| c.is_ascii_digit()) {
+            puny
+        } else {
+            rest
+        }
+    } else {
+        rest
+    };
+    let digits = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+    if digits == 0 {
+        return None;
+    }
+    let len: usize = rest[..digits].parse().ok()?;
+    let rest = rest.get(digits..)?.strip_prefix('_')?;
+    let name = rest.get(..len)?;
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    Some((name.to_string(), &rest[len..]))
+}
+
+fn rust_type(input: &str) -> Option<(String, &str)> {
+    let mut chars = input.chars();
+    let tag = chars.next()?;
+    let name = match tag {
+        'a' => "i8",
+        'b' => "bool",
+        'c' => "char",
+        'd' => "f64",
+        'e' => "str",
+        'f' => "f32",
+        'h' => "u8",
+        'i' => "isize",
+        'j' => "usize",
+        'l' => "i32",
+        'm' => "u32",
+        'n' => "i128",
+        'o' => "u128",
+        's' => "i16",
+        't' => "u16",
+        'u' => "()",
+        'x' => "i64",
+        'y' => "u64",
+        'z' => "!",
+        'p' => "_",
+        _ => return None,
+    };
+    Some((name.to_string(), chars.as_str()))
+}
+
+fn msvc_qual(input: &str) -> Option<(String, &str)> {
+    let mut parts = Vec::new();
+    let mut rest = input;
+    loop {
+        let end = rest.find('@')?;
+        if end == 0 {
+            return None;
+        }
+        let part = &rest[..end];
+        if !part.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return None;
+        }
+        parts.push(part.to_string());
+        rest = &rest[end + 1..];
+        if let Some(next) = rest.strip_prefix('@') {
+            parts.reverse();
+            return Some((parts.join("::"), next));
+        }
+    }
+}
+
+fn msvc_type(input: &str) -> Option<(&'static str, &str)> {
+    let mut chars = input.chars();
+    let tag = chars.next()?;
+    let name = match tag {
+        'C' => "signed char",
+        'D' => "char",
+        'E' => "unsigned char",
+        'F' => "short",
+        'G' => "unsigned short",
+        'H' => "int",
+        'I' => "unsigned int",
+        'J' => "long",
+        'K' => "unsigned long",
+        'M' => "float",
+        'N' => "double",
+        'X' => "void",
+        _ => return None,
+    };
+    Some((name, chars.as_str()))
+}
 
 /// Demangle `_Z` Itanium names such as `_Z3fooi` and `_ZN3Foo3barEi`.
 ///
@@ -94,7 +286,7 @@ fn parse_type(input: &str) -> Option<(&'static str, &str)> {
 
 #[cfg(test)]
 mod tests {
-    use super::itanium;
+    use super::{any, itanium, msvc, rust_v0};
 
     #[test]
     fn demangles_a_function_and_a_nested_name() {
@@ -109,5 +301,24 @@ mod tests {
         assert_eq!(itanium("_Z"), None);
         assert_eq!(itanium("_Z3"), None);
         assert_eq!(itanium("_Z3foo"), None);
+    }
+
+    #[test]
+    fn rust_v0_and_msvc_keep_the_raw_name_available_to_the_caller() {
+        assert_eq!(rust_v0("_RNvC3_foo3_bar").as_deref(), Some("foo::bar"));
+        assert_eq!(
+            rust_v0("_RINvC3_foo3_barlE").as_deref(),
+            Some("foo::bar<i32>")
+        );
+        assert_eq!(rust_v0("_RNvC3foo3bar"), None);
+        assert_eq!(msvc("?foo@@YAHH@Z").as_deref(), Some("int foo(int)"));
+        assert_eq!(
+            msvc("?bar@Foo@@YAXH@Z").as_deref(),
+            Some("void Foo::bar(int)")
+        );
+        assert_eq!(msvc("?foo@@YA"), None);
+        assert_eq!(any("printf"), None);
+        assert_eq!(any("_RNvC3_foo3_bar").as_deref(), Some("foo::bar"));
+        assert_eq!(any("?foo@@YAHH@Z").as_deref(), Some("int foo(int)"));
     }
 }

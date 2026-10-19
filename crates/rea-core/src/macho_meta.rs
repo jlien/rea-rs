@@ -16,6 +16,9 @@ pub struct MachoFacts {
     pub signature: Option<MachoSignature>,
     /// CMS signature blob, slot `0x10000`. `None` when that slot is absent or does not fit. A missing blob does not fail the parse.
     pub cms: Option<MachoBlob>,
+    /// `Some(true)` when a sha1 or sha256 digest of the code directory is a contiguous window in the stored CMS bytes.
+    /// `Some(false)` when both are present and the digest is absent. `None` otherwise. This is not an Apple trust decision.
+    pub cms_verified: Option<bool>,
     /// XML `__info_plist` section, when its identifying keys are present.
     pub info_plist: Option<crate::plist::PlistInfo>,
     /// Bytes past the last segment's file range.
@@ -70,6 +73,8 @@ pub struct MachoArch {
     pub signature: Option<MachoSignature>,
     /// CMS blob of this slice. `None` when the slice is absent or the slot does not fit.
     pub cms: Option<MachoBlob>,
+    /// Same check as [`MachoFacts::cms_verified`] for this slice.
+    pub cms_verified: Option<bool>,
     /// XML `__info_plist` of this slice.
     pub info_plist: Option<crate::plist::PlistInfo>,
     /// Bytes past this slice's last segment.
@@ -91,6 +96,7 @@ pub fn facts(bytes: &[u8]) -> Result<MachoFacts> {
         has_code_signature: body.has_code_signature,
         signature: body.signature,
         cms: body.cms,
+        cms_verified: body.cms_verified,
         info_plist: body.info_plist,
         overlay: body.overlay,
     })
@@ -106,6 +112,7 @@ struct SliceBody {
     has_code_signature: bool,
     signature: Option<MachoSignature>,
     cms: Option<MachoBlob>,
+    cms_verified: Option<bool>,
     info_plist: Option<crate::plist::PlistInfo>,
     overlay: Option<crate::Overlay>,
 }
@@ -135,12 +142,12 @@ fn slice_body(mo: &goblin::mach::MachO, bytes: &[u8]) -> SliceBody {
             goblin::mach::load_command::CommandVariant::CodeSignature(_)
         )
     });
-    let (signature, cms) = mo.load_commands.iter().find_map(|cmd| match &cmd.command {
+    let (signature, cms, cms_verified) = mo.load_commands.iter().find_map(|cmd| match &cmd.command {
         goblin::mach::load_command::CommandVariant::CodeSignature(linkedit) => {
             Some(signature_parts(bytes, linkedit.dataoff, linkedit.datasize))
         }
         _ => None,
-    }).unwrap_or((None, None));
+    }).unwrap_or((None, None, None));
     SliceBody {
         dylibs: mo.libs.iter().map(|lib| (*lib).to_string()).collect(),
         rpaths: mo.rpaths.iter().map(|path| (*path).to_string()).collect(),
@@ -151,6 +158,7 @@ fn slice_body(mo: &goblin::mach::MachO, bytes: &[u8]) -> SliceBody {
         has_code_signature,
         signature,
         cms,
+        cms_verified,
         info_plist: embedded_plist(mo),
         overlay: crate::trailing_overlay(segment_file_end(mo), bytes.len() as u64),
     }
@@ -195,11 +203,57 @@ const BLOB_BYTE_CAP: usize = 4096;
 /// Code directory and CMS blob from `LC_CODE_SIGNATURE`.
 ///
 /// A missing blob, a bad magic, a short directory, or a slot that does not fit is `None` and does not fail the Mach-O parse.
-fn signature_parts(bytes: &[u8], dataoff: u32, datasize: u32) -> (Option<MachoSignature>, Option<MachoBlob>) {
+fn signature_parts(
+    bytes: &[u8],
+    dataoff: u32,
+    datasize: u32,
+) -> (Option<MachoSignature>, Option<MachoBlob>, Option<bool>) {
     let Some(blob) = superblob(bytes, dataoff, datasize) else {
-        return (None, None);
+        return (None, None, None);
     };
-    (code_directory(blob), cms_blob(blob))
+    let signature = code_directory(blob);
+    let cms = cms_blob(blob);
+    let verified = match (code_directory_bytes(blob), cms.as_ref()) {
+        (Some(directory), Some(cms)) => cms_digest_present(directory, &cms.bytes),
+        _ => None,
+    };
+    (signature, cms, verified)
+}
+
+fn code_directory_bytes(blob: &[u8]) -> Option<&[u8]> {
+    let length = blob.len();
+    let count = be_u32(blob, 8)? as usize;
+    let index_end = 12usize.checked_add(count.checked_mul(8)?)?;
+    if index_end > length {
+        return None;
+    }
+    let cd_off = (0..count).find_map(|i| {
+        let at = 12 + i * 8;
+        let ty = be_u32(blob, at)?;
+        let off = be_u32(blob, at + 4)? as usize;
+        (ty == CSSLOT_CODEDIRECTORY).then_some(off)
+    })?;
+    let cd = blob.get(cd_off..length)?;
+    if be_u32(cd, 0)? != CSMAGIC_CODEDIRECTORY {
+        return None;
+    }
+    let cd_len = be_u32(cd, 4)? as usize;
+    if cd_len < CODE_DIRECTORY_BASE || cd_len > cd.len() {
+        return None;
+    }
+    Some(&cd[..cd_len])
+}
+
+fn cms_digest_present(directory: &[u8], cms: &[u8]) -> Option<bool> {
+    if directory.len() < CODE_DIRECTORY_BASE {
+        return None;
+    }
+    let digest = match directory[37] {
+        1 => crate::hash::sha1(directory).to_vec(),
+        2 => crate::hash::sha256(directory).to_vec(),
+        _ => return None,
+    };
+    Some(cms.windows(digest.len()).any(|window| window == digest.as_slice()))
 }
 
 fn superblob(bytes: &[u8], dataoff: u32, datasize: u32) -> Option<&[u8]> {
@@ -423,6 +477,7 @@ fn arch_of(cpu: String, offset: u64, size: u64, slice: &[u8]) -> MachoArch {
         sdk: body.sdk,
         signature: body.signature,
         cms: body.cms,
+        cms_verified: body.cms_verified,
         info_plist: body.info_plist,
         overlay: body.overlay,
     }
@@ -450,6 +505,7 @@ fn empty_slice() -> SliceBody {
         has_code_signature: false,
         signature: None,
         cms: None,
+        cms_verified: None,
         info_plist: None,
         overlay: None,
     }
@@ -523,6 +579,7 @@ mod tests {
                 sdk: None,
                 signature: None,
                 cms: None,
+                cms_verified: None,
                 info_plist: None,
                 overlay: None,
             }]
@@ -558,6 +615,7 @@ mod tests {
                 sdk: Some("16.0.0".into()),
                 signature: None,
                 cms: None,
+                cms_verified: None,
                 info_plist: None,
                 overlay: None,
             }]
@@ -587,24 +645,75 @@ mod tests {
         assert_eq!(cms.length, 8);
         assert_eq!(cms.magic, u32::from_be_bytes(*b"CMS-"));
         assert_eq!(cms.bytes, b"CMS-BLOB");
+        assert_eq!(got.cms_verified, Some(false));
 
         let cms_only = signed_macho_without_code_directory();
         let got = facts(&cms_only).unwrap();
         assert!(got.has_code_signature);
         assert_eq!(got.signature, None);
         assert_eq!(got.cms.as_ref().map(|blob| blob.length), Some(20));
+        assert_eq!(got.cms_verified, None);
 
         let past = signed_macho_with_short_blob();
         let got = facts(&past).unwrap();
         assert!(got.has_code_signature);
         assert_eq!(got.signature, None);
         assert_eq!(got.cms, None);
+        assert_eq!(got.cms_verified, None);
 
         let arches = architectures(&bytes).unwrap();
         assert_eq!(arches[0].signature.as_ref(), Some(&got_signature()));
         assert_eq!(arches[0].cms.as_ref().map(|blob| blob.bytes.as_slice()), Some(b"CMS-BLOB".as_slice()));
         assert!(!format!("{:?}", arches[0].signature).contains("CMS-BLOB"));
         assert_eq!(architectures(&cms_only).unwrap()[0].signature, None);
+    }
+
+    #[test]
+    fn cms_window_matches_the_code_directory_digest() {
+        let mut cd = vec![0u8; 79];
+        write_be(&mut cd, 0, 0xfade_0c02);
+        write_be(&mut cd, 4, 79);
+        write_be(&mut cd, 8, 0x20200);
+        write_be(&mut cd, 20, 52);
+        cd[37] = 2;
+        write_be(&mut cd, 48, 68);
+        cd[52..68].copy_from_slice(b"com.example.app\0");
+        cd[68..79].copy_from_slice(b"TEAM123456\0");
+        let digest = crate::hash::sha256(&cd);
+        let cms_len = 8 + digest.len();
+        let mut cms = vec![0u8; cms_len];
+        write_be(&mut cms, 0, 0x434d_532d);
+        write_be(&mut cms, 4, cms_len as u32);
+        cms[8..].copy_from_slice(&digest);
+
+        let blob_len = 28 + cd.len() + cms.len();
+        let mut blob = vec![0u8; blob_len];
+        write_be(&mut blob, 0, 0xfade_0cc0);
+        write_be(&mut blob, 4, blob_len as u32);
+        write_be(&mut blob, 8, 2);
+        write_be(&mut blob, 12, 0x10000);
+        write_be(&mut blob, 16, (28 + cd.len()) as u32);
+        write_be(&mut blob, 20, 0);
+        write_be(&mut blob, 24, 28);
+        blob[28..28 + cd.len()].copy_from_slice(&cd);
+        blob[28 + cd.len()..].copy_from_slice(&cms);
+
+        let mut file = Vec::new();
+        let mut push = |v: u32| file.extend_from_slice(&v.to_le_bytes());
+        push(0xfeed_facf);
+        push(0x0100_000c);
+        push(0);
+        push(1);
+        push(1);
+        push(16);
+        push(0);
+        push(0);
+        push(0x1d);
+        push(16);
+        push(48);
+        push(blob.len() as u32);
+        file.extend_from_slice(&blob);
+        assert_eq!(facts(&file).unwrap().cms_verified, Some(true));
     }
 
     #[test]

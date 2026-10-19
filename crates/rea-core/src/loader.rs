@@ -187,24 +187,21 @@ fn macho_target(mo: goblin::mach::MachO, bytes: Vec<u8>, path: String) -> Result
         };
         let raw = name.to_string();
         // Mach-O C names carry one ABI underscore. Clang stores C++ as
-        // `__Z3fooi`; the Itanium spelling is `_Z3fooi`. Strip that one
-        // underscore and demangle. A name that is already `_Z…` stays.
+        // `__Z3fooi` and Rust as `__R…`. The mangled spelling drops that one
+        // underscore. A name that is already `_Z…` or `_R…` stays.
         // Other names drop one leading underscore, not every underscore.
         let stripped = raw.strip_prefix('_').unwrap_or(raw.as_str());
-        let itanium = if stripped.starts_with("_Z") {
+        let mangled = if stripped.starts_with("_Z") || stripped.starts_with("_R") {
             stripped
-        } else if raw.starts_with("_Z") {
+        } else if raw.starts_with("_Z") || raw.starts_with("_R") {
             raw.as_str()
         } else {
             ""
         };
-        let (stored, demangled) = if itanium.starts_with("_Z") {
-            (
-                itanium.to_string(),
-                crate::demangle::itanium(itanium),
-            )
+        let (stored, demangled) = if mangled.starts_with("_Z") || mangled.starts_with("_R") {
+            (mangled.to_string(), crate::demangle::any(mangled))
         } else {
-            (stripped.to_string(), None)
+            (stripped.to_string(), crate::demangle::any(stripped))
         };
         symbols.push(Symbol {
             addr: nlist.n_value,
@@ -505,6 +502,31 @@ mod tests {
         let header = crate::headers::emit(&target);
         assert!(header.contains("foo(int)"), "{header}");
         assert!(header.contains("bar()"), "{header}");
+    }
+
+    #[test]
+    fn clang_rust_v0_underscore_is_demangled_through_load_macho() {
+        let strs = b"\0__RNvC3_foo3_bar\0";
+        let symoff = 56u32;
+        let nsyms = 1u32;
+        let stroff = symoff + nsyms * 16;
+        let mut file = vec![0u8; stroff as usize + strs.len()];
+        file[0..4].copy_from_slice(&0xfeedfacfu32.to_le_bytes());
+        file[4..8].copy_from_slice(&0x01000007u32.to_le_bytes());
+        file[12..16].copy_from_slice(&1u32.to_le_bytes());
+        file[16..20].copy_from_slice(&1u32.to_le_bytes());
+        file[20..24].copy_from_slice(&24u32.to_le_bytes());
+        file[32..36].copy_from_slice(&2u32.to_le_bytes());
+        file[36..40].copy_from_slice(&24u32.to_le_bytes());
+        file[40..44].copy_from_slice(&symoff.to_le_bytes());
+        file[44..48].copy_from_slice(&nsyms.to_le_bytes());
+        file[48..52].copy_from_slice(&stroff.to_le_bytes());
+        file[52..56].copy_from_slice(&(strs.len() as u32).to_le_bytes());
+        write_nlist(&mut file, symoff as usize, 1, 0x0f, 1, 0x1000);
+        file[stroff as usize..].copy_from_slice(strs);
+        let target = load_macho(file, "rust.o".into()).unwrap();
+        let sym = target.symbols.iter().find(|s| s.name == "_RNvC3_foo3_bar").expect("raw");
+        assert_eq!(sym.demangled.as_deref(), Some("foo::bar"));
     }
 
     fn macho_with_clang_itanium() -> Vec<u8> {

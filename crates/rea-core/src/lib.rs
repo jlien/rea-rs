@@ -3,17 +3,23 @@
 
 pub mod analysis;
 pub mod artifact;
+pub mod bridge;
+pub mod clr_sig;
 pub mod crash;
+pub mod decompile;
 pub mod demangle;
 pub mod disasm;
 pub mod elf_meta;
 pub mod goinfo;
+pub mod hash;
 pub mod headers;
 pub mod le;
 pub mod loader;
 pub mod macho_meta;
+pub mod paths;
 pub mod pe_meta;
 pub mod plist;
+pub mod session;
 pub mod sqlite;
 pub mod strings;
 pub mod wasm;
@@ -95,7 +101,7 @@ pub struct Symbol {
     /// Mach-O Itanium names are stored as `_Z…`. A clang ABI underscore in
     /// front of that prefix is removed. Other Mach-O names drop one leading underscore.
     pub name: String,
-    /// Itanium C++ form, such as `foo(int)`. `None` when `name` is not mangled
+    /// Itanium C++, Rust v0, or MSVC form. `None` when `name` is not mangled
     /// or the suffix does not fit that grammar. Listing still succeeds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub demangled: Option<String>,
@@ -125,7 +131,7 @@ pub fn trailing_overlay(image_end: u64, file_len: u64) -> Option<Overlay> {
 impl Symbol {
     pub fn new(addr: u64, size: u64, name: impl Into<String>, kind: SymbolKind) -> Self {
         let name = name.into();
-        let demangled = demangle::itanium(&name);
+        let demangled = demangle::any(&name);
         Self {
             addr,
             size,

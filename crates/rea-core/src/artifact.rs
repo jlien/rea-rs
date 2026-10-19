@@ -1,7 +1,8 @@
 //! Static kind of an app bundle, a compiled nib, or an asset catalog.
 //!
-//! This does not reconstruct the nib or the catalog. An unrecognized path is
-//! `Ok(None)`.
+//! `reconstruct` reads a NIBArchive object list and a BOMStore block directory,
+//! including a CARHEADER rendition count. It does not decode pixels. An
+//! unrecognized path is `Ok(None)`. A magic that does not fit stays kind-only.
 
 use crate::{Error, Result};
 use std::path::Path;
@@ -37,9 +38,189 @@ pub fn sniff(bytes: &[u8]) -> Option<String> {
     }
 }
 
+/// Keys and classes from a NIBArchive, or block names from a BOMStore.
+/// A file that is only the magic returns `None`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Reconstruction {
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub object_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keys: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub classes: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocks: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rendition_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
+pub fn reconstruct(bytes: &[u8]) -> Option<Reconstruction> {
+    if bytes.starts_with(b"NIBArchive") {
+        parse_nib(bytes)
+    } else if bytes.starts_with(b"BOMStore") {
+        parse_bom(bytes)
+    } else {
+        None
+    }
+}
+
+fn parse_nib(bytes: &[u8]) -> Option<Reconstruction> {
+    if bytes.len() < 50 {
+        return None;
+    }
+    let object_count = le_u32(bytes, 18)?;
+    let key_count = le_u32(bytes, 26)?;
+    let key_off = le_u32(bytes, 30)? as usize;
+    let class_count = le_u32(bytes, 42)?;
+    let class_off = le_u32(bytes, 46)? as usize;
+    if key_count > 4096 || class_count > 4096 {
+        return None;
+    }
+    let mut at = key_off;
+    let mut keys = Vec::new();
+    for _ in 0..key_count {
+        let len = nib_varint(bytes, &mut at)?;
+        if len > 1024 {
+            return None;
+        }
+        let len = len as usize;
+        let raw = bytes.get(at..at + len)?;
+        at += len;
+        keys.push(String::from_utf8(raw.to_vec()).ok()?);
+    }
+    at = class_off;
+    let mut classes = Vec::new();
+    for _ in 0..class_count {
+        let name_len = nib_varint(bytes, &mut at)? as usize;
+        let extra = nib_varint(bytes, &mut at)? as usize;
+        if name_len > 256 || extra > 64 {
+            return None;
+        }
+        at = at.checked_add(extra.checked_mul(4)?)?;
+        let raw = bytes.get(at..at + name_len)?;
+        at += name_len;
+        let end = raw.iter().rposition(|b| *b != 0).map(|i| i + 1).unwrap_or(0);
+        classes.push(String::from_utf8(raw[..end].to_vec()).ok()?);
+    }
+    Some(Reconstruction {
+        kind: "nib".into(),
+        object_count: Some(object_count),
+        keys: Some(keys),
+        classes: Some(classes),
+        blocks: None,
+        rendition_count: None,
+        version: None,
+    })
+}
+
+/// NIBArchive varint: 7-bit groups, low group first. The terminal byte has bit 7 set.
+fn nib_varint(bytes: &[u8], at: &mut usize) -> Option<u64> {
+    let mut value = 0u64;
+    let mut shift = 0u32;
+    loop {
+        if shift > 56 {
+            return None;
+        }
+        let byte = *bytes.get(*at)?;
+        *at += 1;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 != 0 {
+            return Some(value);
+        }
+        shift += 7;
+    }
+}
+
+fn parse_bom(bytes: &[u8]) -> Option<Reconstruction> {
+    if bytes.len() < 32 {
+        return None;
+    }
+    let index_off = be_u32(bytes, 16)? as usize;
+    let vars_off = be_u32(bytes, 24)? as usize;
+    let count = be_u32(bytes, index_off)? as usize;
+    if count > 4096 {
+        return None;
+    }
+    let mut addresses = Vec::with_capacity(count);
+    let mut cursor = index_off + 4;
+    for _ in 0..count {
+        let address = be_u32(bytes, cursor)? as usize;
+        let length = be_u32(bytes, cursor + 4)? as usize;
+        cursor += 8;
+        addresses.push((address, length));
+    }
+    let var_count = be_u32(bytes, vars_off)? as usize;
+    if var_count > 4096 {
+        return None;
+    }
+    cursor = vars_off + 4;
+    let mut blocks = Vec::new();
+    let mut car: Option<(usize, usize)> = None;
+    for _ in 0..var_count {
+        let index = be_u32(bytes, cursor)? as usize;
+        cursor += 4;
+        let len = *bytes.get(cursor)? as usize;
+        cursor += 1;
+        let name = bytes.get(cursor..cursor + len)?;
+        cursor += len;
+        let name = std::str::from_utf8(name).ok()?.to_string();
+        if name == "CARHEADER" {
+            car = addresses.get(index).copied();
+        }
+        blocks.push(name);
+    }
+    let (rendition_count, version) = match car {
+        Some((address, length)) => car_header(bytes, address, length),
+        None => (None, None),
+    };
+    Some(Reconstruction {
+        kind: "asset-catalog".into(),
+        object_count: None,
+        keys: None,
+        classes: None,
+        blocks: Some(blocks),
+        rendition_count,
+        version,
+    })
+}
+
+fn car_header(bytes: &[u8], address: usize, length: usize) -> (Option<u32>, Option<String>) {
+    let block = match bytes.get(address..address + length) {
+        Some(block) if block.len() >= 20 + 128 => block,
+        _ => return (None, None),
+    };
+    let big = match &block[..4] {
+        b"RATC" => true,
+        b"CTAR" => false,
+        _ => return (None, None),
+    };
+    let count = if big {
+        be_u32(block, 16)
+    } else {
+        le_u32(block, 16)
+    };
+    let text = &block[20..20 + 128];
+    let end = text.iter().position(|b| *b == 0).unwrap_or(text.len());
+    let version = std::str::from_utf8(&text[..end]).ok().map(str::to_string);
+    (count, version)
+}
+
+fn le_u32(bytes: &[u8], at: usize) -> Option<u32> {
+    let raw = bytes.get(at..at + 4)?;
+    Some(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
+}
+
+fn be_u32(bytes: &[u8], at: usize) -> Option<u32> {
+    let raw = bytes.get(at..at + 4)?;
+    Some(u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{identify, sniff};
+    use super::{identify, reconstruct, sniff};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -77,5 +258,50 @@ mod tests {
         );
         assert_eq!(identify(&root).unwrap(), None);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn nib_lists_keys_and_classes_and_a_short_magic_stays_empty() {
+        assert_eq!(reconstruct(b"NIBArchive"), None);
+        let mut buf = vec![0u8; 50];
+        buf[..10].copy_from_slice(b"NIBArchive");
+        buf[10..14].copy_from_slice(&1u32.to_le_bytes());
+        buf[26..30].copy_from_slice(&1u32.to_le_bytes());
+        buf[30..34].copy_from_slice(&50u32.to_le_bytes());
+        buf[42..46].copy_from_slice(&1u32.to_le_bytes());
+        buf[46..50].copy_from_slice(&56u32.to_le_bytes());
+        buf.push(0x85);
+        buf.extend_from_slice(b"frame");
+        buf.push(0x88);
+        buf.push(0x80);
+        buf.extend_from_slice(b"NSObject");
+        let got = reconstruct(&buf).unwrap();
+        assert_eq!(got.kind, "nib");
+        assert_eq!(got.object_count, Some(0));
+        assert_eq!(got.keys.unwrap(), vec!["frame".to_string()]);
+        assert_eq!(got.classes.unwrap(), vec!["NSObject".to_string()]);
+    }
+
+    #[test]
+    fn bom_lists_carheader_without_pixels() {
+        assert_eq!(reconstruct(b"BOMStore"), None);
+        let mut buf = vec![0u8; 64 + 148];
+        buf[..8].copy_from_slice(b"BOMStore");
+        buf[16..20].copy_from_slice(&32u32.to_be_bytes());
+        buf[24..28].copy_from_slice(&44u32.to_be_bytes());
+        buf[32..36].copy_from_slice(&1u32.to_be_bytes());
+        buf[36..40].copy_from_slice(&64u32.to_be_bytes());
+        buf[40..44].copy_from_slice(&148u32.to_be_bytes());
+        buf[44..48].copy_from_slice(&1u32.to_be_bytes());
+        buf[48..52].copy_from_slice(&0u32.to_be_bytes());
+        buf[52] = 9;
+        buf[53..62].copy_from_slice(b"CARHEADER");
+        buf[64..68].copy_from_slice(b"RATC");
+        buf[80..84].copy_from_slice(&3u32.to_be_bytes());
+        buf[84..87].copy_from_slice(b"1.0");
+        let got = reconstruct(&buf).unwrap();
+        assert_eq!(got.blocks.unwrap(), vec!["CARHEADER".to_string()]);
+        assert_eq!(got.rendition_count, Some(3));
+        assert_eq!(got.version.as_deref(), Some("1.0"));
     }
 }

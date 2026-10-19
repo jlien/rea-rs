@@ -86,6 +86,13 @@ fn handle_tool_call(msg: &Value) -> Result<Value, String> {
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
 
+    if name == "rea_session" {
+        return session_call(&args);
+    }
+    if name == "rea_bridge" {
+        return bridge_call(&args);
+    }
+
     let path = args
         .get("path")
         .and_then(Value::as_str)
@@ -94,12 +101,30 @@ fn handle_tool_call(msg: &Value) -> Result<Value, String> {
     if name == "rea_wasm" || name == "rea_go" || name == "rea_sqlite" {
         let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
         let value = if name == "rea_wasm" {
-            json!(rea_core::wasm::inspect(&bytes).map_err(|e| e.to_string())?)
+            if let Some(export) = args.get("execute").and_then(Value::as_str) {
+                let argv = i32_args(&args);
+                json!({
+                    "result": rea_core::wasm::execute(&bytes, export, &argv).map_err(|e| e.to_string())?
+                })
+            } else {
+                json!(rea_core::wasm::inspect(&bytes).map_err(|e| e.to_string())?)
+            }
         } else if name == "rea_sqlite" {
-            let header = rea_core::sqlite::header(&bytes).map_err(|e| e.to_string())?;
-            let schema = rea_core::sqlite::schema(&bytes).map_err(|e| e.to_string())?;
+            let mut db = bytes;
+            if let Some(wal) = args.get("wal").and_then(Value::as_str) {
+                let wal_bytes = std::fs::read(wal).map_err(|e| e.to_string())?;
+                db = rea_core::sqlite::apply_wal(&db, &wal_bytes).map_err(|e| e.to_string())?;
+            }
+            let header = rea_core::sqlite::header(&db).map_err(|e| e.to_string())?;
+            let schema = rea_core::sqlite::schema(&db).map_err(|e| e.to_string())?;
             let mut value = serde_json::to_value(header).map_err(|e| e.to_string())?;
             value["schema"] = json!(schema);
+            if let Some(table) = args.get("table").and_then(Value::as_str) {
+                let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(32) as usize;
+                value["rows"] = json!(
+                    rea_core::sqlite::table_rows(&db, table, limit).map_err(|e| e.to_string())?
+                );
+            }
             value
         } else {
             match rea_core::goinfo::find_build_info(&bytes).map_err(|e| e.to_string())? {
@@ -119,7 +144,7 @@ fn handle_tool_call(msg: &Value) -> Result<Value, String> {
         .and_then(Value::as_str)
         .filter(|name| !name.is_empty());
     let result: Result<Value, String> = (|| {
-        let target = if matches!(name, "rea_sections" | "rea_disasm") {
+        let target = if matches!(name, "rea_sections" | "rea_disasm" | "rea_decompile") {
             loader::load_arch(path, arch).map_err(|e| e.to_string())?
         } else {
             loader::load(path).map_err(|e| e.to_string())?
@@ -168,6 +193,16 @@ fn handle_tool_call(msg: &Value) -> Result<Value, String> {
                     json!({ "count": hits.len(), "strings": hits })
                 }
             }
+            "rea_decompile" => {
+                let addr = args
+                    .get("address")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(target.entry);
+                let count = args.get("count").and_then(Value::as_u64).unwrap_or(32) as usize;
+                let text = rea_core::decompile::decompile(&target, addr, count)
+                    .map_err(|e| e.to_string())?;
+                json!({ "address": addr, "text": text })
+            }
             "rea_disasm" => {
                 #[cfg(feature = "disasm")]
                 {
@@ -211,18 +246,30 @@ fn handle_tool_call(msg: &Value) -> Result<Value, String> {
             }
             "rea_macho" => {
                 let facts = rea_core::macho_meta::facts(&target.bytes).map_err(|e| e.to_string())?;
+                let hits = rea_core::paths::search(
+                    &facts.rpaths,
+                    &facts.dylibs,
+                    Some(std::path::Path::new(path)),
+                );
                 let file = std::fs::read(path).map_err(|e| e.to_string())?;
                 let architectures =
                     rea_core::macho_meta::architectures(&file).map_err(|e| e.to_string())?;
                 let mut value = serde_json::to_value(facts).map_err(|e| e.to_string())?;
                 value["architectures"] = json!(architectures);
+                value["path_hits"] = json!(hits);
                 value
             }
             "rea_pe" => {
                 json!(rea_core::pe_meta::facts(&target.bytes).map_err(|e| e.to_string())?)
             }
             "rea_elf" => {
-                json!(rea_core::elf_meta::facts(&target.bytes).map_err(|e| e.to_string())?)
+                let facts = rea_core::elf_meta::facts(&target.bytes).map_err(|e| e.to_string())?;
+                let mut dirs = facts.rpath.clone();
+                dirs.extend(facts.runpath.iter().cloned());
+                let hits = rea_core::paths::search(&dirs, &facts.needed, Some(std::path::Path::new(path)));
+                let mut value = serde_json::to_value(facts).map_err(|e| e.to_string())?;
+                value["path_hits"] = json!(hits);
+                value
             }
             other => return Err(format!("unknown tool: {other}")),
         })
@@ -232,6 +279,72 @@ fn handle_tool_call(msg: &Value) -> Result<Value, String> {
         Ok(v) => Ok(text_result(v.to_string())),
         Err(e) => Ok(text_result(format!("error: {e}"))),
     }
+}
+
+fn i32_args(args: &Value) -> Vec<i32> {
+    args.get("args")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_i64().map(|n| n as i32))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn session_call(args: &Value) -> Result<Value, String> {
+    let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+    let dir = args
+        .get("dir")
+        .and_then(Value::as_str)
+        .ok_or("missing required argument: dir")?;
+    let dir = std::path::Path::new(dir);
+    let value = match action {
+        "open" => {
+            let path = args.get("path").and_then(Value::as_str).unwrap_or("");
+            serde_json::to_value(rea_core::session::open(dir, path).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?
+        }
+        "record" => {
+            let id = args.get("id").and_then(Value::as_str).unwrap_or("");
+            let tool = args.get("tool").and_then(Value::as_str).unwrap_or("");
+            let summary = args.get("summary").and_then(Value::as_str).unwrap_or("");
+            serde_json::to_value(
+                rea_core::session::record(dir, id, tool, summary).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?
+        }
+        "diff" => {
+            let left = args.get("left").and_then(Value::as_str).unwrap_or("");
+            let right = args.get("right").and_then(Value::as_str).unwrap_or("");
+            let left = rea_core::session::load(dir, left).map_err(|e| e.to_string())?;
+            let right = rea_core::session::load(dir, right).map_err(|e| e.to_string())?;
+            serde_json::to_value(rea_core::session::diff(&left, &right)).map_err(|e| e.to_string())?
+        }
+        _ => return Ok(text_result(format!("error: session: unknown action {action}"))),
+    };
+    Ok(text_result(value.to_string()))
+}
+
+fn bridge_call(args: &Value) -> Result<Value, String> {
+    let action = args.get("action").and_then(Value::as_str).unwrap_or("status");
+    let value = match action {
+        "status" => json!(rea_core::bridge::status()),
+        "parse" => {
+            let provider = args.get("provider").and_then(Value::as_str).unwrap_or("");
+            let text = if let Some(text) = args.get("text").and_then(Value::as_str) {
+                text.to_string()
+            } else if let Some(file) = args.get("file").and_then(Value::as_str) {
+                std::fs::read_to_string(file).map_err(|e| e.to_string())?
+            } else {
+                return Ok(text_result("error: bridge: missing text"));
+            };
+            json!(rea_core::bridge::parse(provider, &text).map_err(|e| e.to_string())?)
+        }
+        _ => return Ok(text_result(format!("error: bridge: unknown action {action}"))),
+    };
+    Ok(text_result(value.to_string()))
 }
 
 fn tool_definitions() -> Vec<Value> {
@@ -268,7 +381,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "rea_symbols",
-            "description": "List symbols; optionally filter by kind: imports, exports, or locals. Mach-O stab symbols are omitted. An Itanium C++ name is also returned demangled. The raw name stays. A clang __Z name drops one ABI underscore first. Other names are unchanged.",
+            "description": "List symbols; optionally filter by kind: imports, exports, or locals. Mach-O stab symbols are omitted. Itanium, Rust v0, and MSVC names are also returned demangled. The raw name stays. A clang __Z or __R name drops one ABI underscore first. Swift stays raw.",
             "inputSchema": schema(false, json!({
                 "kind": { "type": "string", "enum": ["all", "imports", "exports", "locals"] }
             }), &[]),
@@ -309,33 +422,81 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "rea_wasm",
-            "description": "List WASM section ids, imports, exports, the type count, defined function count, memory limits, table limits, data count, custom section names, and the start index. Does not decode function bodies, type signatures, element segments, data segments, custom payloads, or execute the module.",
-            "inputSchema": schema(true, json!({}), &[]),
+            "description": "WASM section ids, imports, exports, type signatures, function-body opcodes, element and data segments, a capped custom payload, memory and table limits, the data count, and the start index. Optional execute runs one export with an i32 interpreter. No WASI and no memory.",
+            "inputSchema": schema(false, json!({
+                "execute": { "type": "string", "description": "Export name to run. Omit to inspect only." },
+                "args": { "type": "array", "items": { "type": "integer" }, "description": "i32 arguments for execute." }
+            }), &[]),
         }),
         json!({
             "name": "rea_go",
-            "description": "Read Go 1.18+ inline build info. Pointer-based pre-1.18 blobs return an error.",
+            "description": "Go build info. Go 1.18+ inline blobs and pre-1.18 file offsets. A null or out-of-range offset is an error. Host pointers are not dereferenced.",
             "inputSchema": schema(true, json!({}), &[]),
         }),
         json!({
             "name": "rea_macho",
-            "description": "Mach-O dylibs, UUID, build version, rpaths, code-directory identifier, hash type, team id, hash-slot digests, the CMS blob, an embedded Info.plist, an overlay, and fat architectures. Slice facts use the host slice. Each architecture includes that slice's uuid, dylibs, rpaths, build version, code directory, CMS blob, plist, and overlay when the bytes are present. A missing blob does not fail the parse.",
+            "description": "Mach-O dylibs, UUID, build version, rpaths, code-directory identifier, hash type, team id, hash-slot digests, the CMS blob, cms_verified when the hash type is sha1 or sha256, an embedded Info.plist, an overlay, fat architectures, and rpath file hits. cms_verified is a digest window, not an Apple trust decision. A missing blob does not fail the parse.",
             "inputSchema": schema(true, json!({}), &[]),
         }),
         json!({
             "name": "rea_pe",
-            "description": "PE subsystem, image base, COFF timestamp, data directories, CLR runtime header, metadata version, stream names, table row counts, Module/TypeRef/TypeDef names, Field and MethodDef names on each TypeDef, Param names on each method, MemberRef names, CodeView PDB path, root resource type ids, the name under each type, the language id under each name, the data-entry size and code page, the resource payload, and an overlay. A missing payload does not fail the parse. The timestamp is not a date.",
+            "description": "PE subsystem, image base, raw COFF timestamp and its UTC date, data directories, CLR runtime header, metadata version, stream names, table row counts, type and member names, method signatures, a bounded IL listing, assembly and assembly-ref names, property and event names, CodeView PDB path, resource names, payloads, and an overlay. A missing payload does not fail the parse.",
             "inputSchema": schema(true, json!({}), &[]),
         }),
         json!({
             "name": "rea_sqlite",
-            "description": "SQLite database header, including the application id, and sqlite_schema objects (type, name, table, root page, SQL). Does not read table rows or a WAL file.",
-            "inputSchema": schema(true, json!({}), &[]),
+            "description": "SQLite database header, including the application id, and sqlite_schema objects. Optional table lists capped rows. Optional wal replays committed frames before the read.",
+            "inputSchema": schema(false, json!({
+                "table": { "type": "string", "description": "Table name whose rows are listed." },
+                "limit": { "type": "integer", "description": "Maximum rows (default 32)." },
+                "wal": { "type": "string", "description": "WAL file to replay before reading." }
+            }), &[]),
         }),
         json!({
             "name": "rea_elf",
-            "description": "ELF file type, machine, interpreter, needed libraries, soname, rpath, runpath, and GNU build-id. Rpath directories are not searched.",
+            "description": "ELF file type, machine, interpreter, needed libraries, soname, rpath, runpath, GNU build-id, and rpath or runpath file hits.",
             "inputSchema": schema(true, json!({}), &[]),
+        }),
+        json!({
+            "name": "rea_decompile",
+            "description": "Bounded pseudo-C at a virtual address: assignments, calls, gotos, and returns. Not a type-recovering decompiler. Optional arch selects a Mach-O slice.",
+            "inputSchema": schema(false, json!({
+                "address": { "type": "integer", "description": "Virtual address. Default is the entry point." },
+                "count": { "type": "integer", "description": "Maximum instructions (default 32, cap 64)." },
+                "arch": { "type": "string", "description": "Mach-O slice. Default is the host slice." }
+            }), &[]),
+        }),
+        json!({
+            "name": "rea_session",
+            "description": "Evidence session JSON: open, record a tool and summary, or diff two sessions. Does not map the binary. dir is the directory of the session files.",
+            "inputSchema": json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["open", "record", "diff"] },
+                    "dir": { "type": "string", "description": "Directory of session JSON files." },
+                    "path": { "type": "string", "description": "Path recorded by open. The file is not mapped." },
+                    "id": { "type": "string" },
+                    "tool": { "type": "string" },
+                    "summary": { "type": "string" },
+                    "left": { "type": "string" },
+                    "right": { "type": "string" }
+                },
+                "required": ["action", "dir"]
+            }),
+        }),
+        json!({
+            "name": "rea_bridge",
+            "description": "PATH presence and export parsers for Hopper, Ghidra, IDA, JEB, Frida, CDP, and adb. Does not launch those programs and does not attach to a process.",
+            "inputSchema": json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["status", "parse"] },
+                    "provider": { "type": "string" },
+                    "text": { "type": "string", "description": "Export text to parse." },
+                    "file": { "type": "string", "description": "Export file to parse when text is omitted." }
+                },
+                "required": ["action"]
+            }),
         }),
     ]
 }
@@ -362,13 +523,19 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_returns_fourteen_tools() {
+    fn tools_list_returns_seventeen_tools() {
         let (lines, _) = exchange(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#);
         let v: Value = serde_json::from_str(&lines[0]).unwrap();
         let tools = v["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 14);
+        assert_eq!(tools.len(), 17);
         let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
         assert!(names.contains(&"rea_sqlite"));
+        assert!(names.contains(&"rea_decompile"));
+        assert!(names.contains(&"rea_session"));
+        assert!(names.contains(&"rea_bridge"));
+        let session = tools.iter().find(|t| t["name"] == "rea_session").unwrap();
+        let required = session["inputSchema"]["required"].as_array().unwrap();
+        assert!(required.iter().all(|item| item != "path"));
     }
 
     #[test]
