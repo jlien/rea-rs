@@ -54,10 +54,17 @@ rea xrefs /bin/ls 0x100003f80
 # Format-specific facts
 rea macho /bin/ls
 rea wasm module.wasm
+rea wasm module.wasm --execute f --arg 1
 rea goinfo go-binary
 rea pe program.exe
 rea elf /path/to/elf
-rea sqlite database.sqlite
+rea sqlite database.sqlite --table notes --limit 32
+rea sqlite database.sqlite --wal database.sqlite-wal
+
+# Bounded pseudo-C, a session directory, and an export parser
+rea decompile /bin/ls --count 16
+rea session --dir /tmp/rea-session open /bin/ls
+rea bridge status
 
 # All commands emit JSON — pipe anywhere
 rea strings /bin/ls | jq '.count'
@@ -65,22 +72,25 @@ rea strings /bin/ls | jq '.count'
 
 ## MCP server
 
-`rea mcp` speaks JSON-RPC 2.0 over stdio and exposes fourteen tools:
+`rea mcp` speaks JSON-RPC 2.0 over stdio and exposes seventeen tools:
 
 - `rea_info` — format, architecture, entry point, section/symbol counts
 - `rea_sections` — section names, virtual addresses, sizes, file offsets, and `rwx` permissions. Optional `arch` selects a Mach-O slice. The default is the host slice.
-- `rea_symbols` — imports, exports, and locals, filterable by kind. Mach-O stab symbols are omitted. An Itanium C++ name is also returned demangled. The raw name stays. A clang `__Z` name drops one ABI underscore first.
+- `rea_symbols` — imports, exports, and locals, filterable by kind. Mach-O stab symbols are omitted. An Itanium, Rust v0, or MSVC name is also returned demangled. The raw name stays. A clang `__Z` or `__R` name drops one ABI underscore first. Swift stays raw.
 - `rea_strings` — printable strings with file offsets; optional `xrefs` annotates code references
 - `rea_disasm` — instruction-level disassembly at any virtual address. Optional `arch` selects a Mach-O slice. The default is the host slice.
 - `rea_funcs` — function boundaries from the entry point, direct calls, and prologues
 - `rea_xrefs` — code locations referencing an address (pointer-width absolutes, plus arm64 ADRP, x86_64 RIP-relative, 32-bit x86, and ARM/Thumb PC-relative loads)
 - `rea_call_graph` — direct calls between discovered functions
-- `rea_wasm` — WASM section ids, imports, exports, type count, defined function count, memory min/max, table min/max, data count, custom section names, and the start index. Function bodies, type signatures, element segments, data segments, and custom payloads are not decoded.
-- `rea_go` — Go 1.18+ build info (version and module text)
-- `rea_macho` — dylibs, UUID, build version, rpaths, code-directory identifier, hash type, team id, hash-slot digests, the CMS blob, an embedded Info.plist, an overlay, and fat architectures. Each architecture includes that slice's uuid, dylibs, rpaths, build version, code directory, CMS blob, plist, and overlay when the slice is present. A missing blob does not fail the parse. The signature is not verified.
-- `rea_pe` — subsystem, image base, COFF timestamp, data directories, CLR runtime header, metadata version, stream directory, table row counts, Module/TypeRef/TypeDef names, Field and MethodDef names on each TypeDef, Param names on each method, MemberRef names, CodeView PDB path, root resource type ids, the name under each type, the language id under each name, the data-entry size and code page, the resource payload, and an overlay. A missing payload does not fail the parse. The timestamp is not a date.
-- `rea_elf` — file type, machine, interpreter, needed libraries, soname, rpath, runpath, and GNU build-id. The paths are not searched.
-- `rea_sqlite` — database header, including the application id, and `sqlite_schema` objects. No table rows and no WAL replay.
+- `rea_wasm` — WASM section ids, imports, exports, type signatures, defined function count, function-body opcodes, element and data segments, a capped custom payload, memory min/max, table min/max, data count, custom section names, and the start index. Optional `execute` runs one export with an i32 interpreter. No WASI and no memory.
+- `rea_go` — Go 1.18+ inline build info, and pre-1.18 strings reached by file offsets. A null or out-of-range offset is an error. Host pointers are not dereferenced.
+- `rea_macho` — dylibs, UUID, build version, rpaths, code-directory identifier, hash type, team id, hash-slot digests, the CMS blob, `cms_verified` when the hash type is sha1 or sha256, an embedded Info.plist, an overlay, fat architectures, and rpath file hits. Each architecture includes that slice's uuid, dylibs, rpaths, build version, code directory, CMS blob, plist, and overlay when the slice is present. A missing blob does not fail the parse. `cms_verified` is a digest window, not an Apple trust decision.
+- `rea_pe` — subsystem, image base, raw COFF timestamp and its UTC date, data directories, CLR runtime header, metadata version, stream directory, table row counts, Module/TypeRef/TypeDef names, Field and MethodDef names on each TypeDef, method signatures, a bounded IL listing, Param names on each method, MemberRef names and signatures, Assembly and AssemblyRef names, Property and Event names, CodeView PDB path, root resource type ids, the name under each type, the language id under each name, the data-entry size and code page, the resource payload, and an overlay. A missing payload does not fail the parse.
+- `rea_elf` — file type, machine, interpreter, needed libraries, soname, rpath, runpath, GNU build-id, and rpath or runpath file hits.
+- `rea_sqlite` — database header, including the application id, and `sqlite_schema` objects. Optional `table` lists capped rows. Optional `wal` replays committed frames before the read.
+- `rea_decompile` — bounded pseudo-C at a virtual address: assignments, calls, gotos, and returns. Not a type-recovering decompiler. Optional `arch` selects a Mach-O slice.
+- `rea_session` — JSON evidence session: open, record a tool and a summary, or diff two sessions. Does not map the binary. `dir` is required. `path` is not.
+- `rea_bridge` — PATH presence and export parsers for Hopper, Ghidra, IDA, JEB, Frida, CDP, and adb. Does not launch those programs and does not attach to a process.
 
 Register it with any MCP-capable agent, e.g. Claude Code:
 
@@ -109,8 +119,8 @@ Or in an MCP client config:
 ## Design notes
 
 - **Fat binaries are first-class**: universal Mach-O files are resolved to
-  the host-architecture slice before analysis. `rea sections` and
-  `rea disasm` take `--arch` to read another slice. The default stays the host.
+  the host-architecture slice before analysis. `rea sections`,
+  `rea disasm`, and `rea decompile` take `--arch` to read another slice. The default stays the host.
 - **Uniform surface**: every format loads into the same `Target` struct, so
   tools behave identically across Mach-O, ELF, PE, and LE.
 - **vaddr → file offset mapping** is built in (`Target::vaddr_to_offset`),
@@ -120,10 +130,10 @@ Or in an MCP client config:
 
 ## Roadmap
 
-- [ ] .NET rows beyond Module, TypeRef, TypeDef, Field, MethodDef, Param, and MemberRef names, plus IL (`rea pe` reads the CLR header, stream directory, table row counts, those type names, each TypeDef's field and method names, each method's parameter names, and MemberRef names)
-- [x] WASM module inspection — section ids, imports, exports, type count, defined function count, memory min/max, table min/max, data count, custom names, and the start index (`rea wasm`). No function-body decode, no type signatures, no element or data segments, no custom payloads, no WAT, and no execution
+- [x] .NET rows beyond Module, TypeRef, TypeDef, Field, MethodDef, Param, and MemberRef names, plus IL (`rea pe` reads Assembly and AssemblyRef names, Property and Event names, method and MemberRef signatures, and at most 48 IL opcodes). Other metadata rows, field signatures, and parameter sequence numbers stay unread.
+- [x] WASM module inspection — section ids, imports, exports, type signatures, defined function count, memory min/max, table min/max, data count, custom names and a capped payload, function-body opcodes, element and data segments, and the start index (`rea wasm`). `--execute` runs one export with an i32 interpreter. No WASI, no memory, and no WAT.
 - [x] Function boundary detection and cross-reference resolution — Capstone sweep (entry, direct calls, prologues on x86, x86_64, arm64, and Thumb) plus pointer-width data xrefs and PC-relative loads (arm64 ADRP, x86_64 RIP-relative, 32-bit x86, ARM/Thumb), exposed as `rea funcs`, `rea xrefs`, `rea callgraph`, and the MCP tools
-- [x] SQLite header, including the application id, and `sqlite_schema` objects (`rea sqlite`). No table-row reads and no WAL replay
+- [x] SQLite header, including the application id, `sqlite_schema` objects, and capped rows of one named table (`rea sqlite`). `--wal` replays checksummed frames through the last valid commit.
 - [x] Export as C/C++ headers from recovered definitions (`rea headers`). Itanium names become declarations. Other local and export names that are C identifiers become `extern void name();`. Imports are omitted.
 
 ## License
