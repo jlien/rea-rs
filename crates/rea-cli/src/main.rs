@@ -39,7 +39,7 @@ enum Command {
         #[arg(long)]
         arch: Option<String>,
     },
-    /// List symbols, optionally filtered. Mach-O stabs are omitted. An Itanium C++ name is also shown demangled; the raw name stays.
+    /// List symbols, optionally filtered. Mach-O stabs are omitted. An Itanium C++ name is also shown demangled; the raw name stays. A clang `__Z` name drops one ABI underscore first.
     Symbols {
         path: String,
         #[arg(value_enum, default_value_t = SymKind::All)]

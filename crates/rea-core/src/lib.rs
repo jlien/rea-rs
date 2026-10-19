@@ -92,8 +92,8 @@ pub fn section_perms(read: bool, write: bool, exec: bool) -> String {
 pub struct Symbol {
     pub addr: u64,
     pub size: u64,
-    /// The name stored in the file. Mach-O Itanium names keep their `_Z` prefix.
-    /// A single leading underscore is removed from other Mach-O names.
+    /// Mach-O Itanium names are stored as `_Z…`. A clang ABI underscore in
+    /// front of that prefix is removed. Other Mach-O names drop one leading underscore.
     pub name: String,
     /// Itanium C++ form, such as `foo(int)`. `None` when `name` is not mangled
     /// or the suffix does not fit that grammar. Listing still succeeds.

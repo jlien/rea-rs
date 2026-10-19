@@ -186,13 +186,25 @@ fn macho_target(mo: goblin::mach::MachO, bytes: Vec<u8>, path: String) -> Result
             SymbolKind::Local
         };
         let raw = name.to_string();
-        let demangled = crate::demangle::itanium(&raw);
-        // Keep the Itanium prefix so the raw name stays available. Other
-        // Mach-O names drop one leading underscore.
-        let stored = if raw.starts_with("_Z") {
-            raw
+        // Mach-O C names carry one ABI underscore. Clang stores C++ as
+        // `__Z3fooi`; the Itanium spelling is `_Z3fooi`. Strip that one
+        // underscore and demangle. A name that is already `_Z…` stays.
+        // Other names drop one leading underscore, not every underscore.
+        let stripped = raw.strip_prefix('_').unwrap_or(raw.as_str());
+        let itanium = if stripped.starts_with("_Z") {
+            stripped
+        } else if raw.starts_with("_Z") {
+            raw.as_str()
         } else {
-            raw.trim_start_matches('_').to_string()
+            ""
+        };
+        let (stored, demangled) = if itanium.starts_with("_Z") {
+            (
+                itanium.to_string(),
+                crate::demangle::itanium(itanium),
+            )
+        } else {
+            (stripped.to_string(), None)
         };
         symbols.push(Symbol {
             addr: nlist.n_value,
@@ -468,6 +480,54 @@ mod tests {
         let header = crate::headers::emit(&target);
         assert!(header.contains("foo(int)"), "{header}");
         assert!(header.contains("plain"), "{header}");
+    }
+
+    /// Clang `-c` stores `__Z3fooi`. One ABI underscore comes off, the raw
+    /// name stays `_Z3fooi`, and the demangled form is `foo(int)`.
+    #[test]
+    fn clang_itanium_underscore_is_demangled_through_load_macho() {
+        let bytes = macho_with_clang_itanium();
+        assert!(bytes.windows(8).any(|w| w == b"__Z3fooi"));
+        let target = load_macho(bytes, "clang.o".into()).unwrap();
+        let foo = target
+            .symbols
+            .iter()
+            .find(|s| s.name == "_Z3fooi")
+            .expect("raw name");
+        assert_eq!(foo.demangled.as_deref(), Some("foo(int)"));
+        assert!(target.symbols.iter().all(|s| s.name != "Z3fooi"));
+        let bar = target
+            .symbols
+            .iter()
+            .find(|s| s.name == "_Z3barv")
+            .expect("bar");
+        assert_eq!(bar.demangled.as_deref(), Some("bar()"));
+        let header = crate::headers::emit(&target);
+        assert!(header.contains("foo(int)"), "{header}");
+        assert!(header.contains("bar()"), "{header}");
+    }
+
+    fn macho_with_clang_itanium() -> Vec<u8> {
+        let strs = b"\0__Z3fooi\0__Z3barv\0";
+        let symoff = 56u32;
+        let nsyms = 2u32;
+        let stroff = symoff + nsyms * 16;
+        let mut file = vec![0u8; stroff as usize + strs.len()];
+        file[0..4].copy_from_slice(&0xfeedfacfu32.to_le_bytes());
+        file[4..8].copy_from_slice(&0x01000007u32.to_le_bytes());
+        file[12..16].copy_from_slice(&1u32.to_le_bytes());
+        file[16..20].copy_from_slice(&1u32.to_le_bytes());
+        file[20..24].copy_from_slice(&24u32.to_le_bytes());
+        file[32..36].copy_from_slice(&2u32.to_le_bytes());
+        file[36..40].copy_from_slice(&24u32.to_le_bytes());
+        file[40..44].copy_from_slice(&symoff.to_le_bytes());
+        file[44..48].copy_from_slice(&nsyms.to_le_bytes());
+        file[48..52].copy_from_slice(&stroff.to_le_bytes());
+        file[52..56].copy_from_slice(&(strs.len() as u32).to_le_bytes());
+        write_nlist(&mut file, symoff as usize, 1, 0x0f, 1, 0x1000);
+        write_nlist(&mut file, symoff as usize + 16, 10, 0x0e, 1, 0x1100);
+        file[stroff as usize..stroff as usize + strs.len()].copy_from_slice(strs);
+        file
     }
 
     fn macho_with_itanium() -> Vec<u8> {
