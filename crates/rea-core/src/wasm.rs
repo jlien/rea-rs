@@ -312,6 +312,7 @@ pub fn wat(module: &WasmModule) -> String {
         .count() as u32;
     let mut custom_i = 0usize;
     let mut mem_i = 0usize;
+    let mut tab_i = 0usize;
     for &id in &module.sections {
         match id {
             0 => {
@@ -346,7 +347,16 @@ pub fn wat(module: &WasmModule) -> String {
                                     .unwrap_or_else(|| imp.index.to_string())
                             )
                         }
-                        "table" => format!("(table {})", imp.index),
+                        "table" => {
+                            let limits = module.imported_tables.get(tab_i);
+                            tab_i += 1;
+                            format!(
+                                "(table {})",
+                                limits
+                                    .map(table_limits)
+                                    .unwrap_or_else(|| imp.index.to_string())
+                            )
+                        }
                         _ => "(global)".to_string(),
                     };
                     out.push_str(&format!(
@@ -601,12 +611,14 @@ fn limit_text(memory: &WasmMemory) -> String {
 
 fn table_limits(table: &WasmTable) -> String {
     let mut text = match table.max {
-        Some(max) => format!("{} {max} {}", table.min, table.kind),
-        None => format!("{} {}", table.min, table.kind),
+        Some(max) => format!("{} {max}", table.min),
+        None => format!("{}", table.min),
     };
     if table.shared {
         text.push_str(" shared");
     }
+    text.push(' ');
+    text.push_str(&table.kind);
     text
 }
 
@@ -1480,6 +1492,20 @@ mod tests {
         assert!(text.contains("  (import \"e\" \"t\" (table 2 4 funcref))\n"));
         assert!(text.contains("  (import \"e\" \"g\" (global (mut i32)))\n"));
         assert!(text.contains("  (import \"e\" \"f\" (func $0 (type 5)))\n"));
+    }
+
+    #[test]
+    fn wat_lists_a_shared_table_as_limits_then_reftype() {
+        // Import: module e, name m, kind table (0x70), flags 03, min 2 max 4.
+        let imported = inspect(&hex("0061736d01000000020a010165016d0170030204")).unwrap();
+        let text = wat_full(&imported);
+        assert!(parens_balanced(&text));
+        assert!(text.contains("  (import \"e\" \"m\" (table 2 4 shared funcref))\n"));
+
+        // A defined table section with flags 03 prints the same form.
+        let defined = inspect(&hex("0061736d0100000004050170030102")).unwrap();
+        let text = wat_full(&defined);
+        assert!(text.contains("  (table 1 2 shared funcref)\n"));
     }
 
     #[test]

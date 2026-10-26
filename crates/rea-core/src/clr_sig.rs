@@ -24,7 +24,7 @@ pub fn method_sig(heap: &[u8], index: u32) -> Option<String> {
     let conv = *bytes.get(at)?;
     at += 1;
     if conv == 0x06 {
-        let (ty, _) = sig_type(bytes, at)?;
+        let (ty, _) = sig_type(bytes, at, 0)?;
         return Some(format!("field {ty}"));
     }
     if conv & 0x10 != 0 {
@@ -33,11 +33,11 @@ pub fn method_sig(heap: &[u8], index: u32) -> Option<String> {
     }
     let (count, n) = compressed(bytes, at)?;
     at += n;
-    let (ret, n) = sig_type(bytes, at)?;
+    let (ret, n) = sig_type(bytes, at, 0)?;
     at += n;
     let mut params = Vec::new();
     for _ in 0..count {
-        let (ty, n) = sig_type(bytes, at)?;
+        let (ty, n) = sig_type(bytes, at, 0)?;
         at += n;
         params.push(ty);
     }
@@ -57,11 +57,11 @@ pub fn property_sig(heap: &[u8], index: u32) -> Option<String> {
     }
     let (count, n) = compressed(bytes, 1)?;
     let mut at = 1 + n;
-    let (ty, n) = sig_type(bytes, at)?;
+    let (ty, n) = sig_type(bytes, at, 0)?;
     at += n;
     let mut indexes = Vec::new();
     for _ in 0..count {
-        let (param, n) = sig_type(bytes, at)?;
+        let (param, n) = sig_type(bytes, at, 0)?;
         at += n;
         indexes.push(param);
     }
@@ -183,7 +183,12 @@ fn compressed(bytes: &[u8], at: usize) -> Option<(u32, usize)> {
     None
 }
 
-fn sig_type(bytes: &[u8], at: usize) -> Option<(String, usize)> {
+fn sig_type(bytes: &[u8], at: usize, depth: u32) -> Option<(String, usize)> {
+    // Nested ptr/byref/szarray wrappers recurse; cap the depth so a hostile
+    // blob of thousands of `0x0f` bytes cannot overflow the stack.
+    if depth > 64 {
+        return None;
+    }
     let tag = *bytes.get(at)?;
     let name = match tag {
         0x01 => "void",
@@ -204,12 +209,12 @@ fn sig_type(bytes: &[u8], at: usize) -> Option<(String, usize)> {
         0x19 => "uintptr",
         0x1c => "object",
         0x0f | 0x10 => {
-            let (inner, n) = sig_type(bytes, at + 1)?;
+            let (inner, n) = sig_type(bytes, at + 1, depth + 1)?;
             let prefix = if tag == 0x0f { "ptr" } else { "byref" };
             return Some((format!("{prefix} {inner}"), 1 + n));
         }
         0x1d => {
-            let (inner, n) = sig_type(bytes, at + 1)?;
+            let (inner, n) = sig_type(bytes, at + 1, depth + 1)?;
             return Some((format!("{inner}[]"), 1 + n));
         }
         0x11 | 0x12 => {
@@ -266,5 +271,37 @@ mod tests {
         let method = [0x00, 0x04, 0x00, 0x01, 0x01, 0x08];
         assert_eq!(property_sig(&method, 1), None);
         assert_eq!(property_sig(&heap, 0), None);
+    }
+
+    #[test]
+    fn a_deeply_nested_signature_does_not_overflow_the_stack() {
+        // Heap: empty index 0, then a property blob of 7000 nested ptr
+        // wrappers around int32. Before the depth cap this aborted with a
+        // stack overflow (exit 134); now it is simply unread past 64.
+        let mut blob = vec![0x08u8, 0x00]; // PROPERTY, index-param count 0
+        for _ in 0..7000 {
+            blob.push(0x0f);
+        }
+        blob.push(0x08); // int32
+        let mut heap = vec![0x00u8]; // blob index 0 is empty
+        let len = blob.len();
+        if len < 0x80 {
+            heap.push(len as u8);
+        } else {
+            heap.push(0x80 | (len >> 8) as u8);
+            heap.push(len as u8);
+        }
+        heap.extend_from_slice(&blob);
+        assert_eq!(property_sig(&heap, 1), None);
+
+        // Just under the cap still decodes: 60 nested ptr around int32.
+        let mut blob = vec![0x08u8, 0x00];
+        for _ in 0..60 {
+            blob.push(0x0f);
+        }
+        blob.push(0x08);
+        let mut heap = vec![0x00u8, blob.len() as u8];
+        heap.extend_from_slice(&blob);
+        assert!(property_sig(&heap, 1).is_some());
     }
 }
