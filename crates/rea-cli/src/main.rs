@@ -76,7 +76,7 @@ enum Command {
     },
     /// Direct call graph over discovered functions.
     Callgraph { path: String },
-    /// Straight-line pseudo-C at a virtual address. Assignments, calls, gotos, and returns. Width-based types on x86_64 and arm64: typed synthetic locals, casts at call arguments and returns. `--arch` selects a Mach-O slice.
+    /// Pseudo-C at a virtual address. Follows an unconditional branch to a direct target inside the enclosing function; a target already listed ends the walk as a `goto`. Assignments, calls, gotos, and returns. Width-based types on x86_64 and arm64: typed synthetic locals, casts at call arguments and returns. `--arch` selects a Mach-O slice.
     Decompile {
         path: String,
         /// Virtual address, hex (0x…) or decimal. Defaults to the entry point.
@@ -106,11 +106,11 @@ enum Command {
     },
     /// Go build info. Go 1.18+ inline blobs and pre-1.18 file offsets. A null or out-of-range offset is an error.
     Goinfo { path: String },
-    /// Mach-O dylibs, UUID, build version, rpaths, code-directory identifier, hash type, team id, hash-slot digests, the CMS blob, whether a sha1 or sha256 of the code directory appears in that blob, an embedded Info.plist, an overlay, architectures, and rpath file hits. The digest check is not an Apple trust decision.
+    /// Mach-O dylibs, UUID, build version, rpaths, code-directory identifier, hash type, team id, hash-slot digests, the CMS blob, whether a sha1 or sha256 of the code directory appears in that blob, an embedded Info.plist, entitlements (top-level XML keys with their immediate values, and the DER slot's byte size), exec-segment flags, an overlay, architectures, and rpath file hits. The digest check is not an Apple trust decision.
     Macho { path: String },
     /// PE subsystem, image base, raw COFF timestamp and its UTC date, data directories, CLR header, metadata streams, table row counts, type names, field names, method names, signatures, IL, parameter names, member-ref names, assembly names, property and event names, CodeView PDB path, resource names, payloads, and an overlay.
     Pe { path: String },
-    /// ELF file type, machine, interpreter, needed libraries, soname, rpath, runpath, GNU build-id, and rpath or runpath file hits.
+    /// ELF file type, machine, interpreter, needed libraries, soname, rpath, runpath, GNU build-id, notes (owner, type name, descriptor), GNU property bits, section `sh_type` names and `SHF_` flags, and rpath or runpath file hits.
     Elf { path: String },
     /// SQLite header, schema, and optional rows of one table. `--wal` replays committed frames before the read.
     Sqlite {

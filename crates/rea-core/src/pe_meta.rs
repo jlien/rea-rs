@@ -167,7 +167,7 @@ pub struct ClrProperty {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ClrEvent {
     pub name: String,
-    /// Event type from the signature blob, such as `int32`. `None` when the blob index is 0 or the blob does not fit.
+    /// The EventType coded index resolved to a name, which stands in for a signature. `None` when the index is 0 or the row does not exist.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
 }
