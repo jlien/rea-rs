@@ -152,7 +152,7 @@
 <main>
   <h1>rea-rs, as of this tree</h1>
   <p class="lede">Local static inspection of Mach-O, ELF, PE, and LE. It follows the pitch of <a href="https://github.com/morluto/rea">morluto/rea</a>. API compatibility is none.</p>
-  <p class="meta" id="now">18 Oct 2026. Newest code commit is <code>afc5729</code>. These commits are on <code>origin/main</code>. The Done table lists them newest first. Upstream tool names were read from <code>morluto/rea</code> <code>src/contracts</code> on 12 Oct 2026.</p>
+  <p class="meta" id="now">25 Oct 2026. Newest code commit is <code>3a413a8</code>. These commits are on <code>tasks-loop</code>. The Done table lists them newest first. Upstream tool names were read from <code>morluto/rea</code> <code>src/contracts</code> on 12 Oct 2026.</p>
   <div class="banner">
     <p><code>cargo test --workspace --offline</code> — rea-core 133 passed, rea-mcp 5 passed, CLI compiled. The build and test runs are warning-free.</p>
   </div>
@@ -162,6 +162,7 @@
   <table>
     <thead><tr><th>Commit</th><th>What it added</th></tr></thead>
     <tbody>
+      <tr><td><code>3a413a8</code></td><td>Dropped the unused <code>mut</code> on the Capstone handle and the test-only <code>metadata_type_names</code> wrapper. Build and test run warning-free.</td></tr>
       <tr><td><code>afc5729</code></td><td>CLR signatures, Assembly and AssemblyRef names, Property and Event names, and a bounded IL listing. Rust v0 and MSVC demangle beside the raw name. WASM type signatures, function bodies, element and data segments, custom payloads, and a fuel-capped i32 interpreter. SQLite rows for one named table and checksummed WAL replay. Bounded pseudo-C, JSON evidence sessions, and export parsers for Hopper, Ghidra, IDA, JEB, Frida, CDP, and adb. A sha1 or sha256 window of the code directory inside the CMS blob. NIBArchive keys and classes, and BOMStore block names. Pre-1.18 Go buildinfo by file offset. Rpath search and a UTC COFF date.</td></tr>
       <tr><td><code>852b43d</code></td><td>A clang Mach-O C++ name <code>__Z3fooi</code> is stored as <code>_Z3fooi</code> and demangles to <code>foo(int)</code>. <code>__Z3barv</code> demangles to <code>bar()</code>.</td></tr>
       <tr><td><code>49ed804</code></td><td>CMS blob, code-directory hash slots, PE resource payload, overlay offset and size, Itanium demangle beside the raw name, 32-bit x86 and ARM/Thumb PC-relative loads, a non-host Mach-O slice, Info.plist and crash identifying text, an app-bundle / nib / asset-catalog kind, and a C header of recovered names.</td></tr>
