@@ -652,6 +652,48 @@ mod tests {
         assert_eq!(sym.demangled.as_deref(), Some("foo::bar"));
     }
 
+    /// Swift stores `_$s…` in the string table. One ABI underscore comes off,
+    /// the raw name stays `$s…`, and the demangled form is `module.name`. A
+    /// name that does not demangle keeps its raw name and no demangled form.
+    #[test]
+    fn swift_symbol_is_demangled_through_load_macho() {
+        let strs = b"\0_$s4main3fooyyF\0_$s4main9\0";
+        let symoff = 56u32;
+        let nsyms = 2u32;
+        let stroff = symoff + nsyms * 16;
+        let mut file = vec![0u8; stroff as usize + strs.len()];
+        file[0..4].copy_from_slice(&0xfeedfacfu32.to_le_bytes());
+        file[4..8].copy_from_slice(&0x01000007u32.to_le_bytes());
+        file[12..16].copy_from_slice(&1u32.to_le_bytes());
+        file[16..20].copy_from_slice(&1u32.to_le_bytes());
+        file[20..24].copy_from_slice(&24u32.to_le_bytes());
+        file[32..36].copy_from_slice(&2u32.to_le_bytes());
+        file[36..40].copy_from_slice(&24u32.to_le_bytes());
+        file[40..44].copy_from_slice(&symoff.to_le_bytes());
+        file[44..48].copy_from_slice(&nsyms.to_le_bytes());
+        file[48..52].copy_from_slice(&stroff.to_le_bytes());
+        file[52..56].copy_from_slice(&(strs.len() as u32).to_le_bytes());
+        write_nlist(&mut file, symoff as usize, 1, 0x0f, 1, 0x1000);
+        write_nlist(&mut file, symoff as usize + 16, 17, 0x0f, 1, 0x1010);
+        file[stroff as usize..].copy_from_slice(strs);
+        let target = load_macho(file, "swift.o".into()).unwrap();
+        let sym = target
+            .symbols
+            .iter()
+            .find(|s| s.name == "$s4main3fooyyF")
+            .expect("raw name");
+        assert_eq!(sym.demangled.as_deref(), Some("main.foo"));
+        let broken = target
+            .symbols
+            .iter()
+            .find(|s| s.name == "$s4main9")
+            .expect("broken");
+        assert_eq!(broken.demangled, None);
+        // Headers still omit Swift names until task 6.1.
+        let header = crate::headers::emit(&target);
+        assert!(!header.contains("main.foo"), "{header}");
+    }
+
     fn macho_with_clang_itanium() -> Vec<u8> {
         let strs = b"\0__Z3fooi\0__Z3barv\0";
         let symoff = 56u32;
