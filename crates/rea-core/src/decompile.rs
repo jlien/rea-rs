@@ -41,6 +41,9 @@ type SlotKey = (u8, i64);
 struct SlotSnap {
     ty: Option<&'static str>,
     at: usize,
+    /// A slot that saw two different types is poisoned: it stays untyped
+    /// even when a later typed store arrives.
+    poisoned: bool,
 }
 
 /// Unconditional-jump hops the window follows within one function.
@@ -730,30 +733,34 @@ fn plan_types(
             let ty = src
                 .filter(|c| deaths.get(c).map_or(true, |k| *k > i))
                 .and_then(|c| types.get(&c).copied());
-            let snap = slots.entry(key).or_insert(SlotSnap { ty: None, at: i });
-            match (snap.ty, ty) {
-                (_, None) => {
-                    snap.ty = None;
-                    snap.at = i;
-                }
-                (Some(old), Some(new)) if old != new => {
-                    snap.ty = None;
-                    snap.at = i;
-                }
-                (None, Some(_)) => {
-                    snap.ty = ty;
-                    snap.at = i;
-                }
-                (Some(_), Some(_)) => snap.at = i,
+            let snap = slots
+                .entry(key)
+                .or_insert(SlotSnap { ty: None, at: i, poisoned: false });
+            // A store poisons the slot when it conflicts with the recorded
+            // type (or carries no type at all); a poisoned slot never
+            // recovers — mixed data landed there for the whole window.
+            let poisoned = snap.poisoned
+                || match (snap.ty, ty) {
+                    (Some(old), Some(new)) => old != new,
+                    (Some(_), None) | (None, None) => true,
+                    (None, Some(_)) => false,
+                };
+            if poisoned {
+                snap.poisoned = true;
+                snap.ty = None;
+                snap.at = i;
+            } else {
+                snap.ty = ty;
+                snap.at = i;
             }
         }
 
-        // A load from a typed slot types (or re-types) its destination
-        // register at this index.
+        // A load from a typed, unpoisoned slot types (or re-types) its
+        // destination register at this index.
         if let Some(key) = slot_load_key(insn, arch) {
             if let Some(snap) = slots.get(&key) {
                 if let Some(ty) = snap.ty {
-                    if slot_reaches(i, snap.at, joins) {
+                    if !snap.poisoned && slot_reaches(i, snap.at, joins) {
                         let dst = slot_load_dest(insn, arch);
                         if let Some(canon) = dst {
                             if types.get(&canon) != Some(&ty) {
@@ -1552,6 +1559,28 @@ mod tests {
         let text = decompile(&target(Arch::X86_64, 64, &code), 0x1000, 16).unwrap();
         assert!(text.contains("int v1;"), "{text}");
         assert!(!text.contains("v2;"), "{text}");
+        assert!(text.contains("rbx = qword ptr [rbp - 8]"), "{text}");
+    }
+
+    #[test]
+    fn x86_64_a_typed_store_after_poison_keeps_the_slot_untyped() {
+        // movsxd rax (int); mov [rbp - 8], rax; movzx edx (uint8_t);
+        // mov [rbp - 8], rdx; movsxd rsi (int); mov [rbp - 8], rsi;
+        // mov rbx, qword ptr [rbp - 8]; ret
+        // The slot saw int then uint8_t; the later int store does not
+        // resurrect it — the slot holds mixed data for the whole window.
+        let code = [
+            0x48, 0x63, 0x05, 0x00, 0x00, 0x00, 0x00, 0x48, 0x89, 0x45, 0xf8, 0x0f, 0xb6, 0x15,
+            0x00, 0x00, 0x00, 0x00, 0x48, 0x89, 0x55, 0xf8, 0x48, 0x63, 0x35, 0x00, 0x00, 0x00,
+            0x00, 0x48, 0x89, 0x75, 0xf8, 0x48, 0x8b, 0x5d, 0xf8, 0xc3,
+        ];
+        let text = decompile(&target(Arch::X86_64, 64, &code), 0x1000, 32).unwrap();
+        assert!(text.contains("int v1;"), "{text}");
+        assert!(text.contains("uint8_t v2;"), "{text}");
+        // rsi is typed int by its own movsxd (v3), but rbx must stay untyped:
+        // the poisoned slot does not re-type it even though the last store
+        // carried an int.
+        assert!(!text.contains("v4"), "{text}");
         assert!(text.contains("rbx = qword ptr [rbp - 8]"), "{text}");
     }
 

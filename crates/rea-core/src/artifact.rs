@@ -406,10 +406,10 @@ fn rendition_facts(
 }
 
 /// Name, dimensions, and pixel format from one CSI header, plus the payload
-/// length after the 184-byte header. The payload bytes themselves stay
-/// unread: on real catalogs that region holds tag-length-value metadata
-/// (tags 1001, 1003, 1010, ...), not raw pixels, so nothing is shown or
-/// decoded from it.
+/// after the 184-byte header: its length, the first 16 bytes as hex, and —
+/// for an `SVG` rendition whose payload is valid UTF-8 — the text itself,
+/// capped at 256 bytes (cut at a char boundary). No bitmap is expanded and
+/// no JPEG is decoded; "Magic alone reconstructs to nothing" stays.
 fn csi_line(bytes: &[u8], address: usize, length: usize) -> Option<String> {
     if length < 184 {
         return None;
@@ -430,11 +430,33 @@ fn csi_line(bytes: &[u8], address: usize, length: usize) -> Option<String> {
         line.push(' ');
     }
     line.push_str(&format!("{width}x{height}"));
-    if let Some(format) = pixel_format(raw) {
+    let format = pixel_format(raw);
+    if let Some(format) = &format {
         line.push(' ');
-        line.push_str(&format);
+        line.push_str(format);
     }
-    line.push_str(&format!(" payload {} bytes", length.saturating_sub(184)));
+    let payload_len = length.saturating_sub(184);
+    line.push_str(&format!(" payload {payload_len} bytes"));
+    if payload_len > 0 {
+        if let Some(payload) = bytes.get(address + 184..address + length) {
+            let head = payload.len().min(16);
+            let hex = payload[..head]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            line.push_str(&format!(" {hex}"));
+            if format.as_deref() == Some("SVG") {
+                if let Ok(text) = std::str::from_utf8(payload) {
+                    let mut end = text.len().min(256);
+                    while end > 0 && !text.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    line.push_str(&format!(" text {}", &text[..end]));
+                }
+            }
+        }
+    }
     Some(line)
 }
 
@@ -591,10 +613,12 @@ mod tests {
     }
 
     #[test]
-    fn csi_payload_length_is_reported_but_bytes_stay_unread() {
+    fn csi_payload_prefix_is_reported() {
         // Same catalog as above, but the CSI block is 232 bytes: 184 header
         // plus 48 payload bytes that look like the tag-length-value metadata a
-        // real catalog carries there. The line reports the length only.
+        // real catalog carries there. The line reports the length and the
+        // first 16 payload bytes as hex; 0x89 0xff 0xfe land at relative
+        // offsets 13-15, so 0x80 falls outside the prefix.
         let mut buf = vec![0u8; 525];
         buf[..8].copy_from_slice(b"BOMStore");
         buf[16..20].copy_from_slice(&32u32.to_be_bytes());
@@ -637,7 +661,67 @@ mod tests {
         let got = reconstruct(&buf).unwrap();
         assert_eq!(
             got.renditions.unwrap(),
-            vec!["icon 32x16 BGRA8 payload 48 bytes".to_string()]
+            vec!["icon 32x16 BGRA8 payload 48 bytes e9 03 00 00 14 00 00 00 00 00 00 00 00 89 ff fe".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_svg_payload_with_valid_utf8_includes_its_text() {
+        // Same catalog shape, but the CSI block names pixel format "SVG " and
+        // the payload is valid UTF-8 (an SVG source prefix): the line carries
+        // the hex prefix and the text, capped at 256 bytes.
+        let svg = b"<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>";
+        let csi_len = 184 + svg.len();
+        let mut buf = vec![0u8; 525];
+        buf[..8].copy_from_slice(b"BOMStore");
+        buf[16..20].copy_from_slice(&32u32.to_be_bytes());
+        buf[24..28].copy_from_slice(&68u32.to_be_bytes());
+        buf[32..36].copy_from_slice(&4u32.to_be_bytes());
+        buf[36..40].copy_from_slice(&104u32.to_be_bytes());
+        buf[40..44].copy_from_slice(&148u32.to_be_bytes());
+        buf[44..48].copy_from_slice(&252u32.to_be_bytes());
+        buf[48..52].copy_from_slice(&21u32.to_be_bytes());
+        buf[52..56].copy_from_slice(&273u32.to_be_bytes());
+        buf[56..60].copy_from_slice(&20u32.to_be_bytes());
+        buf[60..64].copy_from_slice(&293u32.to_be_bytes());
+        buf[64..68].copy_from_slice(&(csi_len as u32).to_be_bytes());
+        // Vars: CARHEADER -> block 0, RENDITIONS -> block 1.
+        buf[68..72].copy_from_slice(&2u32.to_be_bytes());
+        buf[72..76].copy_from_slice(&0u32.to_be_bytes());
+        buf[76] = 9;
+        buf[77..86].copy_from_slice(b"CARHEADER");
+        buf[86..90].copy_from_slice(&1u32.to_be_bytes());
+        buf[90] = 10;
+        buf[91..101].copy_from_slice(b"RENDITIONS");
+        // Tree descriptor and leaf node as before.
+        buf[252..256].copy_from_slice(b"tree");
+        buf[260..264].copy_from_slice(&2u32.to_be_bytes());
+        buf[268..272].copy_from_slice(&1u32.to_be_bytes());
+        buf[273..275].copy_from_slice(&1u16.to_be_bytes());
+        buf[275..277].copy_from_slice(&1u16.to_be_bytes());
+        buf[285..289].copy_from_slice(&3u32.to_be_bytes());
+        buf[289..293].copy_from_slice(&1u32.to_be_bytes());
+        // CSI header: 32x16 SVG named "icon".
+        buf[293..297].copy_from_slice(b"ISTC");
+        buf[305..309].copy_from_slice(&32u32.to_le_bytes());
+        buf[309..313].copy_from_slice(&16u32.to_le_bytes());
+        buf[317..321].copy_from_slice(b"SVG ");
+        buf[333..338].copy_from_slice(b"icon\0");
+        // Payload: the SVG source.
+        buf[477..477 + svg.len()].copy_from_slice(svg);
+        let got = reconstruct(&buf).unwrap();
+        let hex_head = svg[..16]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(
+            got.renditions.unwrap(),
+            vec![format!(
+                "icon 32x16 SVG payload {} bytes {hex_head} text {}",
+                svg.len(),
+                String::from_utf8_lossy(svg)
+            )]
         );
     }
 
