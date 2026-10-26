@@ -65,6 +65,7 @@ rea sqlite database.sqlite --wal database.sqlite-wal
 # Bounded pseudo-C, a session directory, and an export parser
 rea decompile /bin/ls --count 16
 rea session --dir /tmp/rea-session open /bin/ls
+rea session --dir /tmp/rea-session record 1 --tool info "identity check"
 rea bridge status
 
 # All commands emit JSON — pipe anywhere
@@ -90,7 +91,7 @@ rea strings /bin/ls | jq '.count'
 - `rea_elf` — file type, machine, interpreter, needed libraries, soname, rpath, runpath, GNU build-id, and rpath or runpath file hits.
 - `rea_sqlite` — database header, including the application id, and `sqlite_schema` objects. Optional `table` lists capped rows. Optional `wal` replays committed frames before the read.
 - `rea_decompile` — bounded pseudo-C at a virtual address: assignments, calls, gotos, and returns. Not a type-recovering decompiler. Optional `arch` selects a Mach-O slice.
-- `rea_session` — JSON evidence session: open, record a tool and a summary, or diff two sessions. Does not map the binary. `dir` is required. `path` is not.
+- `rea_session` — JSON evidence session: open, record a tool and a summary, or diff two sessions. `open` maps a loadable binary once and records its identity summary in the file; a path that does not load still opens. `record` takes an optional `tool` that re-runs one named rea command against the session's binary and embeds the output, capped at 16 KiB. `dir` is required. `path` is not.
 - `rea_bridge` — PATH presence and export parsers for Hopper, Ghidra, IDA, JEB, Frida, CDP, and adb. Does not launch those programs and does not attach to a process.
 
 Register it with any MCP-capable agent, e.g. Claude Code:

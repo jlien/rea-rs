@@ -152,9 +152,9 @@
 <main>
   <h1>rea-rs, as of this tree</h1>
   <p class="lede">Local static inspection of Mach-O, ELF, PE, and LE. It follows the pitch of <a href="https://github.com/morluto/rea">morluto/rea</a>. API compatibility is none.</p>
-  <p class="meta" id="now">25 Oct 2026. Newest code commit is <code>4baf9f7</code>. These commits are on <code>tasks-loop</code>. The Done table lists them newest first. Upstream tool names were read from <code>morluto/rea</code> <code>src/contracts</code> on 12 Oct 2026.</p>
+  <p class="meta" id="now">25 Oct 2026. Newest code commit is <code>4d5497d</code>. These commits are on <code>tasks-loop</code>. The Done table lists them newest first. Upstream tool names were read from <code>morluto/rea</code> <code>src/contracts</code> on 12 Oct 2026.</p>
   <div class="banner">
-    <p><code>cargo test --workspace --offline</code> — rea-core 138 passed, rea-mcp 5 passed, CLI compiled. The build and test runs are warning-free.</p>
+    <p><code>cargo test --workspace --offline</code> — rea-core 143 passed, rea-mcp 5 passed, CLI compiled. The build and test runs are warning-free.</p>
   </div>
 
   <h2 id="done">Since <code>edb709d</code></h2>
@@ -162,6 +162,7 @@
   <table>
     <thead><tr><th>Commit</th><th>What it added</th></tr></thead>
     <tbody>
+      <tr><td><code>4d5497d</code></td><td><code>rea session open</code> maps a loadable binary once and records its identity summary — format, arch, bits, endianness, entry, section and symbol counts — into the session file; a path that does not load still opens with no summary. <code>record</code> takes an optional <code>tool</code> that re-runs one named command (<code>info</code>, <code>sections</code>, <code>symbols</code>, <code>strings</code>, <code>funcs</code>, <code>disasm</code>) against the session's binary and embeds the output, capped at 16 KiB with a <code>[truncated]</code> marker. <code>diff</code> compares identity evidence and embedded tool output beside the summaries. The file on disk stays the source of truth: nothing is mapped between calls. Not an upstream Evidence record.</td></tr>
       <tr><td><code>4baf9f7</code></td><td>Memory limits carry the shared flag, and imported memories keep their limits on a new <code>imported_memories</code> list. <code>rea wasm --wat</code> prints a WAT-flavored readability listing of what is decoded: sections in order, types, imports, memories, exports, and functions by index with their capped opcode strings; unknown opcodes print as <code>opcode 0xNN</code>. Not a full WAT writer. <code>--execute</code> still does not touch memory.</td></tr>
       <tr><td><code>38f15d2</code></td><td>Field signatures from the <code>#Blob</code> heap beside each field name, and a sequence number beside each <code>Param</code> name. A missing or zero blob index stays empty.</td></tr>
       <tr><td><code>3a413a8</code></td><td>Dropped the unused <code>mut</code> on the Capstone handle and the test-only <code>metadata_type_names</code> wrapper. Build and test run warning-free.</td></tr>
@@ -214,7 +215,7 @@
       <tr><td><code>rea wasm</code><br><code>rea_wasm</code></td><td>Section ids, imports, exports, type signatures, the defined function count, function-body opcodes, element function indexes, data bytes, a capped custom payload, memory min and max with the shared flag, imported memories with their limits, table kind with min and max, the data count, custom section names, and the start index. <code>--execute</code> runs one export. <code>--wat</code> prints a WAT-flavored readability listing of what is decoded; it is not a full WAT writer. The loader still rejects WASM, so the command reads the file itself.</td><td>WASI, memory access at execute time, and host imports. Fuel is 4096 and the call depth is 8. A bad element or data section does not fail the inspect. A bad code section does.</td></tr>
       <tr><td><code>rea goinfo</code><br><code>rea_go</code></td><td>Go 1.18+ inline build info, and pre-1.18 version and module strings reached by file offsets.</td><td>A null or out-of-range offset. That form returns <code>go buildinfo is pointer-based (pre-1.18); not resolved</code>. Host pointers are not dereferenced.</td></tr>
       <tr><td><code>rea sqlite</code><br><code>rea_sqlite</code></td><td>Database header, including the application id, <code>sqlite_schema</code> objects, and rows of one named table. <code>--wal</code> replays checksummed frames through the last valid commit. The loader still rejects a database.</td><td>A missing table. A frame after a salt mismatch or a bad checksum. Page numbers outside <code>1..=1048576</code>. The row cap is 1024. Limit 0 returns no rows.</td></tr>
-      <tr><td><code>rea session</code><br><code>rea_session</code></td><td>JSON session files: open, record a tool and a summary, and diff two sessions. The CLI requires <code>--dir</code>. MCP requires <code>action</code> and <code>dir</code>.</td><td>Mapping the binary. An upstream Evidence record. The files are written only in the directory the caller names.</td></tr>
+      <tr><td><code>rea session</code><br><code>rea_session</code></td><td>JSON session files: open, record a tool and a summary, and diff two sessions. <code>open</code> maps a loadable binary once and records its identity summary in the file; <code>record</code> takes an optional <code>tool</code> that embeds one named command's output, capped at 16 KiB. The CLI requires <code>--dir</code>. MCP requires <code>action</code> and <code>dir</code>.</td><td>An upstream Evidence record. The files are written only in the directory the caller names.</td></tr>
       <tr><td><code>rea bridge</code><br><code>rea_bridge</code></td><td>PATH presence for Hopper, Ghidra, IDA, JEB, Frida, and adb, plus parsers for those exports and for a CDP event line. CDP counts as present because the parser is in-process.</td><td>Launching those programs, attaching to a process, driving a browser, or running adb.</td></tr>
       <tr><td><code>rea mcp</code></td><td>Seventeen tools: the format tools above, plus <code>rea_decompile</code>, <code>rea_session</code>, and <code>rea_bridge</code>. Failures on the load path are text <code>error: …</code>. Unknown methods are JSON-RPC <code>-32601</code>. Sections, disassembly, and decompilation take an optional Mach-O <code>arch</code>.</td><td>Progress notifications. <code>rea_session</code> and <code>rea_bridge</code> do not take a binary path.</td></tr>
       <tr><td><code>rea headers</code></td><td>A C header of recovered local and export names. An Itanium demangle becomes a declaration. The raw name stays on <code>rea symbols</code>.</td><td>Imports, Swift names, a Rust path with no parentheses, and an MSVC <code>?</code> name. CLI only.</td></tr>
@@ -474,7 +475,7 @@
       </tr>
       <tr>
         <td>Session and evidence</td>
-        <td><code>rea_session</code> — JSON open, record, and diff. Each call does not map the binary. The caller names the directory.</td>
+        <td><code>rea_session</code> — JSON open, record, and diff. <code>open</code> maps the binary once for an identity summary; the file on disk stays the source of truth. The caller names the directory.</td>
         <td><code>open_binary</code>, <code>binary_session</code>, <code>get_evidence_bundle</code></td>
         <td><span class="tag part">partial</span></td>
       </tr>
@@ -494,7 +495,7 @@
     <tbody>
       <tr><td>Hopper / Ghidra / IDA bridge</td><td>40</td><td><span class="tag part">parses exports and reports PATH presence. Does not launch the GUI</span></td></tr>
       <tr><td>Enhanced native (overview, ObjC, Swift, value and UI trace)</td><td>12</td><td><span class="tag part">local call graph on x86, x86_64, arm64, Thumb</span></td></tr>
-      <tr><td>Session, evidence, comparisons</td><td>21</td><td><span class="tag part">JSON open, record, and diff. Not an upstream Evidence record. The binary is not kept mapped</span></td></tr>
+      <tr><td>Session, evidence, comparisons</td><td>21</td><td><span class="tag part">JSON open, record, and diff. Not an upstream Evidence record. The binary is mapped once at open, not kept between calls</span></td></tr>
       <tr><td>File-level extras (signature, plist, crash, layout, PE resources)</td><td>12</td><td><span class="tag part">section rwx; Mach-O UUID, build version, rpaths, each slice's code directory, hash slots, CMS blob, a sha1 or sha256 digest window, embedded Info.plist, overlay, and rpath file hits; ELF build-id, file type, machine, and path hits; PE subsystem, image base, raw COFF timestamp and UTC date, directories, CodeView PDB path, resource type, name, language id, data-entry size, payload, and overlay; crash identifying text. Not an Apple trust decision</span></td></tr>
       <tr><td>JavaScript, Electron, web, browser</td><td>32</td><td><span class="tag part">one CDP event line. Does not drive a browser</span></td></tr>
       <tr><td>Android, adb, apktool, JEB</td><td>35</td><td><span class="tag part">adb status lines and JEB method lines, plus PATH presence. Does not run adb or JEB</span></td></tr>
