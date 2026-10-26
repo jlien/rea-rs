@@ -862,6 +862,39 @@ mod tests {
     }
 
     #[test]
+    fn decompiling_a_body_at_a_huge_mapped_address_does_not_panic() {
+        // Regression: function_body computed `start + max`, which overflowed
+        // for a section mapped near u64::MAX. A forward jmp evaluates the
+        // second comparison, so this reaches the former panic site.
+        let mut bytes = vec![0u8; 4096];
+        // jmp +2 (0xeb 0x02): a forward direct target past the jmp itself.
+        bytes[..2].copy_from_slice(&[0xeb, 0x02]);
+        let high = 0xffff_ffff_ffff_0000u64;
+        let t = Target {
+            path: "fixture".into(),
+            format: Format::Elf,
+            arch: Arch::X86_64,
+            bits: 64,
+            little_endian: true,
+            entry: high,
+            sections: vec![Section {
+                name: ".text".into(),
+                addr: high,
+                size: bytes.len() as u64,
+                file_offset: 0,
+                perms: "r-x".into(),
+                sh_type: None,
+                sh_flags: None,
+            }],
+            symbols: Vec::new(),
+            page_map: None,
+            bytes,
+        };
+        let out = decompile(&t, high, 4);
+        assert!(out.is_ok(), "expected Ok, got {out:?}");
+    }
+
+    #[test]
     fn decompiling_an_address_beyond_every_section_is_an_error_not_a_panic() {
         // Regression: function_body used `start + max`, which overflowed for
         // addresses near u64::MAX.

@@ -221,7 +221,7 @@ pub(crate) fn function_body(target: &Target, start: u64, max: u64) -> (u64, Vec<
                 "jmp" | "b" | "br" => {
                     jumped = false;
                     if let Some(t) = direct_target(&ins.operands) {
-                        if t > ins.addr && t < start + max {
+                        if t > ins.addr && t < start.saturating_add(max) {
                             // forward jump inside the body: continue there
                             work.push(t);
                             jumped = true;
@@ -237,7 +237,7 @@ pub(crate) fn function_body(target: &Target, start: u64, max: u64) -> (u64, Vec<
             // chunk ran out without a terminator: keep going linearly
             if let Some(last) = insns.last() {
                 let next = last.addr + last.size as u64;
-                if next < start + max {
+                if next < start.saturating_add(max) {
                     work.push(next);
                 }
             }
