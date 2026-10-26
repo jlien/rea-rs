@@ -20,7 +20,7 @@
 //! conditional join, a type carries only when every incoming path agrees on
 //! it — an unsound join drops the type instead of guessing. A store of a
 //! typed register to a stack slot (`[rbp±N]` / `[rsp±N]` on x86_64,
-//! `[sp, #N]` on arm64) and a later load from that same slot reuse the type:
+//! `[sp, #N]` on arm64; N decimal or Capstone's hex) and a later load from that same slot reuse the type:
 //! the slot itself never becomes a synthetic local, so reloading into the
 //! register that typed the slot stays one local, and a slot written with two
 //! different types — or with unknown data — becomes untyped. Heap addresses,
@@ -852,12 +852,27 @@ fn slot_key_of(mem: &str, arch: Arch) -> Option<SlotKey> {
     let open = mem.find('[')?;
     let close = mem.rfind(']')?;
     let inner = mem[open + 1..close].trim();
+    // Capstone prints displacements in decimal up to |9| and in hex beyond
+    // (0xc, 0x10, ...), so accept either radix.
+    let parse_disp = |s: &str| -> Option<i64> {
+        let s = s.trim();
+        let (neg, digits) = match s.strip_prefix('-') {
+            Some(rest) => (true, rest),
+            None => (false, s),
+        };
+        let n = if let Some(hex) = digits.strip_prefix("0x").or_else(|| digits.strip_prefix("0X")) {
+            i64::from_str_radix(hex, 16).ok()?
+        } else {
+            digits.parse::<i64>().ok()?
+        };
+        Some(if neg { -n } else { n })
+    };
     match arch {
         Arch::X86_64 => {
             let flat: String = inner.chars().filter(|c| !c.is_whitespace()).collect();
             let (base, disp) = match flat.find(['+', '-']) {
                 Some(p) => {
-                    let n: i64 = flat[p + 1..].parse().ok()?;
+                    let n = parse_disp(&flat[p + 1..])?;
                     let disp = if flat[p..].starts_with('-') { -n } else { n };
                     (&flat[..p], disp)
                 }
@@ -878,7 +893,7 @@ fn slot_key_of(mem: &str, arch: Arch) -> Option<SlotKey> {
                 None => Some((2, 0)),
                 Some(off) => {
                     let off = off.trim().strip_prefix('#')?.trim();
-                    Some((2, off.parse::<i64>().ok()?))
+                    Some((2, parse_disp(off)?))
                 }
             }
         }
@@ -1681,6 +1696,22 @@ mod tests {
         // poisoned slot must not re-type the load's destination.
         assert!(!text.contains("v2 = qword ptr [rbp - 8]"), "{text}");
         assert!(text.contains("rbx = qword ptr [rbp - 8]"), "{text}");
+    }
+
+    #[test]
+    fn x86_64_a_hex_displacement_is_a_slot() {
+        // movsxd rax (int); mov [rbp - 0x10], rax (Capstone prints this
+        // displacement in hex); mov rbx, qword ptr [rbp - 0x10]; ret.
+        // The slot must type through in hex exactly as it does in decimal.
+        let code = [
+            0x48, 0x63, 0x05, 0x00, 0x00, 0x00, 0x00, 0x48, 0x89, 0x45, 0xf0, 0x48, 0x8b, 0x5d,
+            0xf0, 0xc3,
+        ];
+        let text = decompile(&target(Arch::X86_64, 64, &code), 0x1000, 16).unwrap();
+        assert!(text.contains("int v1;"), "{text}");
+        // rbx reuses the slot's int local instead of staying raw; the
+        // load line is spelled with Capstone's hex displacement.
+        assert!(text.contains("v2 = qword ptr [rbp - 0x10]"), "{text}");
     }
 
     #[test]
