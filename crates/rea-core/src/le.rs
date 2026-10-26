@@ -3,9 +3,11 @@
 //! cross-checked against the OS/2 `exe386` structure definitions
 //! (E32_* / O32_* fields).
 //!
-//! Scope: object table, page map, entry point, internal fixups, and
-//! page-granular vaddr→file-offset translation (enough for info/sections/disasm).
-//! Entry bundles and iterated (compressed) pages are not yet handled.
+//! Scope: object table, page map, entry table (bundle types 0-3; forwarder
+//! and unrecognized bundle flags are counted and skipped), entry point,
+//! internal fixups, and page-granular vaddr→file-offset translation (enough
+//! for info/sections/disasm). Iterated (compressed) pages are not yet
+//! handled.
 
 use crate::{Arch, Error, Result, Section};
 
@@ -66,7 +68,7 @@ impl LePages {
         })?;
         let off = vaddr - u64::from(obj.base);
         let idx = (off / pagesize) as usize;
-        if idx >= obj.mapsize as usize {
+        if idx >= obj.mapsize as usize || obj.pagemap == 0 {
             return None;
         }
         let page = u64::from(*self.pages.get(obj.pagemap as usize - 1 + idx)?);
@@ -108,6 +110,28 @@ impl LePages {
     }
 }
 
+/// One entry-table entry: an ordinal's object index and offset.
+#[derive(Debug, Clone)]
+pub struct LeEntry {
+    /// 1-based entry-table ordinal (numbering runs across all bundles,
+    /// including bundles of unused entries).
+    pub ordinal: u32,
+    /// 1-based object number the entry points into.
+    pub object: u32,
+    /// Offset within that object.
+    pub offset: u32,
+}
+
+/// A bundle flag the walker does not map to an entry, with the number of
+/// entries it consumed from the ordinal sequence. Type 4 (forwarder) bundles
+/// name no object of this module; flags past the defined types end parsing
+/// because their on-disk size is unknown.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SkippedBundle {
+    pub flag: u8,
+    pub entries: u32,
+}
+
 /// Fixup records. A source-offset list (`src_flags & 0x20`) is stored after
 /// the target tail: the target is variable-length and has to be parsed first.
 const F_SOURCE_TYPE_MASK: u8 = 0xF;
@@ -135,6 +159,10 @@ pub struct LeImage {
     frectab: u32,
     /// Number of pages (bounds the fixup page table).
     mpages: u32,
+    /// Entry-table entries in ordinal order (bundle types 0-3).
+    pub entries: Vec<LeEntry>,
+    /// Bundle flags that produced no entry, each with its entry count.
+    pub skipped_bundles: Vec<SkippedBundle>,
 }
 
 /// Quick detection: MZ stub with a locatable LE overlay header.
@@ -199,6 +227,90 @@ pub fn find_le_header(bytes: &[u8]) -> Option<usize> {
     None
 }
 
+/// Parse the entry table at `entrytab` (header-relative, 0 = absent).
+/// Bundles are `CNT|TYPE` pairs; CNT 0 terminates the table. Types 0-3 are
+/// consumed per the OS/2 `exe386` layout; anything else is recorded as
+/// skipped and ends the walk because its on-disk size is unknown.
+fn parse_entry_table(
+    bytes: &[u8],
+    header_off: usize,
+    entrytab: u32,
+) -> Result<(Vec<LeEntry>, Vec<SkippedBundle>)> {
+    fn truncated() -> Error {
+        Error::Parse("le: truncated entry table".into())
+    }
+    let mut entries = Vec::new();
+    let mut skipped = Vec::new();
+    if entrytab == 0 {
+        return Ok((entries, skipped));
+    }
+    let mut off = header_off.checked_add(entrytab as usize).ok_or_else(truncated)?;
+    let mut ordinal = 1u32;
+    loop {
+        if off + 2 > bytes.len() {
+            return Err(truncated());
+        }
+        let cnt = bytes[off] as u32;
+        let flag = bytes[off + 1];
+        if cnt == 0 {
+            break;
+        }
+        off += 2;
+        match flag {
+            // Unused entries: ordinals advance, nothing to report.
+            0 => ordinal += cnt,
+            1 | 2 => {
+                let object = u16_at(bytes, off)? as u32;
+                off += 2;
+                // Type 1 adds a flags byte + u16 offset (3); type 2 a call
+                // gate (5) — same object/offset shape, larger stride.
+                let stride = if flag == 1 { 3 } else { 5 };
+                for _ in 0..cnt {
+                    let offset = u16_at(bytes, off + 1)? as u32;
+                    entries.push(LeEntry {
+                        ordinal,
+                        object,
+                        offset,
+                    });
+                    ordinal += 1;
+                    off += stride;
+                }
+            }
+            3 => {
+                let object = u16_at(bytes, off)? as u32;
+                off += 2;
+                for _ in 0..cnt {
+                    // Per-entry layout: FLAGS u8, then OFFSET u32.
+                    let offset = u32_at(bytes, off + 1)?;
+                    entries.push(LeEntry {
+                        ordinal,
+                        object,
+                        offset,
+                    });
+                    ordinal += 1;
+                    off += 5;
+                }
+            }
+            other => {
+                skipped.push(SkippedBundle {
+                    flag: other,
+                    entries: cnt,
+                });
+                if other == 4 {
+                    // Forwarder: reserved u16 + (flags, module ordinal,
+                    // offset/ordinal) per entry. Known size, no object of
+                    // this module; ordinals still advance.
+                    off += 2 + cnt as usize * 7;
+                    ordinal += cnt;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+    Ok((entries, skipped))
+}
+
 impl LeImage {
     /// Parse an LE image from raw file bytes (including the DOS stub).
     pub fn parse(bytes: &[u8]) -> Result<LeImage> {
@@ -221,6 +333,7 @@ impl LeImage {
         let objtab = h(0x40)? as usize;
         let objcnt = h(0x44)?;
         let objmap = h(0x48)? as usize;
+        let entrytab = h(0x5c)?;
         let fpagetab = h(0x68)?;
         let frectab = h(0x6c)?;
         let datapage = h(0x80)?;
@@ -250,6 +363,8 @@ impl LeImage {
             pages.push((e >> 16) as u16);
         }
 
+        let (entries, skipped_bundles) = parse_entry_table(bytes, header_off, entrytab)?;
+
         let start = &objects[startobj as usize - 1];
         let entry = if eip >= start.base {
             u64::from(eip) // DOS/4GW: absolute linear EIP
@@ -270,6 +385,8 @@ impl LeImage {
             fpagetab,
             frectab,
             mpages,
+            entries,
+            skipped_bundles,
         })
     }
 
@@ -514,6 +631,21 @@ impl LeImage {
         true
     }
 
+    /// Linear address of each entry-table entry (object base + offset), in
+    /// ordinal order. `None` when the entry's object number is out of range.
+    /// Not seeded into function discovery.
+    pub fn entry_addresses(&self) -> Vec<Option<u64>> {
+        self.entries
+            .iter()
+            .map(|e| {
+                self.pages
+                    .objects
+                    .get(e.object.checked_sub(1)? as usize)
+                    .map(|o| u64::from(o.base) + u64::from(e.offset))
+            })
+            .collect()
+    }
+
     pub fn arch(&self) -> Arch {
         // e32_cpu: 1 = 80286, 2 = 80386, 3 = 80486 (all disassemble as x86).
         match self.cpu {
@@ -534,7 +666,10 @@ impl LeImage {
                 let kind = if o.flags & 0x4 != 0 { "code" } else { "data" };
                 // Offset of the object's first mapped page (approximate for
                 // display; exact translation goes through the page map).
-                let file_offset = if o.mapsize > 0 && (o.pagemap as usize) <= self.pages.pages.len()
+                let file_offset = if o.mapsize > 0
+                    && o.pagemap >= 1
+                    && (o.pagemap as usize) <= self.pages.pages.len()
+                    && self.pages.pages[o.pagemap as usize - 1] != 0
                 {
                     let page = u64::from(self.pages.pages[o.pagemap as usize - 1]);
                     self.pages.header_off as u64
@@ -603,6 +738,42 @@ mod tests {
     }
 
     #[test]
+    fn an_object_with_a_zero_pagemap_does_not_panic_sections() {
+        // mpages 0, one object with pagemap 0 and mapsize 1: the page map has
+        // no slot to look up, so the object's file offset stays 0 instead of
+        // underflowing the index — in sections() and in translate() (which
+        // vaddr_to_offset and disasm reach through the loaded image).
+        let mut b = synthetic();
+        b[0x40 + 0x14..0x40 + 0x18].copy_from_slice(&0u32.to_le_bytes()); // mpages 0
+        let o = 0x40 + 0xC0;
+        b[o + 12..o + 16].copy_from_slice(&0u32.to_le_bytes()); // pagemap 0
+        let img = LeImage::parse(&b).unwrap();
+        let secs = img.sections();
+        assert_eq!(secs.len(), 1);
+        assert_eq!(secs[0].file_offset, 0);
+        // The entry (0x400005) sits inside the pagemap-0 object: translate
+        // must return None, not underflow `pagemap - 1`.
+        assert_eq!(img.pages.translate(0x400005), None);
+        assert_eq!(img.pages.translate(0x400000), None);
+    }
+
+    #[test]
+    fn a_zero_page_number_keeps_the_section_offset_at_zero() {
+        // mpages 1, pagemap 1, mapsize 1, but the page-map slot's high u16
+        // (the 1-based page number) is 0: sections() must not compute
+        // (page - 1) * pagesize from it. The fixture zeroes the slot the
+        // synthetic image wrote.
+        let mut b = synthetic();
+        b[0x40 + 0xD8..0x40 + 0xDC].copy_from_slice(&0u32.to_le_bytes());
+        let img = LeImage::parse(&b).unwrap();
+        let secs = img.sections();
+        assert_eq!(secs.len(), 1);
+        assert_eq!(secs[0].file_offset, 0);
+        // translate() already refused page number 0 before this fix.
+        assert_eq!(img.pages.translate(0x400000), None);
+    }
+
+    #[test]
     fn parses_synthetic_le() {
         let b = synthetic();
         assert!(is_le(&b));
@@ -622,6 +793,96 @@ mod tests {
         assert_eq!(secs[0].addr, 0x400000);
         let mut owned = b.clone();
         assert_eq!(img.apply_fixups(&mut owned).unwrap(), 0);
+        // No entry table is pointed at: none parsed.
+        assert!(img.entries.is_empty());
+        assert!(img.skipped_bundles.is_empty());
+        assert!(img.entry_addresses().is_empty());
+    }
+
+    /// Rewrite the synthetic image with an entry table at `entrytab`
+    /// (header-relative). The synthetic header leaves le+0x5c..0x64 free
+    /// between the resident-name slot and the fixup table slots.
+    fn with_entry_table(entrytab: u32, table: &[u8]) -> Vec<u8> {
+        let mut b = synthetic();
+        let le = 0x40usize;
+        assert!(entrytab as usize >= 0xDC || entrytab == 0, "collides with header tables");
+        b[le + 0x5c..le + 0x60].copy_from_slice(&entrytab.to_le_bytes());
+        let at = le + entrytab as usize;
+        b[at..at + table.len()].copy_from_slice(table);
+        b
+    }
+
+    #[test]
+    fn entry_bundles_report_object_index_and_offset() {
+        // Ordinal 1: unused (count 2 skips ordinals 1-2), then a 32-bit
+        // bundle (ordinals 3-4), a 16-bit bundle (ordinal 5), and a
+        // terminator.
+        let table = [
+            0x02, 0x00, // 2 unused entries
+            0x02, 0x03, 0x01, 0x00, // 32-bit bundle, object 1
+            0x00, 0x10, 0x00, 0x00, 0x00, // ordinal 3: flags 0, offset 0x10
+            0x00, 0x28, 0x00, 0x00, 0x00, // ordinal 4: flags 0, offset 0x28
+            0x01, 0x01, 0x01, 0x00, // 16-bit bundle, object 1
+            0x40, 0x40, 0x00, // ordinal 5: flags 0x40, offset 0x40
+            0x00, // terminator
+        ];
+        let b = with_entry_table(0x110, &table);
+        let img = LeImage::parse(&b).unwrap();
+        assert_eq!(img.entries.len(), 3);
+        assert_eq!(img.entries[0].ordinal, 3);
+        assert_eq!(img.entries[0].object, 1);
+        assert_eq!(img.entries[0].offset, 0x10);
+        assert_eq!(img.entries[1].ordinal, 4);
+        assert_eq!(img.entries[1].offset, 0x28);
+        assert_eq!(img.entries[2].ordinal, 5);
+        assert_eq!(img.entries[2].offset, 0x40);
+        assert!(img.skipped_bundles.is_empty());
+        assert_eq!(
+            img.entry_addresses(),
+            vec![
+                Some(0x400010),
+                Some(0x400028),
+                Some(0x400040),
+            ]
+        );
+    }
+
+    #[test]
+    fn unrecognized_bundle_flag_is_counted_and_skipped() {
+        // A bundle with the parameter-typing bit (0x80 | 0x03) names no
+        // layout this task maps: it is counted and the walk stops there.
+        let table = [
+            0x01, 0x03, 0x01, 0x00, // 32-bit bundle, object 1
+            0x00, 0x14, 0x00, 0x00, 0x00, // ordinal 1: flags 0, offset 0x14
+            0x01, 0x83, 0x77, // unknown flag 0x83, 1 entry
+        ];
+        let b = with_entry_table(0x110, &table);
+        let img = LeImage::parse(&b).unwrap();
+        assert_eq!(img.entries.len(), 1);
+        assert_eq!(img.entries[0].ordinal, 1);
+        assert_eq!(img.skipped_bundles, vec![SkippedBundle { flag: 0x83, entries: 1 }]);
+    }
+
+    #[test]
+    fn forwarder_bundle_advances_ordinals_without_an_object() {
+        // Type 4 forwarder: reserved u16, then (flags, module ordinal u16,
+        // offset/ordinal u32) per entry. Ordinals 2-3 are forwarded; ordinal
+        // 1 stays internal.
+        let table = [
+            0x01, 0x03, 0x01, 0x00, // 32-bit bundle, object 1
+            0x00, 0x0c, 0x00, 0x00, 0x00, // ordinal 1: flags 0, offset 0x0c
+            0x02, 0x04, 0x00, 0x00, // 2 forwarders, reserved u16
+            0x01, 0x01, 0x00, 0x08, 0x00, 0x00, 0x00, // forwarder 1
+            0x01, 0x02, 0x10, 0x00, 0x00, 0x00, 0x00, // forwarder 2
+            0x00, // terminator
+        ];
+        let b = with_entry_table(0x110, &table);
+        let img = LeImage::parse(&b).unwrap();
+        assert_eq!(img.entries.len(), 1);
+        assert_eq!(img.entries[0].ordinal, 1);
+        assert_eq!(img.entries[0].offset, 0x0c);
+        // Forwarders name no object of this module: counted and skipped.
+        assert_eq!(img.skipped_bundles, vec![SkippedBundle { flag: 4, entries: 2 }]);
     }
 
     /// Fixup page table + records in the gap between the page map and the data page.

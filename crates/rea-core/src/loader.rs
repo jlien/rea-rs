@@ -35,6 +35,17 @@ pub fn load_arch(path: impl AsRef<Path>, arch: Option<&str>) -> Result<Target> {
         return load_wasm(bytes, path_str);
     }
 
+    // A database is identified by its 100-byte header: `sqlite::header`
+    // accepting the file is the whole identity check. Rows, the WAL, and the
+    // caps stay on `rea sqlite`, which reads the file itself.
+    if bytes.starts_with(b"SQLite format 3\0") {
+        if arch.is_some() {
+            return Err(Error::Parse("arch selection is mach-o only".into()));
+        }
+        crate::sqlite::header(&bytes)?;
+        return load_sqlite(bytes, path_str);
+    }
+
     match {
         let mut cursor = std::io::Cursor::new(&*bytes);
         goblin::peek(&mut cursor).map_err(|e| Error::Parse(format!("peek failed: {e}")))?
@@ -63,6 +74,24 @@ fn load_wasm(bytes: Vec<u8>, path: String) -> Result<Target> {
         format: Format::Wasm,
         arch: Arch::Unknown,
         bits: 32,
+        little_endian: true,
+        entry: 0,
+        sections: Vec::new(),
+        symbols: Vec::new(),
+        bytes,
+        page_map: None,
+    })
+}
+
+/// A database loads as an identity target: no sections, no symbols, and no
+/// entry. `sqlite::header` and `sqlite::schema` read the loaded bytes for
+/// `rea info`; rows, the WAL, and the caps stay on `rea sqlite`.
+fn load_sqlite(bytes: Vec<u8>, path: String) -> Result<Target> {
+    Ok(Target {
+        path,
+        format: Format::Sqlite,
+        arch: Arch::Unknown,
+        bits: 64,
         little_endian: true,
         entry: 0,
         sections: Vec::new(),
@@ -623,6 +652,48 @@ mod tests {
         assert_eq!(sym.demangled.as_deref(), Some("foo::bar"));
     }
 
+    /// Swift stores `_$s…` in the string table. One ABI underscore comes off,
+    /// the raw name stays `$s…`, and the demangled form is `module.name`. A
+    /// name that does not demangle keeps its raw name and no demangled form.
+    #[test]
+    fn swift_symbol_is_demangled_through_load_macho() {
+        let strs = b"\0_$s4main3fooyyF\0_$s4main9\0";
+        let symoff = 56u32;
+        let nsyms = 2u32;
+        let stroff = symoff + nsyms * 16;
+        let mut file = vec![0u8; stroff as usize + strs.len()];
+        file[0..4].copy_from_slice(&0xfeedfacfu32.to_le_bytes());
+        file[4..8].copy_from_slice(&0x01000007u32.to_le_bytes());
+        file[12..16].copy_from_slice(&1u32.to_le_bytes());
+        file[16..20].copy_from_slice(&1u32.to_le_bytes());
+        file[20..24].copy_from_slice(&24u32.to_le_bytes());
+        file[32..36].copy_from_slice(&2u32.to_le_bytes());
+        file[36..40].copy_from_slice(&24u32.to_le_bytes());
+        file[40..44].copy_from_slice(&symoff.to_le_bytes());
+        file[44..48].copy_from_slice(&nsyms.to_le_bytes());
+        file[48..52].copy_from_slice(&stroff.to_le_bytes());
+        file[52..56].copy_from_slice(&(strs.len() as u32).to_le_bytes());
+        write_nlist(&mut file, symoff as usize, 1, 0x0f, 1, 0x1000);
+        write_nlist(&mut file, symoff as usize + 16, 17, 0x0f, 1, 0x1010);
+        file[stroff as usize..].copy_from_slice(strs);
+        let target = load_macho(file, "swift.o".into()).unwrap();
+        let sym = target
+            .symbols
+            .iter()
+            .find(|s| s.name == "$s4main3fooyyF")
+            .expect("raw name");
+        assert_eq!(sym.demangled.as_deref(), Some("main.foo"));
+        let broken = target
+            .symbols
+            .iter()
+            .find(|s| s.name == "$s4main9")
+            .expect("broken");
+        assert_eq!(broken.demangled, None);
+        // Headers still omit Swift names until task 6.1.
+        let header = crate::headers::emit(&target);
+        assert!(!header.contains("main.foo"), "{header}");
+    }
+
     fn macho_with_clang_itanium() -> Vec<u8> {
         let strs = b"\0__Z3fooi\0__Z3barv\0";
         let symoff = 56u32;
@@ -749,6 +820,71 @@ mod tests {
         std::fs::write(&path, b"\0asm\x01").unwrap();
         let err = super::load(&path).unwrap_err().to_string();
         assert!(err.contains("peek failed"), "{err}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// One 512-byte page: application id `0x01020304`, and a leaf schema
+    /// b-tree with one row — table `notes`, root page 2, NULL SQL.
+    fn sqlite_db() -> Vec<u8> {
+        let mut db = vec![0u8; 512];
+        db[..16].copy_from_slice(b"SQLite format 3\0");
+        db[16..18].copy_from_slice(&512u16.to_be_bytes());
+        db[18] = 1;
+        db[19] = 1;
+        db[21] = 64;
+        db[22] = 32;
+        db[23] = 32;
+        db[28..32].copy_from_slice(&1u32.to_be_bytes());
+        db[44..48].copy_from_slice(&4u32.to_be_bytes());
+        db[56..60].copy_from_slice(&1u32.to_be_bytes());
+        db[68..72].copy_from_slice(&0x0102_0304u32.to_be_bytes());
+        // Record: header size 6, three text-5 serial types (2*5+13=23),
+        // one int8, one NULL; body is table/name/table plus the root page.
+        let mut payload: Vec<u8> = vec![6, 23, 23, 23, 1, 0];
+        payload.extend_from_slice(b"tablenotesnotes");
+        payload.push(2);
+        let mut cell = vec![payload.len() as u8, 1];
+        cell.extend_from_slice(&payload);
+        let at = 512 - cell.len();
+        db[at..at + cell.len()].copy_from_slice(&cell);
+        db[100] = 0x0d; // leaf table b-tree
+        db[103..105].copy_from_slice(&1u16.to_be_bytes());
+        db[105..107].copy_from_slice(&(at as u16).to_be_bytes());
+        db[108..110].copy_from_slice(&(at as u16).to_be_bytes());
+        db
+    }
+
+    #[test]
+    fn sqlite_loads_as_an_identity_target() {
+        let bytes = sqlite_db();
+        let path = std::env::temp_dir().join(format!("rea-sqlite-id-{}.db", std::process::id()));
+        std::fs::write(&path, &bytes).unwrap();
+        let target = super::load(&path).unwrap();
+        assert_eq!(target.format, crate::Format::Sqlite);
+        assert_eq!(target.format.as_str(), "sqlite");
+        assert_eq!(target.arch, crate::Arch::Unknown);
+        assert_eq!(target.bits, 64);
+        assert!(target.little_endian);
+        assert_eq!(target.entry, 0);
+        assert!(target.sections.is_empty());
+        assert!(target.symbols.is_empty());
+        // `rea info` reads the header and the schema out of the loaded bytes.
+        let hdr = crate::sqlite::header(&target.bytes).unwrap();
+        assert_eq!(hdr.application_id, 0x0102_0304);
+        assert_eq!(crate::sqlite::schema(&target.bytes).unwrap().len(), 1);
+        // Native-code commands reject the target, and so does `--arch`.
+        assert!(target.require_native().is_err());
+        let err = super::load_arch(&path, Some("arm64")).unwrap_err().to_string();
+        assert!(err.contains("mach-o only"), "{err}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_magic_prefix_that_the_header_rejects_does_not_load() {
+        let path = std::env::temp_dir().join(format!("rea-sqlite-short-{}.db", std::process::id()));
+        std::fs::write(&path, b"SQLite format 3\0junk").unwrap();
+        let err = super::load(&path).unwrap_err().to_string();
+        assert!(err.contains("not a database header"), "{err}");
         let _ = std::fs::remove_file(&path);
     }
 

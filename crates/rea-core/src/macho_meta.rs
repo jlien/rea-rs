@@ -27,6 +27,12 @@ pub struct MachoFacts {
     pub entitlements_der_size: Option<u32>,
     /// `__info_plist` section, when its identifying keys are present.
     pub info_plist: Option<crate::plist::PlistInfo>,
+    /// NUL-terminated printable C strings from every section whose name contains `objc`
+    /// (class names, method names, type strings), in file order, capped at
+    /// [`OBJC_STRINGS_CAP`] with a trailing `... N more` marker. A section that holds
+    /// pointers instead of characters contributes nothing. No `class_ro_t`, method list,
+    /// or protocol is walked.
+    pub objc_strings: Vec<String>,
     /// Bytes past the last segment's file range.
     pub overlay: Option<crate::Overlay>,
 }
@@ -116,6 +122,8 @@ pub struct MachoArch {
     pub entitlements_der_size: Option<u32>,
     /// `__info_plist` of this slice.
     pub info_plist: Option<crate::plist::PlistInfo>,
+    /// ObjC strings of this slice, same shape as [`MachoFacts::objc_strings`].
+    pub objc_strings: Vec<String>,
     /// Bytes past this slice's last segment.
     pub overlay: Option<crate::Overlay>,
 }
@@ -139,6 +147,7 @@ pub fn facts(bytes: &[u8]) -> Result<MachoFacts> {
         entitlements: body.entitlements,
         entitlements_der_size: body.entitlements_der_size,
         info_plist: body.info_plist,
+        objc_strings: body.objc_strings,
         overlay: body.overlay,
     })
 }
@@ -157,6 +166,7 @@ struct SliceBody {
     entitlements: Option<MachoEntitlements>,
     entitlements_der_size: Option<u32>,
     info_plist: Option<crate::plist::PlistInfo>,
+    objc_strings: Vec<String>,
     overlay: Option<crate::Overlay>,
 }
 
@@ -206,6 +216,7 @@ fn slice_body(mo: &goblin::mach::MachO, bytes: &[u8]) -> SliceBody {
         entitlements,
         entitlements_der_size,
         info_plist: embedded_plist(mo),
+        objc_strings: objc_strings(mo),
         overlay: crate::trailing_overlay(segment_file_end(mo), bytes.len() as u64),
     }
 }
@@ -236,6 +247,56 @@ fn embedded_plist(mo: &goblin::mach::MachO) -> Option<crate::plist::PlistInfo> {
         }
     }
     None
+}
+
+const OBJC_STRINGS_CAP: usize = 128;
+
+/// NUL-terminated printable C strings from every section whose name contains `objc`,
+/// in file order. A section that holds pointers rather than characters (for example
+/// `__objc_classlist`) yields no printable runs and contributes nothing; no `class_ro_t`,
+/// method list, or protocol is walked, and Swift names are not demangled.
+fn objc_strings(mo: &goblin::mach::MachO) -> Vec<String> {
+    let mut hits: Vec<String> = Vec::new();
+    for seg in mo.segments.iter() {
+        let Ok(sections) = seg.sections() else {
+            continue;
+        };
+        for (sect, data) in sections {
+            let name: String = sect
+                .sectname
+                .iter()
+                .take_while(|b| **b != 0)
+                .map(|b| *b as char)
+                .collect();
+            if !name.to_ascii_lowercase().contains("objc") {
+                continue;
+            }
+            let mut start = None;
+            for (i, &b) in data.iter().enumerate() {
+                if (0x20..=0x7e).contains(&b) {
+                    if start.is_none() {
+                        start = Some(i);
+                    }
+                } else if b == 0 {
+                    if let Some(s) = start.take() {
+                        if i > s {
+                            hits.push(String::from_utf8_lossy(&data[s..i]).into_owned());
+                        }
+                    }
+                } else {
+                    start = None;
+                }
+            }
+            // A printable run ending at the section's last byte with no NUL is not
+            // NUL-terminated and stays unread.
+        }
+    }
+    if hits.len() > OBJC_STRINGS_CAP {
+        let more = hits.len() - OBJC_STRINGS_CAP;
+        hits.truncate(OBJC_STRINGS_CAP);
+        hits.push(format!("... {more} more"));
+    }
+    hits
 }
 
 const CSMAGIC_EMBEDDED_SIGNATURE: u32 = 0xfade_0cc0;
@@ -751,6 +812,7 @@ fn arch_of(cpu: String, offset: u64, size: u64, slice: &[u8]) -> MachoArch {
         entitlements: body.entitlements,
         entitlements_der_size: body.entitlements_der_size,
         info_plist: body.info_plist,
+        objc_strings: body.objc_strings,
         overlay: body.overlay,
     }
 }
@@ -781,6 +843,7 @@ fn empty_slice() -> SliceBody {
         entitlements: None,
         entitlements_der_size: None,
         info_plist: None,
+        objc_strings: Vec::new(),
         overlay: None,
     }
 }
@@ -857,6 +920,7 @@ mod tests {
                 entitlements: None,
                 entitlements_der_size: None,
                 info_plist: None,
+                objc_strings: Vec::new(),
                 overlay: None,
             }]
         );
@@ -895,6 +959,7 @@ mod tests {
                 entitlements: None,
                 entitlements_der_size: None,
                 info_plist: None,
+                objc_strings: Vec::new(),
                 overlay: None,
             }]
         );
@@ -1797,6 +1862,56 @@ mod tests {
         assert_eq!(info.bundle_id.as_deref(), Some("com.example.bplist"));
         assert_eq!(info.bundle_name.as_deref(), Some("Example"));
         assert_eq!(info.bundle_version.as_deref(), None);
+    }
+
+    #[test]
+    fn reads_objc_class_name_strings_from_the_named_section() {
+        let body = b"NSObject\0UIViewController\0_something\0";
+        let file = segment_slice(0x0100_000c, "__objc_classname", body, b"");
+        let got = facts(&file).unwrap();
+        assert_eq!(
+            got.objc_strings,
+            vec!["NSObject".to_string(), "UIViewController".to_string(), "_something".to_string()]
+        );
+        assert_eq!(architectures(&file).unwrap()[0].objc_strings, got.objc_strings);
+    }
+
+    #[test]
+    fn objc_strings_skip_non_name_sections_and_untagged_runs() {
+        // A pointer section (`__objc_classlist` holds 8-byte pointers): the bytes are
+        // not printable runs ending in NUL, so the list stays empty.
+        let pointers = 0u64.to_le_bytes();
+        let file = segment_slice(0x0100_000c, "__objc_classlist", &pointers, b"");
+        assert_eq!(facts(&file).unwrap().objc_strings, Vec::<String>::new());
+
+        // A non-objc section with the same bytes contributes nothing.
+        let text = b"NSObject\0";
+        let file = segment_slice(0x0100_000c, "__cstring", text, b"");
+        assert_eq!(facts(&file).unwrap().objc_strings, Vec::<String>::new());
+
+        // A printable run with no terminating NUL is not a C string and stays unread.
+        let unterminated = b"NSObject";
+        let file = segment_slice(0x0100_000c, "__objc_classname", unterminated, b"");
+        assert_eq!(facts(&file).unwrap().objc_strings, Vec::<String>::new());
+
+        // An empty section and a section whose bytes cannot be read leave an empty
+        // list and do not fail the parse.
+        let file = segment_slice(0x0100_000c, "__objc_methname", b"", b"");
+        assert_eq!(facts(&file).unwrap().objc_strings, Vec::<String>::new());
+    }
+
+    #[test]
+    fn objc_strings_cap_at_128_with_a_more_marker() {
+        let mut body = Vec::new();
+        for i in 0..140 {
+            body.extend_from_slice(format!("Cls{i}\0").as_bytes());
+        }
+        let file = segment_slice(0x0100_000c, "__objc_classname", &body, b"");
+        let got = facts(&file).unwrap();
+        assert_eq!(got.objc_strings.len(), 129);
+        assert_eq!(got.objc_strings[0], "Cls0");
+        assert_eq!(got.objc_strings[127], "Cls127");
+        assert_eq!(got.objc_strings[128], "... 12 more");
     }
 
     /// One 64-bit `__TEXT` segment. `extra` is past `filesize`.

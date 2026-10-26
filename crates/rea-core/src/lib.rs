@@ -34,6 +34,8 @@ pub enum Format {
     Le,
     /// WebAssembly binary module.
     Wasm,
+    /// SQLite database file.
+    Sqlite,
 }
 
 impl Format {
@@ -44,6 +46,7 @@ impl Format {
             Format::Pe => "pe",
             Format::Le => "le",
             Format::Wasm => "wasm",
+            Format::Sqlite => "sqlite",
         }
     }
 }
@@ -205,15 +208,19 @@ impl Target {
         self.bytes.get(off..end)
     }
 
-    /// Reject a WASM target for the native-code commands (`disasm`, `funcs`,
-    /// `decompile`, `xrefs`); the deep view is `rea wasm`.
+    /// Reject a non-native target for the native-code commands (`disasm`,
+    /// `funcs`, `decompile`, `xrefs`); the deep views are `rea wasm` and
+    /// `rea sqlite`.
     pub fn require_native(&self) -> Result<()> {
-        if self.format == Format::Wasm {
-            return Err(Error::Parse(
+        match self.format {
+            Format::Wasm => Err(Error::Parse(
                 "wasm: no native code view; use the wasm commands".into(),
-            ));
+            )),
+            Format::Sqlite => Err(Error::Parse(
+                "sqlite: no native code view; use the sqlite commands".into(),
+            )),
+            _ => Ok(()),
         }
-        Ok(())
     }
 }
 

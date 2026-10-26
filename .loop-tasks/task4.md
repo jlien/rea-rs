@@ -1,12 +1,11 @@
-Read .loop-tasks/00-common.md first and follow it.
+# A Swift mangling subset
 
-# Task 10 — WAT writer upgrade
+**Where:** `crates/rea-core/src/demangle.rs`, and the Mach-O symbol path in `crates/rea-core/src/loader.rs` only if `$s` names do not already reach `demangle::any`
 
-crates/rea-core/src/wasm.rs. The `--wat` listing from iteration 1 is a readability listing; upgrade it toward full WAT emission for what the parser has already decoded — still NOT a full WAT writer for undecoded things, and still no WASI:
+**Retires:** `rea symbols` Stops before: "Swift demangling." Also "Swift stays raw" on that row and in the "Out of this tree" paragraph, for this subset. A demangle failure still does not fail the listing.
 
-1. Emit proper s-expression WAT for: module header, type section (full param/result lists), import entries with their kinds, memory/table declarations with limits and shared flag, exports, start, element segments (offset + func indices), data segments (offset + escaped bytes), and function bodies as `(func $i ...)` with locals and decoded instructions in WAT mnemonic form where the opcode map covers them.
-2. Unknown opcodes degrade to `(; opcode N ;)` comments inline — the output must remain syntactically parseable-looking text, never invalid nesting.
-3. Keep the old readability mode available (previous flag semantics) and add `--wat-full` if a mode split is cleaner than changing `--wat`; your call, document it either way.
-4. Fixture tests: round-trip shape checks on existing fixtures (balanced parens count, known mnemonics present, escaped data bytes).
-5. Update README.md `rea wasm` bullets + review doc WASM rows.
-6. Commit: `rea-rs: full wat emission for decoded wasm`.
+After the existing one-underscore strip, a stored name starting with `$s` or `_$s` can demangle. Parse two length-prefixed identifiers (a decimal length, then that many bytes, the same shape as the Rust v0 ident parser). Render `module.name`. Bytes after the second identifier stay unread and do not reject the match, so a type suffix does not have to be decoded. The demangled text does not include that suffix. Punycode, a length that does not fit, and a first byte that is not a digit return `None`. The stored raw name stays. Objective-C thunks and generic signatures stay raw. Headers still omit Swift names until task 6.1.
+
+**Difficulty:** medium
+
+**Commit:** `rea-rs: a swift mangling subset`

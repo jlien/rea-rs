@@ -1,9 +1,18 @@
-# Common constraints (apply to every task)
+# Common constraints (all tasks, read every time)
 
-- Repo: rea-rs — clean-room Rust rewrite of an MCP reverse-engineering toolkit. Crates: rea-core (loading/analysis/disasm), rea-mcp (hand-rolled JSON-RPC stdio server), rea-cli (the `rea` binary). Workspace deps allowed: goblin, serde, serde_json, anyhow, thiserror, clap, capstone. Do NOT add new external crates.
-- All builds/tests run OFFLINE: `cargo test --workspace --offline`. No network.
-- Commit style: subject exactly `rea-rs: <what it added>` (see `git log --oneline`). One commit per task. Never push.
-- Every task ends with: code + fixture tests (follow existing test patterns in the crate), `cargo test --workspace --offline` passing, README.md MCP-tool/roadmap text updated if the tool surface changed, and docs/rea-rs-review.html updated: newest commit id in the `#now` meta line, a Done-table row, and the touched "Stops before" / gaps cells relaxed to match what now reads. Match the doc's terse declarative voice.
-- The review doc's repeated phrase "stays unread" / "stops before" is the definition of remaining work — your task is to make one of those clauses false, then rewrite it.
-- Honest reporting: if a sub-item proves infeasible, implement the feasible part, leave the doc clause accurate, and say so in the commit body.
-- NOTE: iteration 1 (commits 3a413a8..ef27480) already landed field signatures, Param sequence numbers, WASM memory entries, --wat listing, session binary mapping, NIB values, rendition facts, and width-based decompile types. Build on that state; do not redo it.
+- No new external crates. Allowed: goblin, serde, serde_json, anyhow, thiserror, clap, capstone.
+- Offline only: `cargo build --offline`, `cargo test --workspace --offline`.
+- One task = one commit, subject exactly `rea-rs: <what it added>` (lowercase, as given).
+- Never push. The human merges after review.
+- Every task ends with: fixture tests, a README.md update, and a docs/rea-rs-review.html update
+  (newest commit id in the #now meta line, a Done-table row, and relaxed Stops-before/gaps cells
+  that name what became readable and what remains). Terse declarative voice.
+- "stays unread" / "stops before" phrases define the remaining work. Never delete a clause you did
+  not honestly retire. If a sub-item is infeasible, say so in the doc instead of faking it.
+- Work from the brief below exactly. If a prior task already landed part of it (check git log),
+  build on what landed; do not redo or revert it.
+- Read docs/iterations-3plus-plan.md in the repo root for the full context of this task in the
+  overall iteration plan.
+
+---
+

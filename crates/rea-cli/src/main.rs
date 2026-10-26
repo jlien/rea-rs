@@ -39,7 +39,7 @@ enum Command {
         #[arg(long)]
         arch: Option<String>,
     },
-    /// List symbols, optionally filtered. Mach-O stabs are omitted. Itanium, Rust v0, and MSVC names are also shown demangled; the raw name stays. A clang `__Z` or `__R` name drops one ABI underscore first. Swift stays raw.
+    /// List symbols, optionally filtered. Mach-O stabs are omitted. Itanium, Rust v0, and MSVC names are also shown demangled; the raw name stays. A clang `__Z` or `__R` name drops one ABI underscore first. A Swift `_$s` name drops it too and reads two length-prefixed identifiers as `module.name`; other Swift stays raw.
     Symbols {
         path: String,
         #[arg(value_enum, default_value_t = SymKind::All)]
@@ -76,7 +76,7 @@ enum Command {
     },
     /// Direct call graph over discovered functions.
     Callgraph { path: String },
-    /// Pseudo-C at a virtual address. Follows an unconditional branch to a direct target inside the enclosing function; a target already listed ends the walk as a `goto`. Assignments, calls, gotos, and returns. Width-based types on x86_64 and arm64: typed synthetic locals, casts at call arguments and returns. `--arch` selects a Mach-O slice.
+    /// Pseudo-C at a virtual address. Follows an unconditional branch to a direct target inside the enclosing function, and one forward conditional (`jcc` / `b.cond`) whose target is in the function and ahead of the branch: the fall-through block is listed and both paths join at the target. A target already listed, a backward branch, or a branch outside the function ends the walk as a `goto`. Assignments, calls, gotos, and returns. Width-based types on x86_64 and arm64: typed synthetic locals, casts at call arguments and returns; a type carries across a conditional join only when every incoming path agrees. `--arch` selects a Mach-O slice.
     Decompile {
         path: String,
         /// Virtual address, hex (0x…) or decimal. Defaults to the entry point.
@@ -414,6 +414,16 @@ fn main() -> anyhow::Result<()> {
                             "sections": module.sections.len(),
                             "functions": module.functions,
                             "exports": module.exports.len(),
+                        });
+                    }
+                    if target.format == rea_core::Format::Sqlite {
+                        let hdr = rea_core::sqlite::header(&target.bytes)
+                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                        let objects = rea_core::sqlite::schema(&target.bytes)
+                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                        value["sqlite"] = serde_json::json!({
+                            "application_id": hdr.application_id,
+                            "schema_objects": objects.len(),
                         });
                     }
                     value

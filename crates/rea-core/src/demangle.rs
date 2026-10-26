@@ -1,9 +1,11 @@
 //! Demanglers for names this tree already stores.
 //!
-//! Itanium C++, Rust v0, and a subset of MSVC. Swift stays raw. A name that
-//! does not fit returns `None` and does not fail symbol listing.
+//! Itanium C++, Rust v0, a subset of MSVC, and a Swift subset (`module.name`
+//! only). A name that does not fit returns `None` and does not fail symbol
+//! listing.
 
-/// Itanium, then Rust v0 (`_R`), then MSVC (`?`). The first match wins.
+/// Itanium, then Rust v0 (`_R`), then MSVC (`?`), then Swift (`$s`). The
+/// first match wins.
 pub fn any(name: &str) -> Option<String> {
     if name.starts_with("_Z") {
         itanium(name)
@@ -11,6 +13,8 @@ pub fn any(name: &str) -> Option<String> {
         rust_v0(name)
     } else if name.starts_with('?') {
         msvc(name)
+    } else if name.starts_with("$s") || name.starts_with("_$s") {
+        swift(name)
     } else {
         None
     }
@@ -33,6 +37,42 @@ pub fn rust_v0(name: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Swift subset. `$s4main3fooyyF` is `main.foo`. Two length-prefixed
+/// identifiers (module, then name) are read: a decimal length, then that many
+/// bytes. Bytes after the second identifier (a type suffix, a generic
+/// signature) stay unread and do not reject the match, and the demangled text
+/// does not include them. Punycode, a length that does not fit, and a first
+/// byte that is not a digit return `None`.
+pub fn swift(name: &str) -> Option<String> {
+    let rest = name.strip_prefix('_').unwrap_or(name);
+    let rest = rest.strip_prefix("$s")?;
+    let (module, rest) = parse_swift_ident(rest)?;
+    let (item, _) = parse_swift_ident(rest)?;
+    Some(format!("{module}.{item}"))
+}
+
+/// A Swift identifier: a decimal length, then that many bytes. A byte that is
+/// not ASCII alphanumeric or `_` (for example the `-` in a punycode encoding)
+/// returns `None`. A leading `00` is the punycode marker — a marker, then a
+/// length, then the punycode text — and returns `None` rather than reading
+/// the marker digits as the length.
+fn parse_swift_ident(input: &str) -> Option<(String, &str)> {
+    if input.starts_with("00") {
+        return None;
+    }
+    let digits = input.chars().take_while(|c| c.is_ascii_digit()).count();
+    if digits == 0 {
+        return None;
+    }
+    let len: usize = input[..digits].parse().ok()?;
+    let rest = input.get(digits..)?;
+    let name = rest.get(..len)?;
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    Some((name.to_string(), &rest[len..]))
 }
 
 /// MSVC subset. `?foo@@YAHH@Z` is `int foo(int)`. `?bar@Foo@@YAXH@Z` is `void Foo::bar(int)`.
@@ -286,7 +326,37 @@ fn parse_type(input: &str) -> Option<(&'static str, &str)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{any, itanium, msvc, rust_v0};
+    use super::{any, itanium, msvc, rust_v0, swift};
+
+    #[test]
+    fn swift_reads_two_identifiers_and_stops() {
+        assert_eq!(swift("$s4main3fooyyF").as_deref(), Some("main.foo"));
+        assert_eq!(swift("_$s4main3fooyyF").as_deref(), Some("main.foo"));
+        assert_eq!(any("$s4main3fooyyF").as_deref(), Some("main.foo"));
+        assert_eq!(any("_$s4main3fooyyF").as_deref(), Some("main.foo"));
+        // A generic signature or type suffix after the second identifier stays
+        // unread and does not reject the match.
+        assert_eq!(swift("$s4main3fooS2i_S2itSfE").as_deref(), Some("main.foo"));
+        assert_eq!(swift("$s4main3foo3barVyXEfU_").as_deref(), Some("main.foo"));
+    }
+
+    #[test]
+    fn swift_rejects_malformed_and_punycode() {
+        // First byte not a digit.
+        assert_eq!(swift("$s4main"), None);
+        assert_eq!(swift("$sXmain3foo"), None);
+        // A length that does not fit.
+        assert_eq!(swift("$s4main9"), None);
+        assert_eq!(swift("$s99999999999999main3foo"), None);
+        // Punycode keeps its `-` separator and is not decoded.
+        assert_eq!(swift("$s4main3x-abc"), None);
+        // The punycode marker `00` before a length is not read as a length.
+        assert_eq!(swift("$s8mangling0022egbpdajGbuEbxfgehfvwxnyyF"), None);
+        // Truncated before the second identifier.
+        assert_eq!(swift("$s4main"), None);
+        assert_eq!(swift("$s"), None);
+        assert_eq!(any("printf"), None);
+    }
 
     #[test]
     fn demangles_a_function_and_a_nested_name() {
