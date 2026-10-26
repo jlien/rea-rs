@@ -40,7 +40,7 @@ rea disasm /bin/ls --count 32
 rea disasm /bin/ls --address 0x100003f80
 rea disasm fat-binary --arch arm64 --address 0x1000 --count 1
 
-# C header of recovered names, plist and crash identity, artifact kind
+# C header of recovered names, plist and crash identity, artifact kind, nib values, rendition dimensions and pixel formats
 rea headers /bin/ls
 rea plist Info.plist
 rea crash report.crash
