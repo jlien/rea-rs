@@ -200,12 +200,14 @@ fn scan_thumb_push_prologues(
 /// A32 frame-pointer push at 4-byte-aligned virtual addresses. A word is
 /// `push {…, lr}` / `stmfd sp!, {…, lr}` when it is an STMDB (P=1, U=0,
 /// S=0, W=1, L=0) with Rn = sp (r13) and the LR bit set in the register
-/// list, under condition `al` (0xE). `push {r11, lr}` (`e9 2d 4b 00`) is
-/// the minimal such word.
+/// list, under condition `al` (0xE). The L bit (bit 20) must be clear, or
+/// the load form `ldmdb sp!, {…, lr}` would match too. `push {r11, lr}`
+/// (`e9 2d 4b 00`) is the minimal such word.
 fn is_a32_push_lr_word(word: u32) -> bool {
     word >> 28 == 0xE
         && (word & 0x0FE0_0000) == 0x0920_0000
         && (word & 0x000F_0000) == 0x000D_0000
+        && word & 0x0010_0000 == 0
         && word & 0x0000_4000 != 0
 }
 
@@ -1095,8 +1097,9 @@ mod tests {
 
     #[test]
     fn a32_push_lr_is_seeded_and_ends_at_bx_lr() {
-        // push {r11, lr} (e92d4b00); mov r0, #0 (e3a00000); bx lr (e12fff1e).
-        // The body must decode in ARM mode and stop at `bx lr`, 12 bytes.
+        // stmfd sp!, {r8, r9, r11, lr} (e92d4b00); mov r0, #0 (e3a00000);
+        // bx lr (e12fff1e). The body must decode in ARM mode and stop at
+        // `bx lr`, 12 bytes.
         let code = [
             0x00, 0x4b, 0x2d, 0xe9, 0x00, 0x00, 0xa0, 0xe3, 0x1e, 0xff, 0x2f, 0xe1,
         ];
@@ -1107,13 +1110,30 @@ mod tests {
 
     #[test]
     fn a32_stmfd_with_wider_reglist_is_a_seed() {
-        // stmfd sp!, {r4, r11, lr} (e92d4c90); bx lr. 8 bytes, ARM mode.
+        // stmfd sp!, {r4, r7, r10, r11, lr} (e92d4c90); bx lr. 8 bytes, ARM mode.
         let code = [
             0x90, 0x4c, 0x2d, 0xe9, 0x1e, 0xff, 0x2f, 0xe1,
         ];
         let funcs = discover_functions(&synthetic_code(Arch::Arm, 32, &code));
         let entry = funcs.iter().find(|f| f.addr == 0x1000).expect("a32 entry");
         assert_eq!(entry.size, 8, "size {} (bx lr should stop the body)", entry.size);
+    }
+
+    #[test]
+    fn a32_ldmdb_is_not_a_seed() {
+        // ldmdb sp!, {r11, lr} (e93d4b00) at 0x1008 is the load form: L=1, so
+        // it does not seed a function there (the entry at 0x1000 is a seed
+        // regardless). mov r0, #0 twice fills the entry body, and the bx lr
+        // at 0x1010 stops it.
+        let code = [
+            0x00, 0x00, 0xa0, 0xe3, 0x00, 0x00, 0xa0, 0xe3, 0x00, 0x4b, 0x3d, 0xe9, 0x1e, 0xff,
+            0x2f, 0xe1,
+        ];
+        let funcs = discover_functions(&synthetic_code(Arch::Arm, 32, &code));
+        assert!(
+            !funcs.iter().any(|f| f.addr == 0x1008),
+            "ldmdb sp! must not seed"
+        );
     }
 
     #[test]

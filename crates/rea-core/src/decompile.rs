@@ -1101,6 +1101,30 @@ mod tests {
     }
 
     #[test]
+    fn arm64_fallthrough_write_of_an_untypeable_load_drops_the_type_at_the_join() {
+        // ldr w0, [x9] @0x1000; b.eq #0x1010 @0x1004; ldr x0, [x10] @0x1008
+        // (no inferable type); nop @0x100c; ret @0x1010. The fall block is
+        // listed only because following walks it to the join, and its x0
+        // write kills the carried `unsigned int`, so the return has no cast.
+        // With the Arm64 arm of followable_cond dropped, the linear walk
+        // keeps the cast and both of the last two asserts fail.
+        let code = [
+            0x20, 0x01, 0x40, 0xb9, // ldr w0, [x9]
+            0x60, 0x00, 0x00, 0x54, // b.eq #0x1010
+            0x40, 0x01, 0x40, 0xf9, // ldr x0, [x10]
+            0x1f, 0x20, 0x03, 0xd5, // nop
+            0xc0, 0x03, 0x5f, 0xd6, // ret
+        ];
+        let text = decompile(&target(Arch::Arm64, 64, &code), 0x1000, 20).unwrap();
+        assert!(text.contains("unsigned int v1;"), "{text}");
+        assert!(text.contains("v1 = [x9]"), "{text}");
+        assert!(text.contains("if (b.eq) goto #0x1010;"), "{text}");
+        assert!(text.contains("v1 = [x10]"), "{text}");
+        assert!(text.contains("\n  return;\n"), "{text}");
+        assert!(!text.contains("return (unsigned int)"), "{text}");
+    }
+
+    #[test]
     fn decompiling_a_body_whose_section_reaches_u64_max_does_not_panic() {
         // Regression: `ins.addr + ins.size` overflowed for an instruction at
         // u64::MAX - 1, and `s.addr + s.size` overflowed in vaddr_to_offset.

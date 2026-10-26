@@ -666,7 +666,9 @@ impl LeImage {
                 let kind = if o.flags & 0x4 != 0 { "code" } else { "data" };
                 // Offset of the object's first mapped page (approximate for
                 // display; exact translation goes through the page map).
-                let file_offset = if o.mapsize > 0 && (o.pagemap as usize) <= self.pages.pages.len()
+                let file_offset = if o.mapsize > 0
+                    && o.pagemap >= 1
+                    && (o.pagemap as usize) <= self.pages.pages.len()
                 {
                     let page = u64::from(self.pages.pages[o.pagemap as usize - 1]);
                     self.pages.header_off as u64
@@ -732,6 +734,21 @@ mod tests {
             b[le + 0x100 + i] = *byte;
         }
         b
+    }
+
+    #[test]
+    fn an_object_with_a_zero_pagemap_does_not_panic_sections() {
+        // mpages 0, one object with pagemap 0 and mapsize 1: the page map has
+        // no slot to look up, so the object's file offset stays 0 instead of
+        // underflowing the index.
+        let mut b = synthetic();
+        b[0x40 + 0x14..0x40 + 0x18].copy_from_slice(&0u32.to_le_bytes()); // mpages 0
+        let o = 0x40 + 0xC0;
+        b[o + 12..o + 16].copy_from_slice(&0u32.to_le_bytes()); // pagemap 0
+        let img = LeImage::parse(&b).unwrap();
+        let secs = img.sections();
+        assert_eq!(secs.len(), 1);
+        assert_eq!(secs[0].file_offset, 0);
     }
 
     #[test]

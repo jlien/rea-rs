@@ -55,8 +55,13 @@ pub fn swift(name: &str) -> Option<String> {
 
 /// A Swift identifier: a decimal length, then that many bytes. A byte that is
 /// not ASCII alphanumeric or `_` (for example the `-` in a punycode encoding)
-/// returns `None`.
+/// returns `None`. A leading `00` is the punycode marker — a marker, then a
+/// length, then the punycode text — and returns `None` rather than reading
+/// the marker digits as the length.
 fn parse_swift_ident(input: &str) -> Option<(String, &str)> {
+    if input.starts_with("00") {
+        return None;
+    }
     let digits = input.chars().take_while(|c| c.is_ascii_digit()).count();
     if digits == 0 {
         return None;
@@ -345,6 +350,8 @@ mod tests {
         assert_eq!(swift("$s99999999999999main3foo"), None);
         // Punycode keeps its `-` separator and is not decoded.
         assert_eq!(swift("$s4main3x-abc"), None);
+        // The punycode marker `00` before a length is not read as a length.
+        assert_eq!(swift("$s8mangling0022egbpdajGbuEbxfgehfvwxnyyF"), None);
         // Truncated before the second identifier.
         assert_eq!(swift("$s4main"), None);
         assert_eq!(swift("$s"), None);
