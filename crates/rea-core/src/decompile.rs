@@ -712,7 +712,7 @@ fn plan_types(
 
     for (i, insn) in insns.iter().enumerate() {
         while next_gap < gap_invalidations.len() && gap_invalidations[next_gap].0 <= i {
-            let (_, keys) = &gap_invalidations[next_gap];
+            let (after, keys) = &gap_invalidations[next_gap];
             if keys.iter().any(Option::is_none) {
                 for snap in slots.values_mut() {
                     snap.poisoned = true;
@@ -720,10 +720,18 @@ fn plan_types(
                 }
             } else {
                 for k in keys.iter().flatten() {
-                    if let Some(snap) = slots.get_mut(k) {
-                        snap.poisoned = true;
-                        snap.ty = None;
-                    }
+                    // The gap's store is unknown data landing in this slot:
+                    // record a poisoned snap even when the walked path has
+                    // not stored here yet, so no later typed store re-types
+                    // the slot.
+                    let snap = slots.entry(*k).or_insert(SlotSnap {
+                        ty: None,
+                        at: *after,
+                        poisoned: false,
+                    });
+                    snap.poisoned = true;
+                    snap.ty = None;
+                    snap.at = *after;
                 }
             }
             next_gap += 1;
@@ -1557,14 +1565,36 @@ mod tests {
     #[test]
     fn x86_64_an_untyped_store_poisons_the_slot() {
         // mov [rbp - 8], rdx (untyped); movsxd rax (int);
-        // mov rbx, qword ptr [rbp - 8]; ret
+        // mov [rbp - 8], rax; mov rbx, qword ptr [rbp - 8]; ret.
+        // The untyped store poisons the slot, so the later int store must
+        // not re-type it and the load stays untyped.
         let code = [
-            0x48, 0x89, 0x55, 0xf8, 0x48, 0x63, 0x05, 0x00, 0x00, 0x00, 0x00, 0x48, 0x8b, 0x5d,
-            0xf8, 0xc3,
+            0x48, 0x89, 0x55, 0xf8, 0x48, 0x63, 0x05, 0x00, 0x00, 0x00, 0x00, 0x48, 0x89, 0x45,
+            0xf8, 0x48, 0x8b, 0x5d, 0xf8, 0xc3,
         ];
-        let text = decompile(&target(Arch::X86_64, 64, &code), 0x1000, 16).unwrap();
+        let text = decompile(&target(Arch::X86_64, 64, &code), 0x1000, 20).unwrap();
         assert!(text.contains("int v1;"), "{text}");
         assert!(!text.contains("v2;"), "{text}");
+        assert!(!text.contains("v2 "), "{text}");
+        assert!(text.contains("rbx = qword ptr [rbp - 8]"), "{text}");
+    }
+
+    #[test]
+    fn x86_64_a_gap_store_to_a_fresh_slot_poisons_it() {
+        // movsxd rax; jmp over the gap store mov [rbp - 8], rax (the first
+        // write the walked path sees is inside the gap); then movzx edx
+        // (uint8_t); mov [rbp - 8], rdx; mov rbx, [rbp - 8]; ret. The gap's
+        // store poisons the slot even though the walked path never stored to
+        // it before the jump, so the uint8_t store cannot type the load.
+        let code = [
+            0x48, 0x63, 0x05, 0x00, 0x00, 0x00, 0x00, 0xeb, 0x04, 0x48, 0x89, 0x45, 0xf8, 0x0f,
+            0xb6, 0x15, 0x00, 0x00, 0x00, 0x00, 0x48, 0x89, 0x55, 0xf8, 0x48, 0x8b, 0x5d, 0xf8,
+            0xc3,
+        ];
+        let text = decompile(&target(Arch::X86_64, 64, &code), 0x1000, 29).unwrap();
+        assert!(text.contains("int v1;"), "{text}");
+        assert!(text.contains("uint8_t v2;"), "{text}");
+        assert!(!text.contains("v3"), "{text}");
         assert!(text.contains("rbx = qword ptr [rbp - 8]"), "{text}");
     }
 
