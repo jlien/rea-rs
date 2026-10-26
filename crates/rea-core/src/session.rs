@@ -127,6 +127,63 @@ pub fn diff(left: &Session, right: &Session) -> SessionDiff {
     }
 }
 
+/// One upstream-morphic Evidence record, mapped from a native [`Record`].
+/// Fields the native store does not capture are explicit `null`s, never
+/// fabricated.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct EvidenceRecord {
+    /// The session the record came from.
+    pub session: String,
+    /// The recorded rea command; empty for a plain summary record.
+    pub tool: String,
+    /// Upstream echoes the caller's arguments. The native store keeps only
+    /// the summary text, so this stays null.
+    pub arguments: Option<serde_json::Value>,
+    pub summary: String,
+    /// Embedded command output, capped at [`EMBED_CAP`]; the `[truncated]`
+    /// marker is carried through verbatim. Null for a plain summary record.
+    pub output: Option<String>,
+    /// The native store timestamps nothing.
+    pub timestamp: Option<String>,
+}
+
+/// The upstream-morphic Evidence export of one session file.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct EvidenceExport {
+    /// Binary path the session maps.
+    pub path: String,
+    /// Identity summary recorded at `open`; null when the path did not load.
+    pub identity: Option<TargetSummary>,
+    /// Upstream holds a live session handle; the native store does not.
+    pub session_handle: Option<String>,
+    /// Upstream holds a live memory mapping; nothing is mapped between calls.
+    pub live_mapping: Option<String>,
+    pub records: Vec<EvidenceRecord>,
+}
+
+/// Map a native session file to the upstream-morphic Evidence shape. The
+/// native file stays the source of truth; nothing here writes back.
+pub fn export_evidence(session: &Session) -> EvidenceExport {
+    EvidenceExport {
+        path: session.path.clone(),
+        identity: session.target.clone(),
+        session_handle: None,
+        live_mapping: None,
+        records: session
+            .records
+            .iter()
+            .map(|record| EvidenceRecord {
+                session: session.id.clone(),
+                tool: record.tool.clone(),
+                arguments: None,
+                summary: record.summary.clone(),
+                output: record.output.clone(),
+                timestamp: None,
+            })
+            .collect(),
+    }
+}
+
 fn summarize(target: &Target) -> TargetSummary {
     TargetSummary {
         format: target.format.as_str().to_string(),
@@ -236,11 +293,14 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn scratch() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::SeqCst);
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("rea-session-{stamp}"))
+        std::env::temp_dir().join(format!("rea-session-{stamp}-{n}"))
     }
 
     fn fixture_target() -> Target {
@@ -407,6 +467,60 @@ mod tests {
         let got = diff(&left, &right);
         assert_eq!(got.only_left, vec!["mach-o".to_string()]);
         assert_eq!(got.only_right, vec!["elf".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn evidence_export_maps_identity_and_records_with_nulls_for_unknown() {
+        let dir = scratch();
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("fixture.elf");
+        std::fs::write(&bin, elf_fixture()).unwrap();
+        let session = open(&dir, bin.to_str().unwrap()).unwrap();
+        let session = record(&dir, &session.id, Some("info"), "identity").unwrap();
+        let session = record(&dir, &session.id, None, "noted").unwrap();
+        let export = super::export_evidence(&session);
+        assert_eq!(export.path, bin.to_str().unwrap().to_string());
+        assert_eq!(export.identity.as_ref().unwrap().format, "elf");
+        assert_eq!(export.session_handle, None);
+        assert_eq!(export.live_mapping, None);
+        assert_eq!(export.records.len(), 2);
+        assert_eq!(export.records[0].session, session.id);
+        assert_eq!(export.records[0].tool, "info");
+        assert_eq!(export.records[0].arguments, None);
+        assert_eq!(export.records[0].timestamp, None);
+        assert_eq!(export.records[0].output.as_ref().unwrap(), session.records[0].output.as_ref().unwrap());
+        assert_eq!(export.records[1].tool, "");
+        assert_eq!(export.records[1].output, None);
+        // Serialized shape carries the null fields explicitly.
+        let value = serde_json::to_value(&export).unwrap();
+        let record = &value["records"][0];
+        assert_eq!(record["arguments"], serde_json::Value::Null);
+        assert_eq!(record["timestamp"], serde_json::Value::Null);
+        assert_eq!(value["session_handle"], serde_json::Value::Null);
+        assert_eq!(value["live_mapping"], serde_json::Value::Null);
+        assert_eq!(record["session"], session.id);
+        assert!(record["output"].as_str().unwrap().contains("\"format\": \"elf\""));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn evidence_export_carries_the_truncation_marker() {
+        let dir = scratch();
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("fixture.elf");
+        // The appended printable run makes the embedded `strings` output
+        // exceed the cap, so the marker survives into the export.
+        let mut bytes = elf_fixture();
+        bytes.extend(std::iter::repeat(b'A').take(EMBED_CAP * 2));
+        std::fs::write(&bin, bytes).unwrap();
+        let session = open(&dir, bin.to_str().unwrap()).unwrap();
+        let session = record(&dir, &session.id, Some("strings"), "big run").unwrap();
+        assert!(session.records[0].output.as_ref().unwrap().ends_with("[truncated]"));
+        let export = super::export_evidence(&session);
+        let output = export.records[0].output.as_ref().unwrap();
+        assert_eq!(output.len(), EMBED_CAP);
+        assert!(output.ends_with("[truncated]"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

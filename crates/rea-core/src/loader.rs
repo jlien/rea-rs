@@ -163,6 +163,8 @@ fn macho_target(mo: goblin::mach::MachO, bytes: Vec<u8>, path: String) -> Result
                     prot & goblin::mach::constants::VM_PROT_WRITE != 0,
                     prot & goblin::mach::constants::VM_PROT_EXECUTE != 0,
                 ),
+                sh_type: None,
+                sh_flags: None,
             });
         }
     }
@@ -253,6 +255,8 @@ fn load_elf(bytes: Vec<u8>, path: String) -> Result<Target> {
                     flags & u64::from(goblin::elf::section_header::SHF_WRITE) != 0,
                     flags & u64::from(goblin::elf::section_header::SHF_EXECINSTR) != 0,
                 ),
+                sh_type: Some(sh_type_name(sh.sh_type)),
+                sh_flags: Some(sh_flag_names(flags)),
             }
         })
         .collect();
@@ -299,6 +303,58 @@ fn load_elf(bytes: Vec<u8>, path: String) -> Result<Target> {
     })
 }
 
+/// `sh_type` name for the common ids; unknown ids stay `0x…`.
+fn sh_type_name(ty: u32) -> String {
+    use goblin::elf::section_header as sh;
+    let name = match ty {
+        sh::SHT_NULL => "NULL",
+        sh::SHT_PROGBITS => "PROGBITS",
+        sh::SHT_SYMTAB => "SYMTAB",
+        sh::SHT_STRTAB => "STRTAB",
+        sh::SHT_RELA => "RELA",
+        sh::SHT_HASH => "HASH",
+        sh::SHT_DYNAMIC => "DYNAMIC",
+        sh::SHT_NOTE => "NOTE",
+        sh::SHT_NOBITS => "NOBITS",
+        sh::SHT_REL => "REL",
+        sh::SHT_DYNSYM => "DYNSYM",
+        sh::SHT_INIT_ARRAY => "INIT_ARRAY",
+        sh::SHT_FINI_ARRAY => "FINI_ARRAY",
+        sh::SHT_GROUP => "GROUP",
+        0x6ffffff6 => "GNU_HASH",
+        0x6ffffffd => "VERDEF",
+        0x6ffffffe => "VERNEED",
+        0x6fffffff => "VERSYM",
+        _ => return format!("0x{ty:x}"),
+    };
+    name.to_string()
+}
+
+/// SHF_ flag names not already visible in the `perms` string. WRITE, ALLOC,
+/// and EXECINSTR map onto the `rwx` bits and are excluded.
+fn sh_flag_names(flags: u64) -> Vec<String> {
+    const SHF_MASKOS: u64 = 0x0ff00000;
+    let mut out = Vec::new();
+    let mut push = |bit: u64, name: &str| {
+        if flags & bit != 0 {
+            out.push(name.to_string());
+        }
+    };
+    push(0x10, "MERGE");
+    push(0x20, "STRINGS");
+    push(0x40, "INFO_LINK");
+    push(0x80, "LINK_ORDER");
+    push(0x100, "OS_NONCONFORMING");
+    push(0x200, "GROUP");
+    push(0x400, "TLS");
+    push(0x800, "COMPRESSED");
+    push(0x8000_0000, "EXCLUDE");
+    if flags & SHF_MASKOS != 0 {
+        out.push(format!("os-0x{:x}", flags & SHF_MASKOS));
+    }
+    out
+}
+
 fn load_pe(bytes: Vec<u8>, path: String) -> Result<Target> {
     let pe = goblin::pe::PE::parse(&bytes)
         .map_err(|e| Error::Parse(format!("pe: {e}")))?;
@@ -325,6 +381,8 @@ fn load_pe(bytes: Vec<u8>, path: String) -> Result<Target> {
                     flags & goblin::pe::section_table::IMAGE_SCN_MEM_WRITE != 0,
                     flags & goblin::pe::section_table::IMAGE_SCN_MEM_EXECUTE != 0,
                 ),
+                sh_type: None,
+                sh_flags: None,
             }
         })
         .collect();
@@ -364,6 +422,14 @@ mod tests {
         assert_eq!(names, ["", ".text", ".shstrtab"]);
         assert_eq!(target.sections[1].perms, "r-x");
         assert_eq!(target.sections[1].addr, 0x1000);
+        assert_eq!(target.sections[1].sh_type.as_deref(), Some("PROGBITS"));
+        assert_eq!(
+            target.sections[1].sh_flags.as_deref(),
+            Some(&["MERGE".to_string()][..])
+        );
+        assert_eq!(target.sections[2].sh_type.as_deref(), Some("STRTAB"));
+        assert!(target.sections[2].sh_flags.as_ref().unwrap().is_empty());
+        assert_eq!(target.sections[0].sh_type.as_deref(), Some("NULL"));
     }
 
     /// `.shstrtab` starts at offset 7. Using the section index would read `text`.
@@ -385,7 +451,7 @@ mod tests {
         file[60..62].copy_from_slice(&3u16.to_le_bytes());
         file[62..64].copy_from_slice(&2u16.to_le_bytes());
         file[shstr_off as usize..shstr_off as usize + shstr.len()].copy_from_slice(shstr);
-        write_shdr(&mut file, shoff, 1, 1, 1, 6, 0x1000, 0, 0);
+        write_shdr(&mut file, shoff, 1, 1, 1, 0x16, 0x1000, 0, 0);
         write_shdr(&mut file, shoff, 2, 7, 3, 0, 0, shstr_off, shstr.len() as u64);
         file
     }

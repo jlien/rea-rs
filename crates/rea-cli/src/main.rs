@@ -76,7 +76,7 @@ enum Command {
     },
     /// Direct call graph over discovered functions.
     Callgraph { path: String },
-    /// Straight-line pseudo-C at a virtual address. Assignments, calls, gotos, and returns. Width-based types on x86_64 and arm64: typed synthetic locals, casts at call arguments and returns. `--arch` selects a Mach-O slice.
+    /// Pseudo-C at a virtual address. Follows an unconditional branch to a direct target inside the enclosing function; a target already listed ends the walk as a `goto`. Assignments, calls, gotos, and returns. Width-based types on x86_64 and arm64: typed synthetic locals, casts at call arguments and returns. `--arch` selects a Mach-O slice.
     Decompile {
         path: String,
         /// Virtual address, hex (0x…) or decimal. Defaults to the entry point.
@@ -88,7 +88,7 @@ enum Command {
         #[arg(long)]
         arch: Option<String>,
     },
-    /// WASM section ids, imports, exports, type signatures, function bodies, element and data segments, and a capped custom payload. Memory limits carry the shared flag, and imported memories list their limits. `--wat` prints a WAT-flavored readability listing of what is decoded; it is not a full WAT writer. `--execute` runs one export with the i32 interpreter. No WASI, and `--execute` does not touch memory.
+    /// WASM section ids, imports, exports, type signatures, function bodies, element and data segments, and a capped custom payload. Memory limits carry the shared flag, and imported memories list their limits. `--wat` prints a WAT-flavored readability listing of what is decoded; it is not a full WAT writer. `--wat-full` prints a full WAT emission of the same decoded content, with unknown opcodes as inline comments. `--execute` runs one export with the i32 interpreter. No WASI, and `--execute` does not touch memory.
     Wasm {
         path: String,
         /// Exported function to run. Omit this to inspect only.
@@ -100,14 +100,17 @@ enum Command {
         /// Print a WAT-flavored readability listing instead of JSON. Not a full WAT writer.
         #[arg(long, conflicts_with = "execute")]
         wat: bool,
+        /// Print a full WAT emission of what is decoded instead of JSON: types with full param and result lists, imports with kind details, segment offsets, and function bodies with locals. Still not a writer for undecoded things.
+        #[arg(long, conflicts_with_all = ["execute", "wat"])]
+        wat_full: bool,
     },
     /// Go build info. Go 1.18+ inline blobs and pre-1.18 file offsets. A null or out-of-range offset is an error.
     Goinfo { path: String },
-    /// Mach-O dylibs, UUID, build version, rpaths, code-directory identifier, hash type, team id, hash-slot digests, the CMS blob, whether a sha1 or sha256 of the code directory appears in that blob, an embedded Info.plist, an overlay, architectures, and rpath file hits. The digest check is not an Apple trust decision.
+    /// Mach-O dylibs, UUID, build version, rpaths, code-directory identifier, hash type, team id, hash-slot digests, the CMS blob, whether a sha1 or sha256 of the code directory appears in that blob, an embedded Info.plist, entitlements (top-level XML keys with their immediate values, and the DER slot's byte size), exec-segment flags, an overlay, architectures, and rpath file hits. The digest check is not an Apple trust decision.
     Macho { path: String },
     /// PE subsystem, image base, raw COFF timestamp and its UTC date, data directories, CLR header, metadata streams, table row counts, type names, field names, method names, signatures, IL, parameter names, member-ref names, assembly names, property and event names, CodeView PDB path, resource names, payloads, and an overlay.
     Pe { path: String },
-    /// ELF file type, machine, interpreter, needed libraries, soname, rpath, runpath, GNU build-id, and rpath or runpath file hits.
+    /// ELF file type, machine, interpreter, needed libraries, soname, rpath, runpath, GNU build-id, notes (owner, type name, descriptor), GNU property bits, and rpath or runpath file hits.
     Elf { path: String },
     /// SQLite header, schema, and optional rows of one table. `--wal` replays committed frames before the read.
     Sqlite {
@@ -159,6 +162,20 @@ enum SessionCmd {
     },
     /// Compare two session ids in `--dir`.
     Diff { left: String, right: String },
+    /// Print a session file. `--format evidence` maps it to the upstream-morphic Evidence shape instead: per record the tool name, an arguments echo, the capped embedded output, a timestamp, and the session id. Fields the native store does not capture (argument echoes, timestamps, the upstream session handle, a live mapping) are explicit nulls. CLI-only; the MCP surface is unchanged.
+    Export {
+        id: String,
+        #[arg(long, value_enum, default_value_t = ExportFormat::Native)]
+        format: ExportFormat,
+    },
+}
+
+#[derive(ValueEnum, Clone, Copy)]
+enum ExportFormat {
+    /// The native session file as stored.
+    Native,
+    /// The upstream-morphic Evidence shape.
+    Evidence,
 }
 
 #[derive(Subcommand)]
@@ -183,8 +200,14 @@ fn main() -> anyhow::Result<()> {
             execute,
             args,
             wat,
+            wat_full,
         } => {
             let bytes = std::fs::read(path).context("failed to read target")?;
+            if *wat_full {
+                let module = rea_core::wasm::inspect(&bytes).context("wasm")?;
+                println!("{}", rea_core::wasm::wat_full(&module));
+                return Ok(());
+            }
             if *wat {
                 let module = rea_core::wasm::inspect(&bytes).context("wasm")?;
                 println!("{}", rea_core::wasm::wat(&module));
@@ -299,6 +322,16 @@ fn main() -> anyhow::Result<()> {
                     let right =
                         rea_core::session::load(dir, right).map_err(|e| anyhow::anyhow!("{e}"))?;
                     serde_json::to_value(rea_core::session::diff(&left, &right))?
+                }
+                SessionCmd::Export { id, format } => {
+                    let session =
+                        rea_core::session::load(dir, id).map_err(|e| anyhow::anyhow!("{e}"))?;
+                    match format {
+                        ExportFormat::Native => serde_json::to_value(&session)?,
+                        ExportFormat::Evidence => {
+                            serde_json::to_value(rea_core::session::export_evidence(&session))?
+                        }
+                    }
                 }
             };
             println!("{}", serde_json::to_string_pretty(&value).unwrap());

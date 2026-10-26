@@ -553,6 +553,8 @@ impl LeImage {
                         o.flags & 0x2 != 0,
                         o.flags & 0x4 != 0,
                     ),
+                    sh_type: None,
+                    sh_flags: None,
                 }
             })
             .collect()

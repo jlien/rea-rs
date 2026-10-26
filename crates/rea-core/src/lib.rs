@@ -81,6 +81,14 @@ pub struct Section {
     /// `SHF_ALLOC` is reported as readable. PE uses the section memory bits.
     /// LE uses object flags 0x1, 0x2, and 0x4.
     pub perms: String,
+    /// ELF only: `sh_type` name (`PROGBITS`, `NOBITS`, `DYNAMIC`, ...), `0x…` for
+    /// unknown ids. `None` for other formats.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sh_type: Option<String>,
+    /// ELF only: `SHF_` flag names not already visible in `perms` (WRITE, ALLOC,
+    /// and EXECINSTR are excluded). `None` for other formats.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sh_flags: Option<Vec<String>>,
 }
 
 /// Format read, write, and execute as `rwx`, with `-` for a missing bit.
@@ -178,15 +186,20 @@ impl Target {
             return pm.translate(vaddr);
         }
         self.sections.iter().find_map(|s| {
-            (vaddr >= s.addr && vaddr < s.addr + s.size)
-                .then(|| s.file_offset + (vaddr - s.addr))
+            if vaddr < s.addr {
+                return None;
+            }
+            let off = vaddr - s.addr;
+            (off < s.size).then(|| s.file_offset.wrapping_add(off))
         })
     }
 
-    /// Read `len` bytes at a virtual address.
+    /// Read `len` bytes at a virtual address, clamped to the end of the
+    /// mapped bytes so a window that overruns the file still reads.
     pub fn read_at_vaddr(&self, vaddr: u64, len: u64) -> Option<&[u8]> {
         let off = self.vaddr_to_offset(vaddr)? as usize;
-        self.bytes.get(off..off + len as usize)
+        let end = off.checked_add(len as usize)?.min(self.bytes.len());
+        self.bytes.get(off..end)
     }
 }
 

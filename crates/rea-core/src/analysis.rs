@@ -58,7 +58,7 @@ fn sweep_call_targets(target: &Target, sec: &crate::Section) -> Vec<u64> {
     let _ = cs.set_skipdata(true); // treat unknown bytes as data, keep going
 
     let start = sec.file_offset as usize;
-    let end = (start + sec.size as usize).min(target.bytes.len());
+    let end = start.saturating_add(sec.size as usize).min(target.bytes.len());
     if start >= end {
         return Vec::new();
     }
@@ -68,7 +68,7 @@ fn sweep_call_targets(target: &Target, sec: &crate::Section) -> Vec<u64> {
     let mut targets = Vec::new();
     let mut pos = 0usize;
     while pos < code.len() {
-        match cs.disasm_count(&code[pos..], base + pos as u64, 64) {
+        match cs.disasm_count(&code[pos..], base.saturating_add(pos as u64), 64) {
             Ok(insns) if !insns.is_empty() => {
                 let mut consumed = 0usize;
                 for ins in insns.iter() {
@@ -94,7 +94,7 @@ fn sweep_call_targets(target: &Target, sec: &crate::Section) -> Vec<u64> {
 /// (`80 b5`) at even virtual addresses. Unknown yields nothing.
 fn prologue_starts(target: &Target, sec: &crate::Section) -> Vec<u64> {
     let start = sec.file_offset as usize;
-    let end = start + sec.size as usize;
+    let end = start.saturating_add(sec.size as usize);
     if end > target.bytes.len() {
         return Vec::new();
     }
@@ -118,7 +118,7 @@ fn scan_prologue_bytes(
     let mut i = start;
     while i + needle.len() <= end {
         if &target.bytes[i..i + needle.len()] == needle {
-            out.push(sec.addr + (i - start) as u64);
+            out.push(sec.addr.saturating_add((i - start) as u64));
         }
         i += 1;
     }
@@ -146,7 +146,7 @@ fn scan_arm64_stp_prologues(
         let masked = word & 0xFFC0_7FFF;
         // pre-index `stp x29, x30, [sp, #imm]!` or signed-offset form.
         if masked == 0xA980_7BFD || masked == 0xA900_7BFD {
-            out.push(sec.addr + (i - start) as u64);
+            out.push(sec.addr.saturating_add((i - start) as u64));
         }
         i += 4;
     }
@@ -166,7 +166,7 @@ fn scan_thumb_push_prologues(
     let mut i = start + misalign;
     while i + 2 <= end {
         if target.bytes[i] == 0x80 && target.bytes[i + 1] == 0xb5 {
-            out.push(sec.addr + (i - start) as u64);
+            out.push(sec.addr.saturating_add((i - start) as u64));
         }
         i += 2;
     }
@@ -178,13 +178,13 @@ fn scan_thumb_push_prologues(
 /// (`jmp`, `b`), stops at `ret`, indirect jumps (`br` / register `jmp`),
 /// and invalid bytes — so functions no longer bleed into padding or the
 /// next function. Conditional branches fall through.
-fn function_body(target: &Target, start: u64, max: u64) -> (u64, Vec<u64>) {
+pub(crate) fn function_body(target: &Target, start: u64, max: u64) -> (u64, Vec<u64>) {
     let mut visited: BTreeSet<u64> = BTreeSet::new();
     let mut calls: Vec<u64> = Vec::new();
     let mut work = vec![start];
     let mut end = start;
     while let Some(addr) = work.pop() {
-        if addr < start || addr >= start + max || !visited.insert(addr) {
+        if addr < start || addr >= start.saturating_add(max) || !visited.insert(addr) {
             continue;
         }
         let Ok(insns) = disasm::disassemble(target, addr, 64) else {
@@ -196,7 +196,7 @@ fn function_body(target: &Target, start: u64, max: u64) -> (u64, Vec<u64>) {
         let mut jumped = false;
         for ins in &insns {
             visited.insert(ins.addr);
-            end = end.max(ins.addr + ins.size as u64);
+            end = end.max(ins.addr.saturating_add(ins.size as u64));
             match ins.mnemonic.as_str() {
                 // Exact mnemonics: `b` must not swallow `bl` or `b.ne`,
                 // and `bl` must not swallow `blr`. Thumb `blx` is a call.
@@ -221,7 +221,7 @@ fn function_body(target: &Target, start: u64, max: u64) -> (u64, Vec<u64>) {
                 "jmp" | "b" | "br" => {
                     jumped = false;
                     if let Some(t) = direct_target(&ins.operands) {
-                        if t > ins.addr && t < start + max {
+                        if t > ins.addr && t < start.saturating_add(max) {
                             // forward jump inside the body: continue there
                             work.push(t);
                             jumped = true;
@@ -236,8 +236,8 @@ fn function_body(target: &Target, start: u64, max: u64) -> (u64, Vec<u64>) {
         if !jumped {
             // chunk ran out without a terminator: keep going linearly
             if let Some(last) = insns.last() {
-                let next = last.addr + last.size as u64;
-                if next < start + max {
+                let next = last.addr.saturating_add(last.size as u64);
+                if next < start.saturating_add(max) {
                     work.push(next);
                 }
             }
@@ -250,7 +250,7 @@ fn function_body(target: &Target, start: u64, max: u64) -> (u64, Vec<u64>) {
 
 /// First operand when it is a bare hex immediate (`0x…` or Capstone's `#0x…`).
 /// Memory operands (`qword ptr [rip + 0x10]`) and anything non-hex are rejected.
-fn direct_target(operands: &str) -> Option<u64> {
+pub(crate) fn direct_target(operands: &str) -> Option<u64> {
     let token = operands
         .split(|c: char| c == ',' || c == ' ' || c == '\t')
         .next()
@@ -275,7 +275,7 @@ fn symbol_seeds(target: &Target) -> Vec<u64> {
             target.sections.iter().any(|sec| {
                 matches!(sec.name.as_str(), "__text" | ".text" | "CODE" | ".init" | ".fini")
                     && sym.addr >= sec.addr
-                    && sym.addr < sec.addr + sec.size
+                    && sym.addr < sec.addr.saturating_add(sec.size)
             })
         })
         .map(|sym| sym.addr)
@@ -393,7 +393,7 @@ fn pc_relative_index(target: &Target) -> BTreeMap<u64, Vec<u64>> {
         .filter(|sec| sec.size > 0 && matches!(sec.name.as_str(), "__text" | ".text"))
     {
         let start = sec.file_offset as usize;
-        let end = (start + sec.size as usize).min(target.bytes.len());
+        let end = start.saturating_add(sec.size as usize).min(target.bytes.len());
         if start >= end {
             continue;
         }
@@ -651,12 +651,15 @@ pub fn data_xrefs(target: &Target, addr: u64) -> Vec<XRef> {
     let mut out = Vec::new();
     for sec in code_sections(target) {
         let start = sec.file_offset as usize;
-        let end = (start + sec.size as usize).min(target.bytes.len());
+        let end = start.saturating_add(sec.size as usize).min(target.bytes.len());
+        if start >= end {
+            continue;
+        }
         let mut i = start;
         while i + width <= end {
             if &target.bytes[i..i + width] == needle {
                 out.push(XRef {
-                    from: sec.addr + (i - start) as u64,
+                    from: sec.addr.saturating_add((i - start) as u64),
                     to: addr,
                 });
             }
@@ -682,7 +685,7 @@ fn code_pointer_index(target: &Target) -> BTreeMap<u64, Vec<u64>> {
     let mut index: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
     for sec in code_sections(target) {
         let start = sec.file_offset as usize;
-        let end = (start + sec.size as usize).min(target.bytes.len());
+        let end = start.saturating_add(sec.size as usize).min(target.bytes.len());
         if start >= end {
             continue;
         }
@@ -710,7 +713,7 @@ fn code_pointer_index(target: &Target) -> BTreeMap<u64, Vec<u64>> {
             index
                 .entry(key)
                 .or_default()
-                .push(sec.addr + (i - start) as u64);
+                .push(sec.addr.saturating_add((i - start) as u64));
         }
     }
     index
@@ -729,14 +732,14 @@ pub fn strings_with_xrefs(target: &Target, min_len: usize) -> Vec<AnnotatedStrin
         let Some(sec) = target
             .sections
             .iter()
-            .find(|s| hit.offset >= s.file_offset && hit.offset < s.file_offset + s.size)
+            .find(|s| hit.offset >= s.file_offset && hit.offset < s.file_offset.saturating_add(s.size))
         else {
             continue;
         };
-        let vaddr = sec.addr + (hit.offset - sec.file_offset);
+        let vaddr = sec.addr.saturating_add(hit.offset - sec.file_offset);
         let len = hit.value.len() as u64;
         let lo = vaddr.saturating_sub(16);
-        let hi = vaddr + len;
+        let hi = vaddr.saturating_add(len);
         let mut refs: Vec<u64> = Vec::new();
         let mut p = lo;
         while p <= hi {
@@ -750,6 +753,9 @@ pub fn strings_with_xrefs(target: &Target, min_len: usize) -> Vec<AnnotatedStrin
             }
             if let Some(locs) = pcrel.get(&p) {
                 refs.extend_from_slice(locs);
+            }
+            if p == hi {
+                break;
             }
             p += 1;
         }
@@ -777,6 +783,98 @@ pub struct AnnotatedString {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Format, Section, Symbol, SymbolKind, Target};
+
+    #[test]
+    fn a_symbol_in_a_high_section_does_not_panic_discovery() {
+        // Regression: symbol_seeds computed `sec.addr + sec.size`, which
+        // overflowed for a section near u64::MAX carrying a symbol.
+        let t = Target {
+            path: "fixture".into(),
+            format: Format::Elf,
+            arch: Arch::X86_64,
+            bits: 64,
+            little_endian: true,
+            entry: 0,
+            sections: vec![Section {
+                name: ".text".into(),
+                addr: 0xffff_ffff_ffff_fff0,
+                size: 0x20,
+                file_offset: 0,
+                perms: "r-x".into(),
+                sh_type: None,
+                sh_flags: None,
+            }],
+            symbols: vec![Symbol {
+                addr: 0xffff_ffff_ffff_fff0,
+                size: 0,
+                name: "f".into(),
+                demangled: None,
+                kind: SymbolKind::Export,
+            }],
+            page_map: None,
+            bytes: vec![0x90; 32],
+        };
+        let _ = discover_functions(&t); // must simply not panic
+    }
+
+    #[test]
+    fn strings_xrefs_survive_hostile_section_bounds() {
+        // Regression: strings_with_xrefs added file_offset + size at :732,
+        // which overflowed for size u64::MAX - 4. The string sits at file
+        // offset 8 so the section lookup actually evaluates the add.
+        let mut bytes = vec![0u8; 8];
+        bytes.extend_from_slice(b"hello world!!!!\0");
+        let t = Target {
+            path: "fixture".into(),
+            format: Format::Elf,
+            arch: Arch::X86_64,
+            bits: 64,
+            little_endian: true,
+            entry: 0,
+            sections: vec![Section {
+                name: ".text".into(),
+                addr: 0xffff_ffff_ffff_fff0,
+                size: u64::MAX - 4,
+                file_offset: 8,
+                perms: "r-x".into(),
+                sh_type: None,
+                sh_flags: None,
+            }],
+            symbols: Vec::new(),
+            page_map: None,
+            bytes,
+        };
+        let _ = strings_with_xrefs(&t, 8); // must simply not panic
+    }
+
+    #[test]
+    fn strings_xrefs_walk_stops_at_u64_max() {
+        // Regression: the xref walk did p += 1 after reaching hi == u64::MAX
+        // and overflowed at :754. A 15-byte run at vaddr u64::MAX - 15 puts
+        // hi exactly at u64::MAX without any add overflowing.
+        let t = Target {
+            path: "fixture".into(),
+            format: Format::Elf,
+            arch: Arch::X86_64,
+            bits: 64,
+            little_endian: true,
+            entry: 0,
+            sections: vec![Section {
+                name: ".text".into(),
+                addr: u64::MAX - 15,
+                size: 16,
+                file_offset: 0,
+                perms: "r-x".into(),
+                sh_type: None,
+                sh_flags: None,
+            }],
+            symbols: Vec::new(),
+            page_map: None,
+            bytes: b"hello world!!!!\0".to_vec(),
+        };
+        let _ = strings_with_xrefs(&t, 8); // must simply not panic
+    }
 
     #[test]
     fn finds_data_xref_pattern() {
@@ -795,6 +893,8 @@ mod tests {
                 size: bytes.len() as u64,
                 file_offset: 0,
                 perms: "---".into(),
+                sh_type: None,
+                sh_flags: None,
             }],
             symbols: vec![],
             bytes,
@@ -803,6 +903,35 @@ mod tests {
         let refs = data_xrefs(&target, 0x1000);
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].from, 0x1002);
+    }
+
+    #[test]
+    fn data_xrefs_survive_a_hostile_section_file_offset() {
+        // A section whose file_offset is u64::MAX: start saturates to
+        // usize::MAX, end clamps to the file length, and the old loop
+        // condition `i + width <= end` overflowed before comparing.
+        let bytes = vec![0x90u8; 8];
+        let target = Target {
+            path: "synthetic".into(),
+            format: crate::Format::Elf,
+            arch: Arch::X86,
+            bits: 32,
+            little_endian: true,
+            entry: 0,
+            sections: vec![crate::Section {
+                name: "hostile".into(),
+                addr: 0x1000,
+                size: 1,
+                file_offset: u64::MAX,
+                perms: "---".into(),
+                sh_type: None,
+                sh_flags: None,
+            }],
+            symbols: vec![],
+            bytes,
+            page_map: None,
+        };
+        assert!(data_xrefs(&target, 0x1000).is_empty());
     }
 
     #[test]
@@ -849,6 +978,8 @@ mod tests {
                 size: code.len() as u64,
                 file_offset: 0,
                 perms: "---".into(),
+                sh_type: None,
+                sh_flags: None,
             }],
             symbols: vec![],
             bytes,
@@ -933,6 +1064,8 @@ mod tests {
                 size: 1,
                 file_offset: 0,
                 perms: "---".into(),
+                sh_type: None,
+                sh_flags: None,
             }],
             symbols: vec![crate::Symbol::new(0x1000, 0, "f", kind)],
             bytes,
@@ -969,6 +1102,8 @@ mod tests {
                 size: bytes.len() as u64,
                 file_offset: 0,
                 perms: "---".into(),
+                sh_type: None,
+                sh_flags: None,
             }],
             symbols: vec![],
             bytes: bytes.to_vec(),
@@ -1024,6 +1159,8 @@ mod tests {
                 size: 8,
                 file_offset: 0,
                 perms: "---".into(),
+                sh_type: None,
+                sh_flags: None,
             }],
             bytes,
         );
@@ -1048,6 +1185,8 @@ mod tests {
                 size: 8,
                 file_offset: 0,
                 perms: "---".into(),
+                sh_type: None,
+                sh_flags: None,
             }],
             bytes,
         );
@@ -1071,6 +1210,8 @@ mod tests {
                 size: 12,
                 file_offset: 0,
                 perms: "---".into(),
+                sh_type: None,
+                sh_flags: None,
             }],
             bytes,
         );
@@ -1090,6 +1231,8 @@ mod tests {
                 size: 7,
                 file_offset: 0,
                 perms: "---".into(),
+                sh_type: None,
+                sh_flags: None,
             }],
             bytes,
         );
@@ -1111,6 +1254,8 @@ mod tests {
                 size: bytes.len() as u64,
                 file_offset: 0,
                 perms: "---".into(),
+                sh_type: None,
+                sh_flags: None,
             }],
             bytes,
         );
@@ -1131,6 +1276,8 @@ mod tests {
                 size: 2,
                 file_offset: 0,
                 perms: "---".into(),
+                sh_type: None,
+                sh_flags: None,
             }],
             bytes,
         );
@@ -1151,6 +1298,8 @@ mod tests {
                 size: 4,
                 file_offset: 0,
                 perms: "---".into(),
+                sh_type: None,
+                sh_flags: None,
             }],
             bytes,
         );
@@ -1172,6 +1321,8 @@ mod tests {
                     size: 8,
                     file_offset: 0,
                     perms: "---".into(),
+                    sh_type: None,
+                    sh_flags: None,
                 },
                 crate::Section {
                     name: "__cstring".into(),
@@ -1179,6 +1330,8 @@ mod tests {
                     size: 6,
                     file_offset: 8,
                     perms: "---".into(),
+                    sh_type: None,
+                    sh_flags: None,
                 },
             ],
             bytes,

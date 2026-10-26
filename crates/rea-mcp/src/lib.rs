@@ -374,7 +374,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "rea_sections",
-            "description": "List sections of a binary with names, virtual addresses, sizes, file offsets, and rwx permissions. Optional arch selects a Mach-O slice (arm64, x86_64, arm, x86). The default is the host slice.",
+            "description": "List sections of a binary with names, virtual addresses, sizes, file offsets, and rwx permissions. ELF sections also carry the sh_type name (PROGBITS, NOBITS, ...) and SHF_ flags beyond the rwx bits. Optional arch selects a Mach-O slice (arm64, x86_64, arm, x86). The default is the host slice.",
             "inputSchema": schema(false, json!({
                 "arch": { "type": "string", "description": "Mach-O slice. Default is the host slice." }
             }), &[]),
@@ -435,7 +435,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "rea_macho",
-            "description": "Mach-O dylibs, UUID, build version, rpaths, code-directory identifier, hash type, team id, hash-slot digests, the CMS blob, cms_verified when the hash type is sha1 or sha256, an embedded Info.plist, an overlay, fat architectures, and rpath file hits. cms_verified is a digest window, not an Apple trust decision. A missing blob does not fail the parse.",
+            "description": "Mach-O dylibs, UUID, build version, rpaths, code-directory identifier, hash type, team id, hash-slot digests, the special-slot count, exec-segment offset, size, and flags, the CMS blob, cms_verified when the hash type is sha1 or sha256, entitlements keys and capped XML, the DER entitlements slot size, an embedded Info.plist, an overlay, fat architectures, and rpath file hits. cms_verified is a digest window, not an Apple trust decision. A missing blob does not fail the parse.",
             "inputSchema": schema(true, json!({}), &[]),
         }),
         json!({
@@ -454,12 +454,12 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "rea_elf",
-            "description": "ELF file type, machine, interpreter, needed libraries, soname, rpath, runpath, GNU build-id, and rpath or runpath file hits.",
+            "description": "ELF file type, machine, interpreter, needed libraries, soname, rpath, runpath, GNU build-id, notes from PT_NOTE segments and SHT_NOTE sections, decoded GNU property bits, and rpath or runpath file hits.",
             "inputSchema": schema(true, json!({}), &[]),
         }),
         json!({
             "name": "rea_decompile",
-            "description": "Bounded pseudo-C at a virtual address: assignments, calls, gotos, and returns. Width-based types on x86_64 and arm64: typed synthetic locals, casts at call arguments and returns. No dataflow across basic blocks. Optional arch selects a Mach-O slice.",
+            "description": "Bounded pseudo-C at a virtual address: assignments, calls, gotos, and returns, following unconditional jumps inside the enclosing function (up to 64 instructions, 8 hops). Width-based types on x86_64 and arm64: typed synthetic locals, casts at call arguments and returns; types cross a followed join only when trivially carried. No memory-object or struct types, no cross-function dataflow. Optional arch selects a Mach-O slice.",
             "inputSchema": schema(false, json!({
                 "address": { "type": "integer", "description": "Virtual address. Default is the entry point." },
                 "count": { "type": "integer", "description": "Maximum instructions (default 32, cap 64)." },
