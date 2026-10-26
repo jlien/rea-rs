@@ -1,4 +1,4 @@
-//! Load-command facts for one Mach-O slice, plus each fat slice's uuid, dylibs, rpaths, build version, and code directory.
+//! Load-command facts for one Mach-O slice, plus each fat slice's uuid, dylibs, rpaths, build version, code directory, and entitlements.
 
 use crate::{Error, Result};
 
@@ -19,6 +19,12 @@ pub struct MachoFacts {
     /// `Some(true)` when a sha1 or sha256 digest of the code directory is a contiguous window in the stored CMS bytes.
     /// `Some(false)` when both are present and the digest is absent. `None` otherwise. This is not an Apple trust decision.
     pub cms_verified: Option<bool>,
+    /// Entitlements slot (`0x10005`) of the CMS superblob: top-level keys with their immediate string or boolean
+    /// values, and the XML payload capped at 8 KiB (hex when the payload is not XML). `None` when the slot is absent
+    /// or empty. Not an Apple trust decision.
+    pub entitlements: Option<MachoEntitlements>,
+    /// Byte size of the DER entitlements slot (`0x10006`), when present. The DER contents stay unparsed.
+    pub entitlements_der_size: Option<u32>,
     /// XML `__info_plist` section, when its identifying keys are present.
     pub info_plist: Option<crate::plist::PlistInfo>,
     /// Bytes past the last segment's file range.
@@ -36,6 +42,14 @@ pub struct MachoSignature {
     pub team_id: Option<String>,
     /// Hash slots that fit in the code directory. Special slots use a negative index. Slots that do not fit are omitted.
     pub hashes: Vec<MachoHashSlot>,
+    /// `nSpecialSlots` — the count of special hash slots that precede the code slots.
+    pub special_slots: u32,
+    /// `execSegBase` from code directory version `0x20400` or later. The segment is not validated.
+    pub exec_seg_offset: Option<u64>,
+    /// `execSegLimit - execSegBase` from code directory version `0x20400` or later.
+    pub exec_seg_size: Option<u64>,
+    /// `execSegFlags` from code directory version `0x20400` or later.
+    pub exec_seg_flags: Option<u64>,
 }
 
 /// One code-directory hash slot. `index` `-1` is the first special slot.
@@ -53,6 +67,27 @@ pub struct MachoBlob {
     pub magic: u32,
     pub length: u32,
     pub bytes: Vec<u8>,
+}
+
+/// One entitlement key with its immediate plist value.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct MachoEntitlement {
+    /// Top-level `<key>` name.
+    pub key: String,
+    /// The immediate `<string>` text, or `true`/`false` for `<true/>`/`<false/>`. `None` for every other value kind
+    /// (array, dict, data, date, integer, real) and for a key with no readable value.
+    pub value: Option<String>,
+}
+
+/// The entitlements slot (`0x10005`) of a CMS superblob. This is a read of stored bytes, not an Apple trust decision.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct MachoEntitlements {
+    /// Top-level keys with their immediate string or boolean values, in file order. Keys inside nested dicts and
+    /// arrays are not listed.
+    pub entries: Vec<MachoEntitlement>,
+    /// The XML payload capped at 8 KiB with an appended `…` marker. A payload that is not XML is the lowercase hex
+    /// of its first 8 KiB, with the same marker when truncated.
+    pub payload: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -75,6 +110,10 @@ pub struct MachoArch {
     pub cms: Option<MachoBlob>,
     /// Same check as [`MachoFacts::cms_verified`] for this slice.
     pub cms_verified: Option<bool>,
+    /// Entitlements of this slice, same shape as [`MachoFacts::entitlements`]. `None` when the slice is absent or the slot does not fit.
+    pub entitlements: Option<MachoEntitlements>,
+    /// DER entitlements slot size of this slice, same shape as [`MachoFacts::entitlements_der_size`].
+    pub entitlements_der_size: Option<u32>,
     /// XML `__info_plist` of this slice.
     pub info_plist: Option<crate::plist::PlistInfo>,
     /// Bytes past this slice's last segment.
@@ -97,6 +136,8 @@ pub fn facts(bytes: &[u8]) -> Result<MachoFacts> {
         signature: body.signature,
         cms: body.cms,
         cms_verified: body.cms_verified,
+        entitlements: body.entitlements,
+        entitlements_der_size: body.entitlements_der_size,
         info_plist: body.info_plist,
         overlay: body.overlay,
     })
@@ -113,6 +154,8 @@ struct SliceBody {
     signature: Option<MachoSignature>,
     cms: Option<MachoBlob>,
     cms_verified: Option<bool>,
+    entitlements: Option<MachoEntitlements>,
+    entitlements_der_size: Option<u32>,
     info_plist: Option<crate::plist::PlistInfo>,
     overlay: Option<crate::Overlay>,
 }
@@ -142,12 +185,13 @@ fn slice_body(mo: &goblin::mach::MachO, bytes: &[u8]) -> SliceBody {
             goblin::mach::load_command::CommandVariant::CodeSignature(_)
         )
     });
-    let (signature, cms, cms_verified) = mo.load_commands.iter().find_map(|cmd| match &cmd.command {
-        goblin::mach::load_command::CommandVariant::CodeSignature(linkedit) => {
-            Some(signature_parts(bytes, linkedit.dataoff, linkedit.datasize))
-        }
-        _ => None,
-    }).unwrap_or((None, None, None));
+    let (signature, cms, cms_verified, entitlements, entitlements_der_size) =
+        mo.load_commands.iter().find_map(|cmd| match &cmd.command {
+            goblin::mach::load_command::CommandVariant::CodeSignature(linkedit) => {
+                Some(signature_parts(bytes, linkedit.dataoff, linkedit.datasize))
+            }
+            _ => None,
+        }).unwrap_or((None, None, None, None, None));
     SliceBody {
         dylibs: mo.libs.iter().map(|lib| (*lib).to_string()).collect(),
         rpaths: mo.rpaths.iter().map(|path| (*path).to_string()).collect(),
@@ -159,6 +203,8 @@ fn slice_body(mo: &goblin::mach::MachO, bytes: &[u8]) -> SliceBody {
         signature,
         cms,
         cms_verified,
+        entitlements,
+        entitlements_der_size,
         info_plist: embedded_plist(mo),
         overlay: crate::trailing_overlay(segment_file_end(mo), bytes.len() as u64),
     }
@@ -194,22 +240,37 @@ fn embedded_plist(mo: &goblin::mach::MachO) -> Option<crate::plist::PlistInfo> {
 
 const CSMAGIC_EMBEDDED_SIGNATURE: u32 = 0xfade_0cc0;
 const CSMAGIC_CODEDIRECTORY: u32 = 0xfade_0c02;
+const CSMAGIC_BLOBWRAPPER: u32 = 0xfade_0b01;
 const CSSLOT_CODEDIRECTORY: u32 = 0;
 const CSSLOT_SIGNATURESLOT: u32 = 0x10000;
+const CSSLOT_ENTITLEMENTS: u32 = 0x10005;
+const CSSLOT_ENTITLEMENTS_DER: u32 = 0x10006;
 const CODE_DIRECTORY_BASE: usize = 44;
 const TEAM_OFFSET_FIELD: usize = 48;
+const EXEC_SEG_BASE_FIELD: usize = 64;
+const EXEC_SEG_LIMIT_FIELD: usize = 72;
+const EXEC_SEG_FLAGS_FIELD: usize = 80;
+const EXEC_SEG_END: usize = 88;
+const EXEC_SEG_VERSION: u32 = 0x20400;
 const BLOB_BYTE_CAP: usize = 4096;
+const ENTITLEMENTS_XML_CAP: usize = 8192;
 
-/// Code directory and CMS blob from `LC_CODE_SIGNATURE`.
+/// Code directory, CMS blob, and entitlement slots from `LC_CODE_SIGNATURE`.
 ///
 /// A missing blob, a bad magic, a short directory, or a slot that does not fit is `None` and does not fail the Mach-O parse.
 fn signature_parts(
     bytes: &[u8],
     dataoff: u32,
     datasize: u32,
-) -> (Option<MachoSignature>, Option<MachoBlob>, Option<bool>) {
+) -> (
+    Option<MachoSignature>,
+    Option<MachoBlob>,
+    Option<bool>,
+    Option<MachoEntitlements>,
+    Option<u32>,
+) {
     let Some(blob) = superblob(bytes, dataoff, datasize) else {
-        return (None, None, None);
+        return (None, None, None, None, None);
     };
     let signature = code_directory(blob);
     let cms = cms_blob(blob);
@@ -217,7 +278,178 @@ fn signature_parts(
         (Some(directory), Some(cms)) => cms_digest_present(directory, &cms.bytes),
         _ => None,
     };
-    (signature, cms, verified)
+    let entitlements = entitlements_slot(blob);
+    let entitlements_der_size = slot_bytes(blob, CSSLOT_ENTITLEMENTS_DER).map(|der| {
+        let declared = if der.len() >= 8 { be_u32(der, 4).map(|v| v as usize) } else { None };
+        match declared {
+            Some(v) if v >= 8 && v <= der.len() => v as u32,
+            _ => der.len() as u32,
+        }
+    });
+    (signature, cms, verified, entitlements, entitlements_der_size)
+}
+
+/// The bytes of one superblob slot. The slot blob's declared length (big-endian at its offset + 4) is honored when it
+/// fits, so a slot that is not last in the index does not swallow the slots after it; otherwise the bytes run to the
+/// end of the superblob.
+fn slot_bytes(blob: &[u8], slot_type: u32) -> Option<&[u8]> {
+    let length = blob.len();
+    let count = be_u32(blob, 8)? as usize;
+    let index_end = 12usize.checked_add(count.checked_mul(8)?)?;
+    if index_end > length {
+        return None;
+    }
+    let off = (0..count).find_map(|i| {
+        let at = 12 + i * 8;
+        let ty = be_u32(blob, at)?;
+        let slot = be_u32(blob, at + 4)? as usize;
+        (ty == slot_type).then_some(slot)
+    })?;
+    let rest = blob.get(off..length)?;
+    if rest.len() >= 8 {
+        if let Some(declared) = be_u32(rest, 4).map(|v| v as usize) {
+            if declared >= 8 && declared <= rest.len() {
+                return Some(&rest[..declared]);
+            }
+        }
+    }
+    Some(rest)
+}
+
+/// Entitlements XML from slot `0x10005`. A `blob-wrapper` header (`0xfade_0b01`) is stripped. An empty or absent slot
+/// is `None`.
+fn entitlements_slot(blob: &[u8]) -> Option<MachoEntitlements> {
+    let slot = slot_bytes(blob, CSSLOT_ENTITLEMENTS)?;
+    let payload = if slot.len() >= 8 && be_u32(slot, 0) == Some(CSMAGIC_BLOBWRAPPER) {
+        let declared = be_u32(slot, 4)? as usize;
+        if declared >= 8 && declared <= slot.len() {
+            &slot[8..declared]
+        } else {
+            &slot[8..]
+        }
+    } else {
+        slot
+    };
+    if payload.is_empty() {
+        return None;
+    }
+    let xml = std::str::from_utf8(payload)
+        .ok()
+        .filter(|text| text.contains("<plist") || text.contains("<dict"));
+    let entries = xml.map(entitlement_entries).unwrap_or_default();
+    let payload = match xml {
+        Some(text) => cap_text(text),
+        None => cap_hex(payload),
+    };
+    Some(MachoEntitlements { entries, payload })
+}
+
+/// Top-level `<key>` names with their immediate `<string>` or boolean value. Content inside a nested `<dict>` or
+/// `<array>` is skipped, so its keys are not listed. A truncated payload keeps the keys that parsed.
+fn entitlement_entries(text: &str) -> Vec<MachoEntitlement> {
+    let mut out = Vec::new();
+    let mut at = match text.find("<dict") {
+        Some(open) => open + "<dict".len(),
+        None => return out,
+    };
+    while let Some(key_at) = text[at..].find("<key>") {
+        let key_at = at + key_at + "<key>".len();
+        let Some(key_end) = text[key_at..].find("</key>") else {
+            break;
+        };
+        let key = text[key_at..key_at + key_end].trim().to_string();
+        let after_key = key_at + key_end + "</key>".len();
+        at = match immediate_value(text, after_key) {
+            Some((value, next)) => {
+                out.push(MachoEntitlement { key, value });
+                next
+            }
+            None => after_key,
+        };
+    }
+    out
+}
+
+/// The value element right after a `</key>`: `Some((value, offset past it))` for a `<string>`, `<true/>`, or
+/// `<false/>`, and `Some((None, offset past it))` for any other complete element that is skipped. `None` when no
+/// element starts there.
+fn immediate_value(text: &str, at: usize) -> Option<(Option<String>, usize)> {
+    let tag_at = at + text[at..].find('<')?;
+    if text[tag_at..].starts_with("<string>") {
+        let rest = &text[tag_at + "<string>".len()..];
+        let end = rest.find("</string>")?;
+        let value = rest[..end].trim();
+        let value = (!value.is_empty()).then(|| value.to_string());
+        return Some((value, tag_at + "<string>".len() + end + "</string>".len()));
+    }
+    for (tag, value) in [("<true/>", "true"), ("<false/>", "false")] {
+        if text[tag_at..].starts_with(tag) {
+            return Some((Some(value.to_string()), tag_at + tag.len()));
+        }
+    }
+    if text[tag_at..].starts_with("<dict") || text[tag_at..].starts_with("<array") {
+        let name_end = text[tag_at..].find(['>', ' '])?;
+        let name = &text[tag_at + 1..tag_at + name_end];
+        let next = skip_element(text, tag_at, name)?;
+        return Some((None, next));
+    }
+    None
+}
+
+/// Offset past the element `<name ...>` that starts at `start`, nesting-aware. Self-closing tags pass through.
+/// An element that never closes stops the scan at the end of `text`.
+fn skip_element(text: &str, start: usize, name: &str) -> Option<usize> {
+    let open = format!("<{name}");
+    let close = format!("</{name}>");
+    let mut depth = 0usize;
+    let mut at = start;
+    loop {
+        let open_at = text[at..].find(&open).map(|i| at + i);
+        let close_at = text[at..].find(&close).map(|i| at + i);
+        match (open_at, close_at) {
+            (None, None) => return Some(text.len()),
+            (o, c) if o.is_some() && (c.is_none() || o < c) => {
+                let o = o?;
+                let tag_end = text[o..].find('>')? + o + 1;
+                if text[..tag_end].ends_with("/>") {
+                    at = tag_end;
+                } else {
+                    depth += 1;
+                    at = tag_end;
+                }
+            }
+            (_, c) => {
+                let c = c?;
+                depth -= 1;
+                at = c + close.len();
+                if depth == 0 {
+                    return Some(at);
+                }
+            }
+        }
+    }
+}
+
+/// The payload text capped at 8 KiB on a char boundary, with `…` appended when truncated.
+fn cap_text(text: &str) -> String {
+    if text.len() <= ENTITLEMENTS_XML_CAP {
+        return text.to_string();
+    }
+    let mut end = ENTITLEMENTS_XML_CAP;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
+}
+
+/// Lowercase hex of the first 8 KiB, with `…` appended when the payload is longer.
+fn cap_hex(payload: &[u8]) -> String {
+    let taken = payload.len().min(ENTITLEMENTS_XML_CAP);
+    let mut out = payload[..taken].iter().map(|b| format!("{b:02x}")).collect::<String>();
+    if payload.len() > ENTITLEMENTS_XML_CAP {
+        out.push('…');
+    }
+    out
 }
 
 fn code_directory_bytes(blob: &[u8]) -> Option<&[u8]> {
@@ -292,6 +524,7 @@ fn code_directory(blob: &[u8]) -> Option<MachoSignature> {
         return None;
     }
     let version = be_u32(cd, 8)?;
+    let special_slots = be_u32(cd, 24).unwrap_or(0);
     let ident_off = be_u32(cd, 20)? as usize;
     let identifier = cstr_at(cd, cd_len, ident_off)?;
     let team_id = if version >= 0x20200 && cd_len >= TEAM_OFFSET_FIELD + 4 {
@@ -304,28 +537,31 @@ fn code_directory(blob: &[u8]) -> Option<MachoSignature> {
     } else {
         None
     };
+    let (exec_seg_offset, exec_seg_size, exec_seg_flags) = if version >= EXEC_SEG_VERSION && cd_len >= EXEC_SEG_END {
+        let base = be_u64(cd, EXEC_SEG_BASE_FIELD)?;
+        let limit = be_u64(cd, EXEC_SEG_LIMIT_FIELD)?;
+        (
+            Some(base),
+            Some(limit.saturating_sub(base)),
+            Some(be_u64(cd, EXEC_SEG_FLAGS_FIELD)?),
+        )
+    } else {
+        (None, None, None)
+    };
     Some(MachoSignature {
         identifier,
         hash_type: hash_name(cd[37]),
         team_id,
         hashes: hash_slots(cd, cd_len),
+        special_slots,
+        exec_seg_offset,
+        exec_seg_size,
+        exec_seg_flags,
     })
 }
 
 fn cms_blob(blob: &[u8]) -> Option<MachoBlob> {
-    let length = blob.len();
-    let count = be_u32(blob, 8)? as usize;
-    let index_end = 12usize.checked_add(count.checked_mul(8)?)?;
-    if index_end > length {
-        return None;
-    }
-    let off = (0..count).find_map(|i| {
-        let at = 12 + i * 8;
-        let ty = be_u32(blob, at)?;
-        let slot = be_u32(blob, at + 4)? as usize;
-        (ty == CSSLOT_SIGNATURESLOT).then_some(slot)
-    })?;
-    let rest = blob.get(off..length)?;
+    let rest = slot_bytes(blob, CSSLOT_SIGNATURESLOT)?;
     if rest.is_empty() {
         return None;
     }
@@ -407,6 +643,13 @@ fn be_u32(buf: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]))
 }
 
+fn be_u64(buf: &[u8], at: usize) -> Option<u64> {
+    let raw = buf.get(at..at + 8)?;
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(raw);
+    Some(u64::from_be_bytes(bytes))
+}
+
 fn cstr_at(buf: &[u8], limit: usize, off: usize) -> Option<String> {
     if off >= limit || off > buf.len() {
         return None;
@@ -437,7 +680,7 @@ fn hash_name(hash_type: u8) -> String {
 
 /// Architecture headers from the original file, which may be a fat archive.
 ///
-/// Each slice that is present contributes its uuid, dylibs, rpaths, build version, code directory, CMS blob, Info.plist, and overlay. A missing or unreadable slice leaves those fields empty and does not fail the parse.
+/// Each slice that is present contributes its uuid, dylibs, rpaths, build version, code directory, CMS blob, entitlements, Info.plist, and overlay. A missing or unreadable slice leaves those fields empty and does not fail the parse.
 pub fn architectures(bytes: &[u8]) -> Result<Vec<MachoArch>> {
     match goblin::mach::Mach::parse(bytes).map_err(|e| Error::Parse(format!("mach-o: {e}")))? {
         goblin::mach::Mach::Fat(multi) => {
@@ -478,6 +721,8 @@ fn arch_of(cpu: String, offset: u64, size: u64, slice: &[u8]) -> MachoArch {
         signature: body.signature,
         cms: body.cms,
         cms_verified: body.cms_verified,
+        entitlements: body.entitlements,
+        entitlements_der_size: body.entitlements_der_size,
         info_plist: body.info_plist,
         overlay: body.overlay,
     }
@@ -506,6 +751,8 @@ fn empty_slice() -> SliceBody {
         signature: None,
         cms: None,
         cms_verified: None,
+        entitlements: None,
+        entitlements_der_size: None,
         info_plist: None,
         overlay: None,
     }
@@ -580,6 +827,8 @@ mod tests {
                 signature: None,
                 cms: None,
                 cms_verified: None,
+                entitlements: None,
+                entitlements_der_size: None,
                 info_plist: None,
                 overlay: None,
             }]
@@ -616,6 +865,8 @@ mod tests {
                 signature: None,
                 cms: None,
                 cms_verified: None,
+                entitlements: None,
+                entitlements_der_size: None,
                 info_plist: None,
                 overlay: None,
             }]
@@ -716,6 +967,206 @@ mod tests {
         assert_eq!(facts(&file).unwrap().cms_verified, Some(true));
     }
 
+    /// A superblob with slot 0x10005 holding the XML `xml` and, when `der` is given, a DER slot after it.
+    fn entitled_macho(xml: &[u8], der: Option<&[u8]>) -> Vec<u8> {
+        let entitlements_len = 8 + xml.len();
+        let mut slot = vec![0u8; entitlements_len];
+        write_be(&mut slot, 0, CSMAGIC_BLOBWRAPPER);
+        write_be(&mut slot, 4, entitlements_len as u32);
+        slot[8..].copy_from_slice(xml);
+        let slots: &[(u32, &[u8])] = match der {
+            Some(der) => &[(CSSLOT_ENTITLEMENTS, &slot), (CSSLOT_ENTITLEMENTS_DER, der)],
+            None => &[(CSSLOT_ENTITLEMENTS, &slot)],
+        };
+        let index_len = slots.len() * 8;
+        let blob_len = 12 + index_len + slots.iter().map(|(_, s)| s.len()).sum::<usize>();
+        let mut blob = vec![0u8; blob_len];
+        write_be(&mut blob, 0, CSMAGIC_EMBEDDED_SIGNATURE);
+        write_be(&mut blob, 4, blob_len as u32);
+        write_be(&mut blob, 8, slots.len() as u32);
+        let mut at = 12 + index_len;
+        for (i, (ty, bytes)) in slots.iter().enumerate() {
+            write_be(&mut blob, 12 + i * 8, *ty);
+            write_be(&mut blob, 12 + i * 8 + 4, at as u32);
+            blob[at..at + bytes.len()].copy_from_slice(bytes);
+            at += bytes.len();
+        }
+        lc_signature_file(&blob)
+    }
+
+    /// One `LC_CODE_SIGNATURE` pointing at `blob` at offset 48.
+    fn lc_signature_file(blob: &[u8]) -> Vec<u8> {
+        let mut file = Vec::new();
+        let mut push = |v: u32| file.extend_from_slice(&v.to_le_bytes());
+        push(0xfeed_facf);
+        push(0x0100_000c);
+        push(0);
+        push(1);
+        push(1);
+        push(16);
+        push(0);
+        push(0);
+        push(0x1d);
+        push(16);
+        push(48);
+        push(blob.len() as u32);
+        file.extend_from_slice(blob);
+        file
+    }
+
+    fn entitlement_xml(keys: &[(&str, &str)]) -> Vec<u8> {
+        let mut xml = String::from("<?xml version=\"1.0\"?><plist version=\"1.0\"><dict>");
+        for (key, value) in keys {
+            xml.push_str(&format!("<key>{key}</key><string>{value}</string>"));
+        }
+        xml.push_str("</dict></plist>");
+        xml.into_bytes()
+    }
+
+    #[test]
+    fn reads_entitlements_keys_and_the_capped_xml() {
+        let xml = entitlement_xml(&[("com.example.container", "group.example"), ("keychain-access-groups", "x")]);
+        let got = facts(&entitled_macho(&xml, None)).unwrap();
+        let ent = got.entitlements.expect("entitlements");
+        assert_eq!(
+            ent.entries,
+            vec![
+                MachoEntitlement { key: "com.example.container".into(), value: Some("group.example".into()) },
+                MachoEntitlement { key: "keychain-access-groups".into(), value: Some("x".into()) },
+            ]
+        );
+        assert_eq!(ent.payload, String::from_utf8(xml).unwrap());
+
+        let mut long = entitlement_xml(&[("one", "1")]);
+        long.extend(std::iter::repeat(b'a').take(ENTITLEMENTS_XML_CAP + 64));
+        let got = facts(&entitled_macho(&long, None)).unwrap();
+        let ent = got.entitlements.expect("entitlements");
+        assert_eq!(ent.payload.len(), ENTITLEMENTS_XML_CAP + "…".len());
+        assert!(ent.payload.ends_with('…'));
+        assert!(ent.payload.starts_with("<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>one</key>"));
+    }
+
+    #[test]
+    fn boolean_and_nested_entitlement_values() {
+        let xml = b"<?xml version=\"1.0\"?><plist><dict>\
+            <key>get-task-allow</key><true/>\
+            <key>com.apple.private.skip-library-validation</key><false/>\
+            <key>com.apple.security.application-groups</key><array><string>group.inner</string></array>\
+            <key>platform-application</key><string>yes</string>\
+            </dict></plist>";
+        let got = facts(&entitled_macho(xml, None)).unwrap();
+        assert_eq!(
+            got.entitlements.expect("entitlements").entries,
+            vec![
+                MachoEntitlement { key: "get-task-allow".into(), value: Some("true".into()) },
+                MachoEntitlement { key: "com.apple.private.skip-library-validation".into(), value: Some("false".into()) },
+                MachoEntitlement { key: "com.apple.security.application-groups".into(), value: None },
+                MachoEntitlement { key: "platform-application".into(), value: Some("yes".into()) },
+            ]
+        );
+    }
+
+    #[test]
+    fn non_xml_entitlement_payload_stays_hex() {
+        let got = facts(&entitled_macho(b"\x30\x82\x01\x0a\x02\x01\x01", None)).unwrap();
+        let ent = got.entitlements.expect("entitlements");
+        assert!(ent.entries.is_empty());
+        assert_eq!(ent.payload, "3082010a020101");
+    }
+
+    #[test]
+    fn der_slot_is_a_size_only() {
+        let der = b"\x30\x82\x04\x10\x02\x01\x01";
+        let xml = entitlement_xml(&[("com.example.one", "1")]);
+        let got = facts(&entitled_macho(&xml, Some(der))).unwrap();
+        assert_eq!(got.entitlements_der_size, Some(der.len() as u32));
+        assert_eq!(got.entitlements.expect("entitlements").entries.len(), 1);
+
+        let got = facts(&entitled_macho(&xml, None)).unwrap();
+        assert_eq!(got.entitlements_der_size, None);
+    }
+
+    #[test]
+    fn missing_entitlements_slot_is_none() {
+        let got = facts(&signed_macho()).unwrap();
+        assert_eq!(got.entitlements, None);
+        assert_eq!(got.entitlements_der_size, None);
+        assert!(architectures(&signed_macho()).unwrap()[0].entitlements.is_none());
+    }
+
+    #[test]
+    fn mid_index_entitlement_slot_does_not_swallow_the_der_slot() {
+        let xml = entitlement_xml(&[("com.example.two", "2")]);
+        let der = b"\x30\x03\x02\x01\x01";
+        let file = entitled_macho(&xml, Some(der));
+        let got = facts(&file).unwrap();
+        assert_eq!(got.entitlements_der_size, Some(5));
+        let xml = std::str::from_utf8(&xml).unwrap();
+        assert!(got.entitlements.expect("entitlements").payload.starts_with(xml));
+    }
+
+    #[test]
+    fn fat_slices_keep_their_own_entitlements() {
+        let xml_arm = entitlement_xml(&[("com.example.arm", "arm")]);
+        let xml_intel = entitlement_xml(&[("com.example.intel", "intel")]);
+        let arm = entitled_macho(&xml_arm, None);
+        let intel = entitled_macho(&xml_intel, None);
+        let bytes = fat_two(&arm, &intel);
+        let arches = architectures(&bytes).unwrap();
+        let arm_ent = arches[0].entitlements.as_ref().expect("arm entitlements");
+        let intel_ent = arches[1].entitlements.as_ref().expect("intel entitlements");
+        assert_eq!(arm_ent.entries[0].key, "com.example.arm");
+        assert_eq!(intel_ent.entries[0].key, "com.example.intel");
+        assert!(arches[0].entitlements_der_size.is_none());
+
+        let mixed = fat_two(&entitled_macho(&xml_arm, None), b"not-a-slice");
+        let arches = architectures(&mixed).unwrap();
+        assert!(arches[0].entitlements.is_some());
+        assert!(arches[1].entitlements.is_none());
+        assert!(arches[1].entitlements_der_size.is_none());
+    }
+
+    #[test]
+    fn exec_segment_fields_come_from_a_newer_code_directory() {
+        let mut cd = vec![0u8; 96];
+        write_be(&mut cd, 0, CSMAGIC_CODEDIRECTORY);
+        write_be(&mut cd, 4, 96);
+        write_be(&mut cd, 8, 0x20500);
+        write_be(&mut cd, 20, 52);
+        write_be(&mut cd, 24, 1);
+        cd[37] = 2;
+        write_be(&mut cd, 48, 52);
+        cd[64..72].copy_from_slice(&0u64.to_be_bytes());
+        cd[72..80].copy_from_slice(&4096u64.to_be_bytes());
+        cd[80..88].copy_from_slice(&1u64.to_be_bytes());
+        let blob = cd_blob(&cd);
+        let got = facts(&lc_signature_file(&blob)).unwrap();
+        let sig = got.signature.expect("signature");
+        assert_eq!(sig.exec_seg_offset, Some(0));
+        assert_eq!(sig.exec_seg_size, Some(4096));
+        assert_eq!(sig.exec_seg_flags, Some(1));
+        assert_eq!(sig.special_slots, 1);
+
+        let old = facts(&signed_macho()).unwrap();
+        let sig = old.signature.expect("signature");
+        assert_eq!(sig.exec_seg_offset, None);
+        assert_eq!(sig.exec_seg_size, None);
+        assert_eq!(sig.exec_seg_flags, None);
+        assert_eq!(sig.special_slots, 0);
+    }
+
+    /// A superblob whose only slot is the code directory `cd`.
+    fn cd_blob(cd: &[u8]) -> Vec<u8> {
+        let mut blob = vec![0u8; 20 + cd.len()];
+        write_be(&mut blob, 0, CSMAGIC_EMBEDDED_SIGNATURE);
+        write_be(&mut blob, 4, (20 + cd.len()) as u32);
+        write_be(&mut blob, 8, 1);
+        write_be(&mut blob, 12, CSSLOT_CODEDIRECTORY);
+        write_be(&mut blob, 16, 20);
+        blob[20..].copy_from_slice(cd);
+        blob
+    }
+
     #[test]
     fn reads_code_directory_hash_slots() {
         let got = facts(&hashed_macho()).unwrap();
@@ -746,6 +1197,10 @@ mod tests {
                 hash_type: "sha256".into(),
                 team_id: Some("TEAM654321".into()),
                 hashes: Vec::new(),
+                special_slots: 0,
+                exec_seg_offset: None,
+                exec_seg_size: None,
+                exec_seg_flags: None,
             })
         );
         assert_eq!(arches[0].cms.as_ref().map(|blob| blob.bytes.as_slice()), Some(b"CMS-BLOB".as_slice()));
@@ -879,6 +1334,10 @@ mod tests {
             hash_type: "sha256".into(),
             team_id: Some("TEAM123456".into()),
             hashes: Vec::new(),
+            special_slots: 0,
+            exec_seg_offset: None,
+            exec_seg_size: None,
+            exec_seg_flags: None,
         }
     }
 
