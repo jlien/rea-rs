@@ -67,6 +67,7 @@ rea sqlite database.sqlite --wal database.sqlite-wal
 rea decompile /bin/ls --count 16
 rea session --dir /tmp/rea-session open /bin/ls
 rea session --dir /tmp/rea-session record 1 --tool info "identity check"
+rea session --dir /tmp/rea-session export 1 --format evidence
 rea bridge status
 
 # All commands emit JSON — pipe anywhere
@@ -92,7 +93,7 @@ rea strings /bin/ls | jq '.count'
 - `rea_elf` — file type, machine, interpreter, needed libraries, soname, rpath, runpath, GNU build-id, and rpath or runpath file hits. Notes from PT_NOTE segments and SHT_NOTE sections render as (owner, type id, descriptor hex capped at 128 bytes); known types carry names (`NT_GNU_BUILD_ID`, `NT_PRPSINFO`, ...), unknown stay `0x…`. GNU property notes decode the x86 ISA and IBT/SHSTK feature bits; unknown property types stay hex.
 - `rea_sqlite` — database header, including the application id, and `sqlite_schema` objects. Optional `table` lists capped rows. Optional `wal` replays committed frames before the read.
 - `rea_decompile` — bounded pseudo-C at a virtual address: assignments, calls, gotos, and returns, following unconditional jumps inside the enclosing function (bounds from function discovery, else the forward-jump walk) up to 64 instructions and 8 hops; a repeated target, an out-of-function branch, or an indirect jump renders as `goto`. Width-based types on x86_64 and arm64: loads typed by signedness and width, `lea` and `adrp`+`add` targets as `void*`, synthetic typed locals (`int v1; void* v2;`) above the body, casts where a typed value flows into a call argument or a return; a type crosses a followed join only when the skipped gap writes nothing to the register, else it drops. Still not a type-recovering decompiler: no memory-object or struct types, no cross-function dataflow. Optional `arch` selects a Mach-O slice.
-- `rea_session` — JSON evidence session: open, record a tool and a summary, or diff two sessions. `open` maps a loadable binary once and records its identity summary in the file; a path that does not load still opens. `record` takes an optional `tool` that re-runs one named rea command against the session's binary and embeds the output, capped at 16 KiB. `dir` is required. `path` is not.
+- `rea_session` — JSON evidence session: open, record a tool and a summary, or diff two sessions. `open` maps a loadable binary once and records its identity summary in the file; a path that does not load still opens. `record` takes an optional `tool` that re-runs one named rea command against the session's binary and embeds the output, capped at 16 KiB. `dir` is required. `path` is not. A CLI-only `rea session export --format evidence` maps a session file to the upstream-morphic Evidence shape (per record: tool name, arguments echo, capped output, timestamp, session id); fields the native store does not capture — argument echoes, timestamps, the upstream session handle, a live mapping — are explicit nulls. The MCP surface does not grow: still seventeen tools.
 - `rea_bridge` — PATH presence and export parsers for Hopper, Ghidra, IDA, JEB, Frida, CDP, and adb. Does not launch those programs and does not attach to a process.
 
 Register it with any MCP-capable agent, e.g. Claude Code:

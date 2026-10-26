@@ -162,6 +162,20 @@ enum SessionCmd {
     },
     /// Compare two session ids in `--dir`.
     Diff { left: String, right: String },
+    /// Print a session file. `--format evidence` maps it to the upstream-morphic Evidence shape instead: per record the tool name, an arguments echo, the capped embedded output, a timestamp, and the session id. Fields the native store does not capture (argument echoes, timestamps, the upstream session handle, a live mapping) are explicit nulls. CLI-only; the MCP surface is unchanged.
+    Export {
+        id: String,
+        #[arg(long, value_enum, default_value_t = ExportFormat::Native)]
+        format: ExportFormat,
+    },
+}
+
+#[derive(ValueEnum, Clone, Copy)]
+enum ExportFormat {
+    /// The native session file as stored.
+    Native,
+    /// The upstream-morphic Evidence shape.
+    Evidence,
 }
 
 #[derive(Subcommand)]
@@ -308,6 +322,16 @@ fn main() -> anyhow::Result<()> {
                     let right =
                         rea_core::session::load(dir, right).map_err(|e| anyhow::anyhow!("{e}"))?;
                     serde_json::to_value(rea_core::session::diff(&left, &right))?
+                }
+                SessionCmd::Export { id, format } => {
+                    let session =
+                        rea_core::session::load(dir, id).map_err(|e| anyhow::anyhow!("{e}"))?;
+                    match format {
+                        ExportFormat::Native => serde_json::to_value(&session)?,
+                        ExportFormat::Evidence => {
+                            serde_json::to_value(rea_core::session::export_evidence(&session))?
+                        }
+                    }
                 }
             };
             println!("{}", serde_json::to_string_pretty(&value).unwrap());
