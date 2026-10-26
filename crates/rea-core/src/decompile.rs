@@ -714,10 +714,16 @@ fn plan_types(
         while next_gap < gap_invalidations.len() && gap_invalidations[next_gap].0 <= i {
             let (_, keys) = &gap_invalidations[next_gap];
             if keys.iter().any(Option::is_none) {
-                slots.clear();
+                for snap in slots.values_mut() {
+                    snap.poisoned = true;
+                    snap.ty = None;
+                }
             } else {
                 for k in keys.iter().flatten() {
-                    slots.remove(k);
+                    if let Some(snap) = slots.get_mut(k) {
+                        snap.poisoned = true;
+                        snap.ty = None;
+                    }
                 }
             }
             next_gap += 1;
@@ -1624,6 +1630,26 @@ mod tests {
         let text = decompile(&target(Arch::X86_64, 64, &code), 0x1000, 16).unwrap();
         assert!(text.contains("int v1;"), "{text}");
         assert!(!text.contains("v2;"), "{text}");
+        assert!(text.contains("rbx = qword ptr [rbp - 8]"), "{text}");
+    }
+
+    #[test]
+    fn x86_64_a_typed_store_after_the_gap_keeps_the_slot_poisoned() {
+        // movsxd rax; mov [rbp - 8], rax (int); jmp over the gap store
+        // mov [rbp - 8], rdx (untyped); then movsxd rsi (int);
+        // mov [rbp - 8], rsi; mov rbx, [rbp - 8]; ret. The gap store wrote
+        // unknown data to the slot, so the later int store must not re-type
+        // it and the load stays untyped.
+        let code = [
+            0x48, 0x63, 0x05, 0x00, 0x00, 0x00, 0x00, 0x48, 0x89, 0x45, 0xf8, 0xeb, 0x04, 0x48,
+            0x89, 0x55, 0xf8, 0x48, 0x63, 0x35, 0x00, 0x00, 0x00, 0x00, 0x48, 0x89, 0x75, 0xf8,
+            0x48, 0x8b, 0x5d, 0xf8, 0xc3,
+        ];
+        let text = decompile(&target(Arch::X86_64, 64, &code), 0x1000, 33).unwrap();
+        assert!(text.contains("int v1;"), "{text}");
+        // movsxd rsi still types its own register local (int v2), but the
+        // poisoned slot must not re-type the load's destination.
+        assert!(!text.contains("v2 = qword ptr [rbp - 8]"), "{text}");
         assert!(text.contains("rbx = qword ptr [rbp - 8]"), "{text}");
     }
 

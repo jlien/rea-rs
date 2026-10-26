@@ -332,8 +332,9 @@ fn car_header(bytes: &[u8], address: usize, length: usize) -> (Option<u32>, Opti
 /// `{ value block, key block }` pairs and chain through `forward`. The value
 /// block of a rendition is a CSI header: name at 40, width at 12, height at
 /// 16, pixel format at 24. Only those header fields are read, plus the
-/// payload length after the 184-byte header; the payload bytes stay
-/// untouched.
+/// payload after the 184-byte header: its length, the first 16 bytes as hex,
+/// and — for an `SVG` payload that is valid UTF-8 — the text itself, capped
+/// at 256 bytes. No bitmap is expanded and no JPEG is decoded.
 fn rendition_facts(
     bytes: &[u8],
     address: usize,
