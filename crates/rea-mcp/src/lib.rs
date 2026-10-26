@@ -139,6 +139,13 @@ fn handle_tool_call(msg: &Value) -> Result<Value, String> {
         return Ok(text_result(value.to_string()));
     }
 
+    if name == "rea_headers" {
+        return Ok(match loader::load(path) {
+            Ok(target) => text_result(rea_core::headers::emit(&target)),
+            Err(e) => text_result(format!("error: {e}")),
+        });
+    }
+
     let arch = args
         .get("arch")
         .and_then(Value::as_str)
@@ -458,6 +465,11 @@ fn tool_definitions() -> Vec<Value> {
             "inputSchema": schema(true, json!({}), &[]),
         }),
         json!({
+            "name": "rea_headers",
+            "description": "A C header of recovered local and export names. An Itanium or MSVC demangle becomes a declaration, keeping its return type. Imports are omitted, as are Swift names and a Rust path with no parentheses.",
+            "inputSchema": schema(true, json!({}), &[]),
+        }),
+        json!({
             "name": "rea_decompile",
             "description": "Bounded pseudo-C at a virtual address: assignments, calls, gotos, and returns, following unconditional jumps inside the enclosing function (up to 64 instructions, 8 hops). Width-based types on x86_64 and arm64: typed synthetic locals, casts at call arguments and returns; types cross a followed join only when trivially carried. No memory-object or struct types, no cross-function dataflow. Optional arch selects a Mach-O slice.",
             "inputSchema": schema(false, json!({
@@ -523,19 +535,41 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_returns_seventeen_tools() {
+    fn tools_list_returns_eighteen_tools() {
         let (lines, _) = exchange(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#);
         let v: Value = serde_json::from_str(&lines[0]).unwrap();
         let tools = v["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 17);
+        assert_eq!(tools.len(), 18);
         let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
         assert!(names.contains(&"rea_sqlite"));
         assert!(names.contains(&"rea_decompile"));
+        assert!(names.contains(&"rea_headers"));
         assert!(names.contains(&"rea_session"));
         assert!(names.contains(&"rea_bridge"));
         let session = tools.iter().find(|t| t["name"] == "rea_session").unwrap();
         let required = session["inputSchema"]["required"].as_array().unwrap();
         assert!(required.iter().all(|item| item != "path"));
+        let headers = tools.iter().find(|t| t["name"] == "rea_headers").unwrap();
+        let required = headers["inputSchema"]["required"].as_array().unwrap();
+        assert!(required.iter().any(|r| r == "path"));
+    }
+
+    #[test]
+    fn rea_headers_call_returns_the_header_text() {
+        let exe = std::env::current_exe().unwrap();
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {
+                "name": "rea_headers",
+                "arguments": { "path": exe.to_str().unwrap() }
+            }
+        });
+        let result = handle_tool_call(&msg).unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with("#ifndef REA_RECOVERED_H\n"), "{text}");
+        assert!(text.ends_with("#endif\n"), "{text}");
     }
 
     #[test]
