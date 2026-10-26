@@ -54,6 +54,7 @@ rea xrefs /bin/ls 0x100003f80
 # Format-specific facts
 rea macho /bin/ls
 rea wasm module.wasm
+rea wasm module.wasm --wat
 rea wasm module.wasm --execute f --arg 1
 rea goinfo go-binary
 rea pe program.exe
@@ -82,7 +83,7 @@ rea strings /bin/ls | jq '.count'
 - `rea_funcs` — function boundaries from the entry point, direct calls, and prologues
 - `rea_xrefs` — code locations referencing an address (pointer-width absolutes, plus arm64 ADRP, x86_64 RIP-relative, 32-bit x86, and ARM/Thumb PC-relative loads)
 - `rea_call_graph` — direct calls between discovered functions
-- `rea_wasm` — WASM section ids, imports, exports, type signatures, defined function count, function-body opcodes, element and data segments, a capped custom payload, memory min/max, table min/max, data count, custom section names, and the start index. Optional `execute` runs one export with an i32 interpreter. No WASI and no memory.
+- `rea_wasm` — WASM section ids, imports, exports, type signatures, defined function count, function-body opcodes, element and data segments, a capped custom payload, memory min/max with the shared flag, imported memories with their limits, table min/max, data count, custom section names, and the start index. Optional `execute` runs one export with an i32 interpreter. No WASI, and `execute` does not touch memory. A `wat` listing is CLI-only: it prints a WAT-flavored readability listing of what is decoded (sections in order, types, imports, memories, exports, functions by index with their opcodes). Not a full WAT writer.
 - `rea_go` — Go 1.18+ inline build info, and pre-1.18 strings reached by file offsets. A null or out-of-range offset is an error. Host pointers are not dereferenced.
 - `rea_macho` — dylibs, UUID, build version, rpaths, code-directory identifier, hash type, team id, hash-slot digests, the CMS blob, `cms_verified` when the hash type is sha1 or sha256, an embedded Info.plist, an overlay, fat architectures, and rpath file hits. Each architecture includes that slice's uuid, dylibs, rpaths, build version, code directory, CMS blob, plist, and overlay when the slice is present. A missing blob does not fail the parse. `cms_verified` is a digest window, not an Apple trust decision.
 - `rea_pe` — subsystem, image base, raw COFF timestamp and its UTC date, data directories, CLR runtime header, metadata version, stream directory, table row counts, Module/TypeRef/TypeDef names, Field and MethodDef names on each TypeDef, field and method signatures, a bounded IL listing, Param names and sequence numbers on each method, MemberRef names and signatures, Assembly and AssemblyRef names, Property and Event names, CodeView PDB path, root resource type ids, the name under each type, the language id under each name, the data-entry size and code page, the resource payload, and an overlay. A missing payload does not fail the parse.
@@ -131,7 +132,7 @@ Or in an MCP client config:
 ## Roadmap
 
 - [x] .NET rows beyond Module, TypeRef, TypeDef, Field, MethodDef, Param, and MemberRef names, plus IL (`rea pe` reads Assembly and AssemblyRef names, Property and Event names, field and method signatures, MemberRef signatures, Param sequence numbers, and at most 48 IL opcodes). Other metadata rows stay unread.
-- [x] WASM module inspection — section ids, imports, exports, type signatures, defined function count, memory min/max, table min/max, data count, custom names and a capped payload, function-body opcodes, element and data segments, and the start index (`rea wasm`). `--execute` runs one export with an i32 interpreter. No WASI, no memory, and no WAT.
+- [x] WASM module inspection — section ids, imports, exports, type signatures, defined function count, memory min/max with the shared flag, imported memories with their limits, table min/max, data count, custom names and a capped payload, function-body opcodes, element and data segments, and the start index (`rea wasm`). `--execute` runs one export with an i32 interpreter; it does not touch memory. `--wat` prints a WAT-flavored readability listing of what is decoded. Not a full WAT writer. No WASI and no memory access.
 - [x] Function boundary detection and cross-reference resolution — Capstone sweep (entry, direct calls, prologues on x86, x86_64, arm64, and Thumb) plus pointer-width data xrefs and PC-relative loads (arm64 ADRP, x86_64 RIP-relative, 32-bit x86, ARM/Thumb), exposed as `rea funcs`, `rea xrefs`, `rea callgraph`, and the MCP tools
 - [x] SQLite header, including the application id, `sqlite_schema` objects, and capped rows of one named table (`rea sqlite`). `--wal` replays checksummed frames through the last valid commit.
 - [x] Export as C/C++ headers from recovered definitions (`rea headers`). Itanium names become declarations. Other local and export names that are C identifiers become `extern void name();`. Imports are omitted.
