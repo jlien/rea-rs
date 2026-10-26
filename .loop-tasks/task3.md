@@ -1,12 +1,11 @@
-Read .loop-tasks/00-common.md first and follow it.
+# LE entry-bundle addresses
 
-# Task 9 — ELF: notes and section detail
+**Where:** `crates/rea-core/src/le.rs`
 
-crates/rea-core/src/elf_meta.rs. Today rea_elf reads file type, machine, interpreter, needed libs, soname, rpath/runpath (+file hits), GNU build-id. The doc says layout/note inspection lives inside upstream's native file tools.
+**Retires:** "Entry bundles and iterated pages are not handled" (overlap row and the "Out of this tree" paragraph), the entry-bundle half. The module comment says the same thing.
 
-1. Parse ELF NOTE sections (SHT_NOTE segments and sections): render each note as (name owner, type id, descriptor hex capped at e.g. 128 bytes with a marker). Known types get names: NT_GNU_BUILD_ID, NT_GNU_HWCAP, NT_GNU_PROPERTY, NT_PRPSINFO etc. — a table you own in-code; unknown types stay numeric.
-2. Add section-type detail: for each section in `rea sections` ELF path (or a new field on rea_elf), report sh_type name (PROGBITS, NOBITS, DYNAMIC...) and SHF_ flags beyond the existing rwx string.
-3. GNU property notes: parse the x86 ISA/IBT/SHSTK property bits when present into a readable list; unknown property types stay hex.
-4. Fixture tests using the in-crate ELF64 fixture pattern (the machine has no system ELF — /bin/ls is Mach-O; tests must be synthetic).
-5. Update README.md `rea elf` / `rea_elf` bullets + review doc ELF row.
-6. Commit: `rea-rs: elf notes and section types`.
+The walker already reads a fixed set of header fields (object table, page map, data page). Add the entry table beside that set, using the header fields that point at it. Report each entry's object index and offset. A bundle flag this task does not recognize is counted and skipped, and the review names that flag. Do not guess a second on-disk layout if the first fixture disagrees with the header; keep the clause in that case. Iterated pages stay unread until task 6.5. Do not seed `rea funcs` from these addresses in this task.
+
+**Difficulty:** medium
+
+**Commit:** `rea-rs: le entry bundle addresses`

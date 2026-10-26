@@ -1,6 +1,5 @@
 #!/bin/bash
-# Iteration-2 task loop: one omp -p run per task, test gate between tasks.
-cd /Users/jimmylien/Eng/wt-rea-rs-tasks-2 || exit 1
+# Task loop: one omp -p run per task, test gate between tasks.
 export PATH="$HOME/.bun/bin:$PATH"
 mkdir -p .loop-tasks
 : > .loop-tasks/loop.log

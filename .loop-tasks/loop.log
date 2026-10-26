@@ -1,167 +1,246 @@
-LOOP START Mon Oct 26 00:48:58 CDT 2026
-task 1 already done, skip
-=== task 2 START Mon Oct 26 00:48:58 CDT 2026 ===
+LOOP START Mon Oct 26 12:30:57 CDT 2026
+=== task 1 START Mon Oct 26 12:30:57 CDT 2026 ===
 Working...
-Task 8 complete.
+Task 1 complete. Two commits on `tasks-loop-5`, nothing pushed.
 
-**What landed** (`65e4ecc` code, `e550374` docs, both `rea-rs: same-function flow in the pseudo-c window`):
+**Code — `cc33905 rea-rs: sqlite identity through the loader`**
+- `lib.rs`: `Format::Sqlite` variant (`"sqlite"`); `Target::require_native` now rejects both `Wasm` and `Sqlite` with named errors.
+- `loader.rs`: before `goblin::peek`, a file starting with `SQLite format 3\0` runs `sqlite::header` as the identity check (a bad header still fails the load) and loads as an identity target — arch `unknown`, 64-bit, no entry/sections/symbols, `page_map: None`. `--arch` still errors "mach-o only".
+- CLI/MCP `info`: format `sqlite` adds `{"application_id", "schema_objects"}` under a `sqlite` key, mirroring the wasm block.
+- Tests: loader unit tests (identity load + header-rejected prefix), MCP tests (`rea_info` counts, `rea_funcs` rejection), CLI smoke `sqlite_info_smoke.rs`. `sqlite_schema` row reads, WAL, and the 1024-row / `1..=1048576` caps stay on `rea sqlite`.
+- README: `rea_info`, `rea_sqlite`, and roadmap bullets updated.
 
-- `crates/rea-core/src/decompile.rs` — the window now follows unconditional `jmp`/`b`/`br` with a direct target inside the enclosing function. Bounds come from `analysis::discover_functions` (made `pub(crate)` along with `direct_target`), falling back to the forward-jump walk; capped at 64 instructions and 8 hops. A repeated target, out-of-function branch, or indirect jump ends the listing with a `goto` line; visited-target set guards loops.
-- Type carrying: a width type crosses a followed join only when the skipped gap writes nothing to that register (gap scanned via `scan_gap`); an undecodable gap drops all types into the join rather than guessing.
-- `lib.rs` `read_at_vaddr` clamps its read window to the end of mapped bytes — mid-section addresses were failing with "not mapped" before this fix, which the flow tests exercise.
-- Fixtures: x86_64 and arm64 jmp chains, visited-guard loops (both arches), out-of-bounds jmp/b (both arches), typed-flow-through-join, and a gap-write type-drop test.
-- Docs: README `rea_decompile` bullet, MCP tool description, review doc `#now` meta → `65e4ecc`, new Done row, tool-table/comparison/gaps clauses rewritten to name same-function flow + carried width types; remaining stops are memory-object/struct types and cross-function dataflow.
+**Docs — `b046b57 rea-rs: docs retire the sqlite loader stop`**
+- `#now` names `cc33905` on `tasks-loop-5`; banner rea-core 227 / rea-mcp 10 / rea-cli 4 (measured); Done row added; the `rea info` and `rea sqlite` command rows, the sqlite fixture/evidence row, the gaps cell, and the tests row all relaxed — "The loader still rejects a database" is gone, and every still-erroring command is named.
 
-**Verification**: `cargo test --workspace --offline` — rea-core 164 passed, rea-mcp 5 passed, no failures, no warnings. Working tree clean except untracked `.loop-tasks/`.
-=== task 2 omp rc=0 Mon Oct 26 01:14:58 CDT 2026 ===
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.08s
+**Verification:** `cargo build --workspace --offline` and `cargo test --workspace --offline` pass warning-free (241 tests). Manual run on a synthetic 512-byte-page db: `rea info` prints `"format": "sqlite"` with `application_id: 16909060`, `schema_objects: 1`; `rea funcs` exits 1 with `sqlite: no native code view; use the sqlite commands`; `rea sqlite` still reads header/schema. One fixture iteration was needed: the schema record initially lacked its header-size varint, caught by the smoke test's real binary run.
+=== task 1 omp rc=0 Mon Oct 26 12:39:57 CDT 2026 ===
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s
      Running unittests src/main.rs (target/debug/deps/rea-8a7a7393c6ff29b7)
 
 running 0 tests
 
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
+     Running tests/pe_clr_smoke.rs (target/debug/deps/pe_clr_smoke-38afbe1ab9e72888)
+
+running 2 tests
+test rea_pe_resolves_memberref_parents_of_a_synthetic_dotnet_pe ... ok
+test rea_pe_reports_the_assembly_row_of_a_synthetic_dotnet_pe ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.41s
+
+     Running tests/sqlite_info_smoke.rs (target/debug/deps/sqlite_info_smoke-c3a7b7d18c558b3d)
+
+running 1 test
+test rea_info_reports_sqlite_identity_and_funcs_still_errors ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/wasm_info_smoke.rs (target/debug/deps/wasm_info_smoke-d6aeb4f1413630ca)
+
+running 1 test
+test rea_info_reports_wasm_identity_and_funcs_still_errors ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
      Running unittests src/lib.rs (target/debug/deps/rea_core-3c69bfc8184e934b)
 
-running 164 tests
+running 227 tests
 test analysis::tests::direct_target_parses_hex_immediates ... ok
 test analysis::tests::call_graph_drops_unknown_targets ... ok
+test analysis::tests::data_xrefs_survive_a_hostile_section_file_offset ... ok
 test analysis::tests::data_xref_on_64bit_is_eight_bytes ... ok
 test analysis::tests::finds_data_xref_pattern ... ok
 test analysis::tests::string_xref_follows_64bit_pointer ... ok
 test analysis::tests::arm_literal_load_is_an_xref ... ok
-test analysis::tests::arm64_adrp_add_is_an_xref ... ok
-test analysis::tests::string_xref_follows_adrp_add ... ok
-test analysis::tests::thumb_literal_load_is_an_xref ... ok
-test analysis::tests::arm64_forward_branch_extends_body ... ok
-test analysis::tests::arm64_add_consumes_the_adrp_page ... ok
 test analysis::tests::import_and_non_text_symbol_are_not_seeds ... ok
-test analysis::tests::arm64_adrp_ldr_is_an_xref ... ok
+test analysis::tests::a_symbol_in_a_high_section_does_not_panic_discovery ... ok
+test analysis::tests::string_xref_follows_adrp_add ... ok
+test analysis::tests::arm64_adrp_add_is_an_xref ... ok
 test analysis::tests::discovers_arm64_prologue_and_bl ... ok
+test analysis::tests::arm64_forward_branch_extends_body ... ok
+test analysis::tests::arm64_adrp_ldr_is_an_xref ... ok
+test analysis::tests::thumb_literal_load_is_an_xref ... ok
+test analysis::tests::arm64_add_consumes_the_adrp_page ... ok
+test analysis::tests::strings_xrefs_walk_stops_at_u64_max ... ok
+test analysis::tests::strings_xrefs_survive_hostile_section_bounds ... ok
+test analysis::tests::discovers_x86_64_prologue_and_call ... ok
+test analysis::tests::symbol_in_text_is_a_function_seed ... ok
 test analysis::tests::thumb_push_pop_is_a_function ... ok
 test analysis::tests::x86_64_rip_relative_is_an_xref ... ok
-test artifact::tests::magic_distinguishes_nib_and_asset_catalog ... ok
-test artifact::tests::nib_lists_keys_and_classes_and_a_short_magic_stays_empty ... ok
-test artifact::tests::nib_caps_objects_and_marks_undecodable_types ... ok
-test artifact::tests::bom_lists_carheader_and_rendition_facts ... ok
-test artifact::tests::nib_renders_scalar_values_beside_keys ... ok
-test analysis::tests::symbol_in_text_is_a_function_seed ... ok
 test analysis::tests::x86_32_call_pop_load_is_an_xref ... ok
-test analysis::tests::discovers_x86_64_prologue_and_call ... ok
+test artifact::tests::nib_lists_keys_and_classes_and_a_short_magic_stays_empty ... ok
+test bridge::tests::exports_become_findings ... ok
+test artifact::tests::nib_caps_objects_and_marks_undecodable_types ... ok
+test artifact::tests::magic_distinguishes_nib_and_asset_catalog ... ok
 test artifact::tests::nib_undecodable_value_renders_type_and_stops ... ok
+test artifact::tests::nib_renders_scalar_values_beside_keys ... ok
+test artifact::tests::bom_lists_carheader_and_rendition_facts ... ok
+test clr_sig::tests::a_deeply_nested_signature_does_not_overflow_the_stack ... ok
 test clr_sig::tests::method_signature_is_return_and_params ... ok
+test clr_sig::tests::operand_free_prefix_opcodes_join_the_listing ... ok
 test clr_sig::tests::property_signature_is_type_and_index_params ... ok
 test clr_sig::tests::tiny_body_lists_ldarg_and_ret ... ok
 test crash::tests::reads_process_identifier_and_version ... ok
-test crash::tests::truncated_report_has_no_identity ... ok
-test bridge::tests::exports_become_findings ... ok
 test bridge::tests::status_lists_the_seven_providers ... ok
+test crash::tests::truncated_report_has_no_identity ... ok
 test artifact::tests::directory_with_info_plist_is_an_app_bundle ... ok
-test decompile::tests::x86_64_jmp_out_of_the_function_ends_with_a_goto ... ok
 test decompile::tests::arm64_b_chain_continues_at_the_target ... ok
-test decompile::tests::arm64_ret_is_a_return ... ok
-test decompile::tests::arm64_signed_word_and_byte_loads_get_their_c_types ... ok
 test decompile::tests::arm64_b_out_of_the_function_ends_with_a_goto ... ok
 test decompile::tests::arm64_adrp_plus_add_pointer_flows_into_a_call_argument ... ok
 test decompile::tests::arm64_loop_back_to_a_visited_target_ends_with_a_goto ... ok
-test demangle::tests::leaves_plain_and_truncated_names_alone ... ok
-test demangle::tests::demangles_a_function_and_a_nested_name ... ok
-test demangle::tests::rust_v0_and_msvc_keep_the_raw_name_available_to_the_caller ... ok
+test decompile::tests::decompiling_a_body_whose_section_reaches_u64_max_does_not_panic ... ok
+test decompile::tests::decompiling_a_section_with_a_hostile_file_offset_does_not_panic ... ok
+test decompile::tests::arm64_ret_is_a_return ... ok
+test decompile::tests::arm64_signed_word_and_byte_loads_get_their_c_types ... ok
+test decompile::tests::decompiling_a_body_at_a_huge_mapped_address_does_not_panic ... ok
+test decompile::tests::decompiling_an_address_beyond_every_section_is_an_error_not_a_panic ... ok
+test decompile::tests::x86_64_backward_jump_to_unvisited_code_walks_it_then_ends_at_the_visited_loop_head ... ok
 test decompile::tests::x86_64_byte_load_is_uint8_t ... ok
-test elf_meta::tests::rejects_non_elf ... ok
+test demangle::tests::demangles_a_function_and_a_nested_name ... ok
+test demangle::tests::leaves_plain_and_truncated_names_alone ... ok
+test demangle::tests::rust_v0_and_msvc_keep_the_raw_name_available_to_the_caller ... ok
 test elf_meta::tests::reads_interpreter_needed_and_build_id ... ok
+test elf_meta::tests::rejects_non_elf ... ok
+test decompile::tests::x86_64_jmp_out_of_the_function_ends_with_a_goto ... ok
 test goinfo::tests::absent_magic_is_none ... ok
 test goinfo::tests::pointer_form_is_an_error ... ok
 test goinfo::tests::pointer_offsets_resolve_inside_the_file ... ok
 test goinfo::tests::reads_inline_buildinfo_and_strips_sentinels ... ok
-test hash::tests::sha1_of_abc ... ok
-test headers::tests::header_contains_a_recovered_name_and_a_demangled_declaration ... ok
 test hash::tests::sha256_of_empty_and_abc ... ok
+test hash::tests::sha1_of_abc ... ok
+test headers::tests::a_rust_path_becomes_a_comment_but_not_a_declaration ... ok
+test hash::tests::sha384_of_empty_and_abc ... ok
+test headers::tests::header_contains_a_recovered_name_and_a_demangled_declaration ... ok
+test headers::tests::msvc_names_become_declarations_with_their_return_type ... ok
 test le::tests::import_by_ordinal_does_not_eat_following_internal ... ok
 test le::tests::internal_offset32_writes_base_plus_target ... ok
 test le::tests::mapsize_larger_than_page_table_errors ... ok
 test le::tests::offset16_stores_object_relative_target ... ok
 test le::tests::parses_synthetic_le ... ok
 test le::tests::source_list_offsets_follow_target_tail ... ok
-test loader::tests::clang_rust_v0_underscore_is_demangled_through_load_macho ... ok
 test loader::tests::clang_itanium_underscore_is_demangled_through_load_macho ... ok
+test loader::tests::a_magic_prefix_that_the_header_rejects_does_not_load ... ok
+test loader::tests::clang_rust_v0_underscore_is_demangled_through_load_macho ... ok
 test loader::tests::elf_section_names_use_the_string_table_offset ... ok
-test loader::tests::macho_symbols_skip_stabs ... ok
 test loader::tests::itanium_name_is_demangled_and_the_raw_name_stays ... ok
-test macho_meta::tests::architectures_rejects_non_macho ... ok
+test loader::tests::macho_symbols_skip_stabs ... ok
 test loader::tests::non_host_slice_can_be_section_listed_and_disassembled ... ok
+test loader::tests::sqlite_loads_as_an_identity_target ... ok
+test loader::tests::wasm_loads_as_an_identity_target ... ok
+test loader::tests::wasm_shorter_than_the_header_stays_unrecognized ... ok
+test macho_meta::tests::architectures_rejects_non_macho ... ok
+test macho_meta::tests::a_hostile_special_slot_count_does_not_panic ... ok
+test macho_meta::tests::boolean_and_nested_entitlement_values ... ok
 test macho_meta::tests::cms_window_matches_the_code_directory_digest ... ok
-test macho_meta::tests::fat_slices_keep_their_own_identity ... ok
+test macho_meta::tests::der_slot_is_a_size_only ... ok
+test macho_meta::tests::cms_window_matches_truncated_sha256_and_sha384_digests ... ok
+test macho_meta::tests::exec_segment_fields_come_from_a_newer_code_directory ... ok
 test macho_meta::tests::fat_slices_keep_their_own_code_directories ... ok
+test macho_meta::tests::fat_slices_keep_their_own_entitlements ... ok
+test macho_meta::tests::mid_index_entitlement_slot_does_not_swallow_the_der_slot ... ok
+test macho_meta::tests::fat_slices_keep_their_own_identity ... ok
+test macho_meta::tests::missing_entitlements_slot_is_none ... ok
+test macho_meta::tests::non_xml_entitlement_payload_stays_hex ... ok
 test macho_meta::tests::omits_version_without_build_command ... ok
+test macho_meta::tests::reads_an_embedded_binary_plist ... ok
 test macho_meta::tests::reads_build_version_and_code_signature ... ok
-test macho_meta::tests::reads_code_directory_and_the_cms_blob ... ok
 test macho_meta::tests::reads_code_directory_hash_slots ... ok
-test decompile::tests::x86_64_jmp_chain_continues_at_the_target ... ok
-test macho_meta::tests::reads_fat_arch_header_without_slice_bytes ... ok
-test decompile::tests::x86_64_loop_back_to_a_visited_target_ends_with_a_goto ... ok
-test macho_meta::tests::rejects_fat_archive ... ok
-test macho_meta::tests::rejects_non_macho ... ok
 test macho_meta::tests::reads_embedded_plist_and_overlay_without_failing_a_short_one ... ok
+test macho_meta::tests::reads_code_directory_and_the_cms_blob ... ok
+test macho_meta::tests::reads_fat_arch_header_without_slice_bytes ... ok
+test macho_meta::tests::rejects_fat_archive ... ok
+test macho_meta::tests::reads_entitlements_keys_and_the_capped_xml ... ok
+test macho_meta::tests::rejects_non_macho ... ok
+test macho_meta::tests::self_closing_and_tight_self_closing_values_keep_later_keys ... ok
 test macho_meta::tests::unreadable_fat_slice_leaves_the_code_directory_empty ... ok
-test pe_meta::tests::clr_member_refs_skip_the_interface_row ... ok
-test pe_meta::tests::clr_field_signature_from_the_blob ... ok
+test decompile::tests::x86_64_typed_register_flows_through_a_followed_join ... ok
+test pe_meta::tests::clr_assembly_row_carries_version_culture_and_public_key ... ok
+test pe_meta::tests::clr_assembly_ref_row_carries_token_and_versions ... ok
 test pe_meta::tests::clr_bad_signature_keeps_runtime_version ... ok
-test pe_meta::tests::clr_member_refs_stay_aligned_past_interface_rows ... ok
+test pe_meta::tests::clr_blob_index_zero_or_past_the_heap_stays_empty ... ok
+test pe_meta::tests::clr_field_ptr_moves_the_signature_with_the_name ... ok
+test pe_meta::tests::clr_field_ptr_orders_the_field_names ... ok
+test pe_meta::tests::clr_field_ptr_short_of_the_list_keeps_row_order ... ok
+test pe_meta::tests::clr_field_signature_from_the_blob ... ok
+test decompile::tests::x86_64_mov_and_ret_become_an_assignment_and_a_return ... ok
+test pe_meta::tests::clr_four_byte_blob_length_counts_the_first_byte ... ok
+test paths::tests::origin_token_finds_a_library_and_a_miss_stays_empty ... ok
+test pe_meta::tests::clr_four_byte_blob_length_reads_a_16384_byte_blob ... ok
 test pe_meta::tests::clr_interfaces_resolve_typedef_and_typeref_rows ... ok
+test pe_meta::tests::clr_member_ref_parents_resolve_and_stay_empty_when_unfit ... ok
+test pe_meta::tests::clr_member_refs_skip_the_interface_row ... ok
+test pe_meta::tests::clr_member_refs_stay_aligned_past_interface_rows ... ok
 test pe_meta::tests::clr_method_params_skip_the_param_ptr_row ... ok
+test pe_meta::tests::clr_method_ptr_orders_the_method_names ... ok
 test pe_meta::tests::clr_module_refs_are_names ... ok
+test decompile::tests::x86_64_jmp_chain_continues_at_the_target ... ok
+test pe_meta::tests::clr_param_ptr_orders_the_param_names ... ok
+test decompile::tests::x86_64_loop_back_to_a_visited_target_ends_with_a_goto ... ok
+test pe_meta::tests::clr_reads_runtime_and_version ... ok
 test pe_meta::tests::clr_property_and_event_signatures_come_from_the_blob ... ok
 test pe_meta::tests::clr_short_header_is_none ... ok
-test pe_meta::tests::clr_reads_runtime_and_version ... ok
 test pe_meta::tests::clr_short_table_stream_is_empty ... ok
+test decompile::tests::x86_64_signed_word_load_is_int_and_casts_the_return ... ok
+test pe_meta::tests::clr_stream_count_past_buffer_keeps_version ... ok
 test pe_meta::tests::clr_signature_assembly_and_property_names ... ok
 test pe_meta::tests::clr_table_counts_follow_valid_bits ... ok
-test pe_meta::tests::clr_stream_count_past_buffer_keeps_version ... ok
 test pe_meta::tests::clr_type_names_from_module_and_typedef ... ok
-test pe_meta::tests::clr_type_names_need_the_string_heap ... ok
 test pe_meta::tests::clr_stream_names_skip_empty_and_stop ... ok
+test pe_meta::tests::clr_type_names_need_the_string_heap ... ok
 test pe_meta::tests::clr_typedef_fields_follow_the_field_list ... ok
-test pe_meta::tests::clr_typedef_uses_a_wide_field_index ... ok
+test decompile::tests::x86_64_type_writes_in_the_skipped_gap_drop_the_type_at_the_join ... ok
 test pe_meta::tests::clr_uncompressed_stream_is_used_when_tilde_is_absent ... ok
 test pe_meta::tests::clr_typedef_methods_skip_the_field_row ... ok
 test pe_meta::tests::clr_version_none_when_unusable ... ok
 test pe_meta::tests::codeview_missing_when_record_does_not_fit ... ok
+test pe_meta::tests::clr_typedef_uses_a_wide_field_index ... ok
 test pe_meta::tests::codeview_nb10_has_no_guid ... ok
-test pe_meta::tests::codeview_rsds_after_another_debug_type ... ok
 test pe_meta::tests::coff_timestamp_is_a_utc_date ... ok
-test pe_meta::tests::rejects_non_pe ... ok
-test pe_meta::tests::reads_subsystem_image_base_and_timestamp ... ok
+test pe_meta::tests::codeview_rsds_after_another_debug_type ... ok
 test pe_meta::tests::reads_resource_payload_and_overlay ... ok
-test pe_meta::tests::resource_name_longer_than_256_chars_is_an_error ... ok
+test pe_meta::tests::rejects_non_pe ... ok
 test pe_meta::tests::resource_data_entry_keeps_size_and_skips_payload ... ok
+test pe_meta::tests::resource_name_longer_than_256_chars_is_an_error ... ok
 test pe_meta::tests::root_id_entries ... ok
+test pe_meta::tests::reads_subsystem_image_base_and_timestamp ... ok
 test pe_meta::tests::skips_named_entries_and_string_ids ... ok
 test pe_meta::tests::truncated_directory_is_parse_error ... ok
 test pe_meta::tests::truncated_resource_data_is_an_error ... ok
+test plist::tests::binary_plist_that_does_not_parse_is_none ... ok
+test plist::tests::binary_plist_without_the_keys_is_none ... ok
+test plist::tests::reads_binary_plist_identity_keys ... ok
 test plist::tests::reads_identifying_plist_fields ... ok
 test plist::tests::truncated_plist_does_not_invent_fields ... ok
-test paths::tests::origin_token_finds_a_library_and_a_miss_stays_empty ... ok
 test session::tests::diff_compares_identity_evidence_and_tool_records ... ok
-test decompile::tests::x86_64_signed_word_load_is_int_and_casts_the_return ... ok
-test session::tests::open_without_a_binary_keeps_the_path_optional ... ok
-test session::tests::open_records_identity_for_a_loadable_binary ... ok
-test sqlite::tests::empty_file_with_no_pages_has_no_schema ... ok
+test plist::tests::reads_binary_plist_utf16_values_and_long_ascii_lengths ... ok
 test sqlite::tests::decodes_utf16le_schema_text ... ok
-test session::tests::record_embeds_a_named_command_output ... ok
+test session::tests::evidence_export_maps_identity_and_records_with_nulls_for_unknown ... ok
+test sqlite::tests::empty_file_with_no_pages_has_no_schema ... ok
+test decompile::tests::x86_64_lea_pointer_becomes_a_typed_local_and_a_cast_argument ... ok
+test session::tests::open_record_and_diff ... ok
+test session::tests::open_records_identity_for_a_loadable_binary ... ok
+test session::tests::embedded_output_is_capped_and_marked ... ok
 test sqlite::tests::follows_an_interior_page_to_the_leaf ... ok
 test sqlite::tests::page_size_one_means_64k ... ok
 test sqlite::tests::reads_a_leaf_schema_row_and_a_null_sql ... ok
-test session::tests::embedded_output_is_capped_and_marked ... ok
 test sqlite::tests::reads_header_fields ... ok
+test session::tests::open_without_a_binary_keeps_the_path_optional ... ok
 test sqlite::tests::reads_rows_from_the_named_table ... ok
 test sqlite::tests::rejects_a_non_table_root ... ok
 test sqlite::tests::rejects_a_short_or_foreign_file ... ok
-test session::tests::open_record_and_diff ... ok
+test sqlite::tests::wal_replay_keeps_the_last_committed_page ... ok
+test strings::tests::a_run_that_is_neither_ascii_nor_utf16_stays_unread ... ok
 test strings::tests::finds_printable_runs ... ok
+test strings::tests::ascii_hits_keep_their_shape_and_plain_ascii_is_not_utf16 ... ok
+test session::tests::record_embeds_a_named_command_output ... ok
+test strings::tests::finds_utf16be_runs ... ok
+test strings::tests::finds_utf16le_runs ... ok
+test strings::tests::merged_hits_sort_by_offset ... ok
 test strings::tests::respects_min_len ... ok
 test tests::section_perms_uses_rwx_letters ... ok
-test sqlite::tests::wal_replay_keeps_the_last_committed_page ... ok
+test strings::tests::utf16_uses_same_min_len_in_code_units ... ok
 test wasm::tests::custom_name_too_long_is_an_error ... ok
 test wasm::tests::custom_names_leave_the_payload_unread ... ok
 test wasm::tests::data_count_ignores_the_data_section ... ok
@@ -169,38 +248,50 @@ test wasm::tests::duplicate_data_count_is_an_error ... ok
 test wasm::tests::duplicate_start_is_an_error ... ok
 test wasm::tests::duplicate_table_is_an_error ... ok
 test wasm::tests::duplicate_type_is_an_error ... ok
-test decompile::tests::x86_64_typed_register_flows_through_a_followed_join ... ok
 test wasm::tests::element_and_data_segments_keep_their_payloads ... ok
 test wasm::tests::empty_module_is_version_one ... ok
-test decompile::tests::x86_64_mov_and_ret_become_an_assignment_and_a_return ... ok
-test decompile::tests::x86_64_type_writes_in_the_skipped_gap_drop_the_type_at_the_join ... ok
-test wasm::tests::execute_returns_an_i32_constant ... ok
+test wasm::tests::execute_names_the_import_when_the_export_is_one ... ok
+test wasm::tests::execute_names_the_import_when_a_call_reaches_one ... ok
 test wasm::tests::export_func_and_section_ids ... ok
+test wasm::tests::execute_returns_an_i32_constant ... ok
 test wasm::tests::export_kinds ... ok
+test wasm::tests::huge_local_group_clamps_to_the_cap ... ok
 test wasm::tests::import_func_env_m ... ok
 test wasm::tests::import_table_mem_global_consume_desc ... ok
 test wasm::tests::memory_limits_and_start_index ... ok
 test wasm::tests::memory_shared_flag_and_imported_memory ... ok
 test wasm::tests::rejects_bad_magic_truncated_and_bad_leb ... ok
 test wasm::tests::table_limits_leave_the_element_section_unread ... ok
+test wasm::tests::table_shared_flag_and_imported_table ... ok
 test wasm::tests::type_count_consumes_the_signature ... ok
+test wasm::tests::wat_full_keeps_unknown_opcodes_parseable ... ok
+test wasm::tests::wat_full_lists_body_locals_and_call_targets ... ok
+test wasm::tests::wat_full_lists_segment_offsets_and_escaped_bytes ... ok
+test wasm::tests::wat_full_lists_import_kinds ... ok
+test wasm::tests::wat_full_round_trips_the_fixture_module ... ok
+test wasm::tests::wat_lists_a_shared_table_as_limits_then_reftype ... ok
 test wasm::tests::wat_lists_imported_shared_memory ... ok
 test wasm::tests::wat_lists_types_functions_and_exports ... ok
 test wasm::tests::wat_passes_unknown_opcodes_through ... ok
-test decompile::tests::x86_64_lea_pointer_becomes_a_typed_local_and_a_cast_argument ... ok
+test session::tests::evidence_export_carries_the_truncation_marker ... ok
 
-test result: ok. 164 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 227 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
 
      Running unittests src/lib.rs (target/debug/deps/rea_mcp-4334a264f4ca2797)
 
-running 5 tests
+running 10 tests
 test tests::notifications_are_silent ... ok
+test tests::rea_funcs_rejects_a_wasm_target ... ok
 test tests::unknown_method_is_jsonrpc_error ... ok
 test tests::initialize_handshake ... ok
+test tests::rea_funcs_rejects_a_sqlite_target ... ok
+test tests::rea_info_reports_sqlite_identity_counts ... ok
+test tests::rea_info_reports_wasm_identity_counts ... ok
+test tests::tools_list_returns_eighteen_tools ... ok
 test tests::tools_list_includes_funcs_and_xrefs ... ok
-test tests::tools_list_returns_seventeen_tools ... ok
+test tests::rea_headers_call_returns_the_header_text ... ok
 
-test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
 
    Doc-tests rea_core
 
@@ -214,36 +305,55 @@ running 0 tests
 
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
-=== task 2 test rc=0 Mon Oct 26 01:14:58 CDT 2026 ===
-=== task 3 START Mon Oct 26 01:14:58 CDT 2026 ===
+=== task 1 test rc=0 Mon Oct 26 12:39:58 CDT 2026 ===
+=== task 2 START Mon Oct 26 12:39:58 CDT 2026 ===
 Working...
-The task is complete. The loop's established convention across all prior tasks is a paired commit (code + docs, same subject — cf. `ab11e15`/`ef27480`, `35922cd`/`d8ddd4f`), so the two `same-function flow` commits are its house pattern, not an accident. I will not rewrite history under an active loop.
+Task 5.2 complete.
 
-## Final state — task 2 (Task 8): same-function flow in the pseudo-c window
+**Code** — `296fcf8` `rea-rs: objc class-name strings` (README.md + `crates/rea-core/src/macho_meta.rs` only):
+- `MachoFacts::objc_strings: Vec<String>` and `MachoArch::objc_strings` (each fat slice carries its own list; empty slice → empty list).
+- `objc_strings(mo)`: walks every section whose name contains `objc` (case-insensitive), collects NUL-terminated printable C strings in file order, capped at 128 with a `... N more` marker. A pointer-only section (`__objc_classlist`) contributes nothing; no `class_ro_t`/method list/protocol walking; no Swift demangling; a run with no terminating NUL stays unread. No section → empty list, parse unaffected.
 
-**Code** (`65e4ecc`): `crates/rea-core/src/decompile.rs` now walks the window via `walk()`:
-- Follows unconditional `jmp`/`b`/`br` with a direct target inside `[fstart, fend)` — bounds from `analysis::discover_functions()`, else the `analysis::function_body` forward-jump fallback (`function_bounds()`, made possible by two `pub(crate)` visibility changes in `analysis.rs`).
-- Caps: 64 instructions total (`limit.clamp(1,64)`), `MAX_HOPS = 8`; a target that is backward, out-of-bounds, already `visited`, over hop budget, or indirect ends the listing as `goto <target>` — matching prior rendering.
-- Type carry (`carry_types`): a width type crosses a followed join only if the skipped gap decodes (`scan_gap`, ≤16 insns) and writes nothing to that register (`written_reg`); an undecodable gap drops every type at the join via `Names::deactivate`. Commit body also notes `read_at_vaddr` now clamps to mapped bytes so mid-section reads work.
-- Fixtures: 8 new tests — x86_64/arm64 same-function chains, loops tripping the visited guard (`goto 0x1000`), out-of-function jumps, type carried through a followed join, and type dropped when the skipped gap writes the register.
+**Verification** — `cargo build --offline` clean; `cargo test --workspace --offline` all green (rea-core 230, rea-mcp 10, rea-cli 4). Three new fixture tests: named-section strings (incl. slice parity), pointer/non-objc/unterminated/empty sections, and the 128-cap with `... 12 more`. Live smoke: a synthetic Mach-O with `__objc_classname` (strings) + `__objc_classlist` (pointers) returns the three strings on `facts` and the slice; `/bin/ls` returns an empty `objc_strings` without failing.
 
-**Docs** (`e550374`): README `rea_decompile` bullet rewritten; `docs/rea-rs-review.html` `#now` → `65e4ecc`, new Done row, `rea decompile` row relaxed to name same-function flow + carried width types, and "Out of this tree" now says what stays (full type recovery beyond same-function flow, memory-object/struct types, cross-function dataflow).
+**Docs** — `98857d2` `rea-rs: docs retire the objc strings gap`: README `rea_macho` line names the new field; review.html `#now` updated to `296fcf8`, banner count 227→230, new Done-table row, and the enhanced-native gaps cell now names the ObjC strings while keeping Swift, value/UI trace, and the unwalked structures honest.
 
-**Verification**: `cargo test --workspace --offline` on the committed tree — rea-core **164 passed**, rea-mcp **5 passed**, rc=0 (recorded in `.loop-tasks/loop.log` and the doc banner). Worktree clean; nothing pushed.
-
-**One disclosure**: I briefly added temporary `eprintln!` debug traces to `walk()` while diagnosing the new tests; the loop agent discarded them before committing — `git show 65e4ecc` contains no debug output, and the final tree is clean.
-=== task 2 omp rc=0 Mon Oct 26 01:18:17 CDT 2026 ===
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.12s
+One deviation: the working tree had pre-existing uncommitted `.loop-tasks/` harness edits from an earlier task's first sweep; my initial `git add -A` swept them into the code commit. I reset and recommitted with only the task's files; the harness edits remain uncommitted in the worktree, matching how later tasks (`cc33905`) committed.
+=== task 2 omp rc=0 Mon Oct 26 12:47:02 CDT 2026 ===
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s
      Running unittests src/main.rs (target/debug/deps/rea-8a7a7393c6ff29b7)
 
 running 0 tests
 
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
+     Running tests/pe_clr_smoke.rs (target/debug/deps/pe_clr_smoke-38afbe1ab9e72888)
+
+running 2 tests
+test rea_pe_resolves_memberref_parents_of_a_synthetic_dotnet_pe ... ok
+test rea_pe_reports_the_assembly_row_of_a_synthetic_dotnet_pe ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.37s
+
+     Running tests/sqlite_info_smoke.rs (target/debug/deps/sqlite_info_smoke-c3a7b7d18c558b3d)
+
+running 1 test
+test rea_info_reports_sqlite_identity_and_funcs_still_errors ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/wasm_info_smoke.rs (target/debug/deps/wasm_info_smoke-d6aeb4f1413630ca)
+
+running 1 test
+test rea_info_reports_wasm_identity_and_funcs_still_errors ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
      Running unittests src/lib.rs (target/debug/deps/rea_core-3c69bfc8184e934b)
 
-running 164 tests
+running 230 tests
 test analysis::tests::direct_target_parses_hex_immediates ... ok
+test analysis::tests::data_xrefs_survive_a_hostile_section_file_offset ... ok
 test analysis::tests::call_graph_drops_unknown_targets ... ok
 test analysis::tests::finds_data_xref_pattern ... ok
 test analysis::tests::data_xref_on_64bit_is_eight_bytes ... ok
@@ -252,174 +362,244 @@ test analysis::tests::arm64_adrp_add_is_an_xref ... ok
 test analysis::tests::string_xref_follows_adrp_add ... ok
 test analysis::tests::arm64_adrp_ldr_is_an_xref ... ok
 test analysis::tests::arm64_add_consumes_the_adrp_page ... ok
-test analysis::tests::thumb_literal_load_is_an_xref ... ok
-test analysis::tests::import_and_non_text_symbol_are_not_seeds ... ok
 test analysis::tests::arm64_forward_branch_extends_body ... ok
-test analysis::tests::arm_literal_load_is_an_xref ... ok
+test analysis::tests::import_and_non_text_symbol_are_not_seeds ... ok
+test analysis::tests::a_symbol_in_a_high_section_does_not_panic_discovery ... ok
 test analysis::tests::thumb_push_pop_is_a_function ... ok
 test analysis::tests::discovers_arm64_prologue_and_bl ... ok
-test analysis::tests::x86_64_rip_relative_is_an_xref ... ok
-test analysis::tests::x86_32_call_pop_load_is_an_xref ... ok
 test analysis::tests::symbol_in_text_is_a_function_seed ... ok
-test artifact::tests::nib_lists_keys_and_classes_and_a_short_magic_stays_empty ... ok
+test analysis::tests::x86_64_rip_relative_is_an_xref ... ok
+test analysis::tests::thumb_literal_load_is_an_xref ... ok
+test analysis::tests::strings_xrefs_survive_hostile_section_bounds ... ok
 test analysis::tests::discovers_x86_64_prologue_and_call ... ok
+test analysis::tests::arm_literal_load_is_an_xref ... ok
+test analysis::tests::strings_xrefs_walk_stops_at_u64_max ... ok
+test analysis::tests::x86_32_call_pop_load_is_an_xref ... ok
 test artifact::tests::magic_distinguishes_nib_and_asset_catalog ... ok
-test artifact::tests::bom_lists_carheader_and_rendition_facts ... ok
-test artifact::tests::nib_renders_scalar_values_beside_keys ... ok
 test artifact::tests::nib_caps_objects_and_marks_undecodable_types ... ok
+test artifact::tests::nib_lists_keys_and_classes_and_a_short_magic_stays_empty ... ok
+test artifact::tests::nib_renders_scalar_values_beside_keys ... ok
 test artifact::tests::nib_undecodable_value_renders_type_and_stops ... ok
 test clr_sig::tests::method_signature_is_return_and_params ... ok
+test clr_sig::tests::a_deeply_nested_signature_does_not_overflow_the_stack ... ok
+test bridge::tests::exports_become_findings ... ok
+test artifact::tests::bom_lists_carheader_and_rendition_facts ... ok
+test clr_sig::tests::operand_free_prefix_opcodes_join_the_listing ... ok
 test clr_sig::tests::property_signature_is_type_and_index_params ... ok
 test clr_sig::tests::tiny_body_lists_ldarg_and_ret ... ok
 test crash::tests::reads_process_identifier_and_version ... ok
 test crash::tests::truncated_report_has_no_identity ... ok
-test bridge::tests::exports_become_findings ... ok
+test decompile::tests::decompiling_a_body_whose_section_reaches_u64_max_does_not_panic ... ok
 test bridge::tests::status_lists_the_seven_providers ... ok
+test decompile::tests::decompiling_a_section_with_a_hostile_file_offset_does_not_panic ... ok
 test artifact::tests::directory_with_info_plist_is_an_app_bundle ... ok
-test decompile::tests::x86_64_jmp_out_of_the_function_ends_with_a_goto ... ok
+test decompile::tests::arm64_ret_is_a_return ... ok
 test decompile::tests::arm64_b_out_of_the_function_ends_with_a_goto ... ok
 test decompile::tests::arm64_loop_back_to_a_visited_target_ends_with_a_goto ... ok
-test decompile::tests::arm64_ret_is_a_return ... ok
-test decompile::tests::arm64_adrp_plus_add_pointer_flows_into_a_call_argument ... ok
 test decompile::tests::arm64_signed_word_and_byte_loads_get_their_c_types ... ok
 test decompile::tests::arm64_b_chain_continues_at_the_target ... ok
+test decompile::tests::arm64_adrp_plus_add_pointer_flows_into_a_call_argument ... ok
+test decompile::tests::decompiling_a_body_at_a_huge_mapped_address_does_not_panic ... ok
+test decompile::tests::decompiling_an_address_beyond_every_section_is_an_error_not_a_panic ... ok
+test decompile::tests::x86_64_backward_jump_to_unvisited_code_walks_it_then_ends_at_the_visited_loop_head ... ok
 test demangle::tests::demangles_a_function_and_a_nested_name ... ok
 test demangle::tests::leaves_plain_and_truncated_names_alone ... ok
 test demangle::tests::rust_v0_and_msvc_keep_the_raw_name_available_to_the_caller ... ok
+test elf_meta::tests::reads_interpreter_needed_and_build_id ... ok
 test elf_meta::tests::rejects_non_elf ... ok
 test goinfo::tests::absent_magic_is_none ... ok
-test elf_meta::tests::reads_interpreter_needed_and_build_id ... ok
 test goinfo::tests::pointer_form_is_an_error ... ok
 test goinfo::tests::pointer_offsets_resolve_inside_the_file ... ok
 test goinfo::tests::reads_inline_buildinfo_and_strips_sentinels ... ok
 test hash::tests::sha1_of_abc ... ok
+test decompile::tests::x86_64_byte_load_is_uint8_t ... ok
 test hash::tests::sha256_of_empty_and_abc ... ok
+test hash::tests::sha384_of_empty_and_abc ... ok
 test headers::tests::header_contains_a_recovered_name_and_a_demangled_declaration ... ok
+test headers::tests::a_rust_path_becomes_a_comment_but_not_a_declaration ... ok
+test headers::tests::msvc_names_become_declarations_with_their_return_type ... ok
 test le::tests::import_by_ordinal_does_not_eat_following_internal ... ok
 test le::tests::internal_offset32_writes_base_plus_target ... ok
 test le::tests::mapsize_larger_than_page_table_errors ... ok
 test le::tests::offset16_stores_object_relative_target ... ok
 test le::tests::parses_synthetic_le ... ok
-test decompile::tests::x86_64_jmp_chain_continues_at_the_target ... ok
 test le::tests::source_list_offsets_follow_target_tail ... ok
+test decompile::tests::x86_64_jmp_out_of_the_function_ends_with_a_goto ... ok
 test loader::tests::clang_rust_v0_underscore_is_demangled_through_load_macho ... ok
 test loader::tests::clang_itanium_underscore_is_demangled_through_load_macho ... ok
 test loader::tests::elf_section_names_use_the_string_table_offset ... ok
 test loader::tests::itanium_name_is_demangled_and_the_raw_name_stays ... ok
+test loader::tests::a_magic_prefix_that_the_header_rejects_does_not_load ... ok
 test loader::tests::macho_symbols_skip_stabs ... ok
+test loader::tests::sqlite_loads_as_an_identity_target ... ok
+test loader::tests::wasm_loads_as_an_identity_target ... ok
+test loader::tests::non_host_slice_can_be_section_listed_and_disassembled ... ok
+test loader::tests::wasm_shorter_than_the_header_stays_unrecognized ... ok
 test macho_meta::tests::architectures_rejects_non_macho ... ok
 test macho_meta::tests::cms_window_matches_the_code_directory_digest ... ok
+test macho_meta::tests::a_hostile_special_slot_count_does_not_panic ... ok
+test macho_meta::tests::boolean_and_nested_entitlement_values ... ok
+test macho_meta::tests::exec_segment_fields_come_from_a_newer_code_directory ... ok
+test macho_meta::tests::der_slot_is_a_size_only ... ok
+test macho_meta::tests::cms_window_matches_truncated_sha256_and_sha384_digests ... ok
+test macho_meta::tests::fat_slices_keep_their_own_entitlements ... ok
 test macho_meta::tests::fat_slices_keep_their_own_code_directories ... ok
-test decompile::tests::x86_64_byte_load_is_uint8_t ... ok
-test macho_meta::tests::omits_version_without_build_command ... ok
 test macho_meta::tests::fat_slices_keep_their_own_identity ... ok
+test macho_meta::tests::mid_index_entitlement_slot_does_not_swallow_the_der_slot ... ok
+test macho_meta::tests::non_xml_entitlement_payload_stays_hex ... ok
+test macho_meta::tests::missing_entitlements_slot_is_none ... ok
+test macho_meta::tests::omits_version_without_build_command ... ok
+test macho_meta::tests::objc_strings_skip_non_name_sections_and_untagged_runs ... ok
+test macho_meta::tests::objc_strings_cap_at_128_with_a_more_marker ... ok
+test macho_meta::tests::reads_an_embedded_binary_plist ... ok
 test macho_meta::tests::reads_build_version_and_code_signature ... ok
 test macho_meta::tests::reads_code_directory_hash_slots ... ok
-test macho_meta::tests::reads_fat_arch_header_without_slice_bytes ... ok
 test macho_meta::tests::reads_code_directory_and_the_cms_blob ... ok
-test macho_meta::tests::rejects_fat_archive ... ok
+test decompile::tests::x86_64_loop_back_to_a_visited_target_ends_with_a_goto ... ok
 test macho_meta::tests::reads_embedded_plist_and_overlay_without_failing_a_short_one ... ok
+test macho_meta::tests::reads_fat_arch_header_without_slice_bytes ... ok
+test decompile::tests::x86_64_signed_word_load_is_int_and_casts_the_return ... ok
+test macho_meta::tests::rejects_fat_archive ... ok
 test macho_meta::tests::rejects_non_macho ... ok
+test macho_meta::tests::reads_objc_class_name_strings_from_the_named_section ... ok
+test macho_meta::tests::reads_entitlements_keys_and_the_capped_xml ... ok
 test macho_meta::tests::unreadable_fat_slice_leaves_the_code_directory_empty ... ok
-test loader::tests::non_host_slice_can_be_section_listed_and_disassembled ... ok
-test pe_meta::tests::clr_field_signature_from_the_blob ... ok
-test pe_meta::tests::clr_member_refs_skip_the_interface_row ... ok
+test macho_meta::tests::self_closing_and_tight_self_closing_values_keep_later_keys ... ok
 test pe_meta::tests::clr_bad_signature_keeps_runtime_version ... ok
+test pe_meta::tests::clr_blob_index_zero_or_past_the_heap_stays_empty ... ok
+test pe_meta::tests::clr_assembly_row_carries_version_culture_and_public_key ... ok
+test pe_meta::tests::clr_assembly_ref_row_carries_token_and_versions ... ok
+test pe_meta::tests::clr_field_ptr_moves_the_signature_with_the_name ... ok
+test pe_meta::tests::clr_field_signature_from_the_blob ... ok
+test pe_meta::tests::clr_four_byte_blob_length_counts_the_first_byte ... ok
+test pe_meta::tests::clr_field_ptr_orders_the_field_names ... ok
+test pe_meta::tests::clr_field_ptr_short_of_the_list_keeps_row_order ... ok
+test pe_meta::tests::clr_four_byte_blob_length_reads_a_16384_byte_blob ... ok
 test pe_meta::tests::clr_interfaces_resolve_typedef_and_typeref_rows ... ok
+test pe_meta::tests::clr_member_ref_parents_resolve_and_stay_empty_when_unfit ... ok
+test pe_meta::tests::clr_member_refs_skip_the_interface_row ... ok
 test pe_meta::tests::clr_member_refs_stay_aligned_past_interface_rows ... ok
 test pe_meta::tests::clr_method_params_skip_the_param_ptr_row ... ok
 test pe_meta::tests::clr_module_refs_are_names ... ok
-test pe_meta::tests::clr_reads_runtime_and_version ... ok
+test pe_meta::tests::clr_method_ptr_orders_the_method_names ... ok
+test pe_meta::tests::clr_param_ptr_orders_the_param_names ... ok
 test pe_meta::tests::clr_property_and_event_signatures_come_from_the_blob ... ok
+test pe_meta::tests::clr_reads_runtime_and_version ... ok
 test pe_meta::tests::clr_short_header_is_none ... ok
 test pe_meta::tests::clr_short_table_stream_is_empty ... ok
-test decompile::tests::x86_64_loop_back_to_a_visited_target_ends_with_a_goto ... ok
 test pe_meta::tests::clr_stream_count_past_buffer_keeps_version ... ok
-test pe_meta::tests::clr_signature_assembly_and_property_names ... ok
 test pe_meta::tests::clr_table_counts_follow_valid_bits ... ok
+test pe_meta::tests::clr_signature_assembly_and_property_names ... ok
+test decompile::tests::x86_64_jmp_chain_continues_at_the_target ... ok
 test pe_meta::tests::clr_stream_names_skip_empty_and_stop ... ok
 test pe_meta::tests::clr_type_names_from_module_and_typedef ... ok
 test pe_meta::tests::clr_type_names_need_the_string_heap ... ok
+test paths::tests::origin_token_finds_a_library_and_a_miss_stays_empty ... ok
 test pe_meta::tests::clr_typedef_fields_follow_the_field_list ... ok
 test pe_meta::tests::clr_typedef_methods_skip_the_field_row ... ok
 test pe_meta::tests::clr_typedef_uses_a_wide_field_index ... ok
 test pe_meta::tests::clr_uncompressed_stream_is_used_when_tilde_is_absent ... ok
+test decompile::tests::x86_64_type_writes_in_the_skipped_gap_drop_the_type_at_the_join ... ok
 test pe_meta::tests::clr_version_none_when_unusable ... ok
 test pe_meta::tests::codeview_missing_when_record_does_not_fit ... ok
 test pe_meta::tests::codeview_nb10_has_no_guid ... ok
-test paths::tests::origin_token_finds_a_library_and_a_miss_stays_empty ... ok
 test pe_meta::tests::codeview_rsds_after_another_debug_type ... ok
 test pe_meta::tests::coff_timestamp_is_a_utc_date ... ok
-test pe_meta::tests::reads_subsystem_image_base_and_timestamp ... ok
 test pe_meta::tests::rejects_non_pe ... ok
-test pe_meta::tests::reads_resource_payload_and_overlay ... ok
+test pe_meta::tests::reads_subsystem_image_base_and_timestamp ... ok
 test pe_meta::tests::resource_name_longer_than_256_chars_is_an_error ... ok
+test pe_meta::tests::reads_resource_payload_and_overlay ... ok
 test pe_meta::tests::resource_data_entry_keeps_size_and_skips_payload ... ok
 test pe_meta::tests::root_id_entries ... ok
 test pe_meta::tests::skips_named_entries_and_string_ids ... ok
 test pe_meta::tests::truncated_directory_is_parse_error ... ok
 test pe_meta::tests::truncated_resource_data_is_an_error ... ok
+test plist::tests::binary_plist_that_does_not_parse_is_none ... ok
+test plist::tests::binary_plist_without_the_keys_is_none ... ok
+test plist::tests::reads_binary_plist_identity_keys ... ok
+test plist::tests::reads_binary_plist_utf16_values_and_long_ascii_lengths ... ok
 test plist::tests::reads_identifying_plist_fields ... ok
 test plist::tests::truncated_plist_does_not_invent_fields ... ok
 test session::tests::diff_compares_identity_evidence_and_tool_records ... ok
-test decompile::tests::x86_64_lea_pointer_becomes_a_typed_local_and_a_cast_argument ... ok
-test decompile::tests::x86_64_typed_register_flows_through_a_followed_join ... ok
+test decompile::tests::x86_64_mov_and_ret_become_an_assignment_and_a_return ... ok
 test sqlite::tests::decodes_utf16le_schema_text ... ok
 test sqlite::tests::empty_file_with_no_pages_has_no_schema ... ok
-test sqlite::tests::follows_an_interior_page_to_the_leaf ... ok
+test decompile::tests::x86_64_typed_register_flows_through_a_followed_join ... ok
 test sqlite::tests::page_size_one_means_64k ... ok
+test sqlite::tests::follows_an_interior_page_to_the_leaf ... ok
 test sqlite::tests::reads_a_leaf_schema_row_and_a_null_sql ... ok
 test sqlite::tests::reads_header_fields ... ok
-test sqlite::tests::rejects_a_non_table_root ... ok
 test sqlite::tests::reads_rows_from_the_named_table ... ok
-test session::tests::open_without_a_binary_keeps_the_path_optional ... ok
+test sqlite::tests::rejects_a_non_table_root ... ok
 test sqlite::tests::rejects_a_short_or_foreign_file ... ok
+test strings::tests::a_run_that_is_neither_ascii_nor_utf16_stays_unread ... ok
+test sqlite::tests::wal_replay_keeps_the_last_committed_page ... ok
+test strings::tests::ascii_hits_keep_their_shape_and_plain_ascii_is_not_utf16 ... ok
 test strings::tests::finds_printable_runs ... ok
-test session::tests::open_records_identity_for_a_loadable_binary ... ok
+test strings::tests::finds_utf16be_runs ... ok
+test strings::tests::finds_utf16le_runs ... ok
+test strings::tests::merged_hits_sort_by_offset ... ok
 test strings::tests::respects_min_len ... ok
-test session::tests::record_embeds_a_named_command_output ... ok
+test strings::tests::utf16_uses_same_min_len_in_code_units ... ok
 test tests::section_perms_uses_rwx_letters ... ok
 test wasm::tests::custom_name_too_long_is_an_error ... ok
-test sqlite::tests::wal_replay_keeps_the_last_committed_page ... ok
 test wasm::tests::custom_names_leave_the_payload_unread ... ok
-test session::tests::open_record_and_diff ... ok
 test wasm::tests::data_count_ignores_the_data_section ... ok
+test session::tests::open_records_identity_for_a_loadable_binary ... ok
 test wasm::tests::duplicate_data_count_is_an_error ... ok
 test wasm::tests::duplicate_start_is_an_error ... ok
+test session::tests::open_without_a_binary_keeps_the_path_optional ... ok
 test wasm::tests::duplicate_table_is_an_error ... ok
 test wasm::tests::duplicate_type_is_an_error ... ok
 test wasm::tests::element_and_data_segments_keep_their_payloads ... ok
 test wasm::tests::empty_module_is_version_one ... ok
+test wasm::tests::execute_names_the_import_when_a_call_reaches_one ... ok
+test wasm::tests::execute_names_the_import_when_the_export_is_one ... ok
 test wasm::tests::execute_returns_an_i32_constant ... ok
 test wasm::tests::export_func_and_section_ids ... ok
 test wasm::tests::export_kinds ... ok
+test session::tests::open_record_and_diff ... ok
+test wasm::tests::huge_local_group_clamps_to_the_cap ... ok
 test wasm::tests::import_func_env_m ... ok
-test wasm::tests::memory_limits_and_start_index ... ok
 test wasm::tests::import_table_mem_global_consume_desc ... ok
+test wasm::tests::memory_limits_and_start_index ... ok
 test wasm::tests::memory_shared_flag_and_imported_memory ... ok
 test wasm::tests::rejects_bad_magic_truncated_and_bad_leb ... ok
+test session::tests::evidence_export_maps_identity_and_records_with_nulls_for_unknown ... ok
+test decompile::tests::x86_64_lea_pointer_becomes_a_typed_local_and_a_cast_argument ... ok
 test wasm::tests::table_limits_leave_the_element_section_unread ... ok
 test wasm::tests::type_count_consumes_the_signature ... ok
+test wasm::tests::table_shared_flag_and_imported_table ... ok
+test wasm::tests::wat_full_keeps_unknown_opcodes_parseable ... ok
+test wasm::tests::wat_full_lists_body_locals_and_call_targets ... ok
+test session::tests::record_embeds_a_named_command_output ... ok
+test wasm::tests::wat_full_lists_import_kinds ... ok
+test wasm::tests::wat_full_lists_segment_offsets_and_escaped_bytes ... ok
+test wasm::tests::wat_full_round_trips_the_fixture_module ... ok
+test wasm::tests::wat_lists_a_shared_table_as_limits_then_reftype ... ok
 test wasm::tests::wat_lists_imported_shared_memory ... ok
 test wasm::tests::wat_lists_types_functions_and_exports ... ok
 test wasm::tests::wat_passes_unknown_opcodes_through ... ok
-test decompile::tests::x86_64_type_writes_in_the_skipped_gap_drop_the_type_at_the_join ... ok
 test session::tests::embedded_output_is_capped_and_marked ... ok
-test decompile::tests::x86_64_mov_and_ret_become_an_assignment_and_a_return ... ok
-test decompile::tests::x86_64_signed_word_load_is_int_and_casts_the_return ... ok
+test session::tests::evidence_export_carries_the_truncation_marker ... ok
 
-test result: ok. 164 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 230 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
 
      Running unittests src/lib.rs (target/debug/deps/rea_mcp-4334a264f4ca2797)
 
-running 5 tests
+running 10 tests
 test tests::notifications_are_silent ... ok
+test tests::rea_funcs_rejects_a_sqlite_target ... ok
+test tests::rea_funcs_rejects_a_wasm_target ... ok
 test tests::unknown_method_is_jsonrpc_error ... ok
+test tests::rea_info_reports_wasm_identity_counts ... ok
 test tests::initialize_handshake ... ok
-test tests::tools_list_returns_seventeen_tools ... ok
+test tests::rea_info_reports_sqlite_identity_counts ... ok
 test tests::tools_list_includes_funcs_and_xrefs ... ok
+test tests::tools_list_returns_eighteen_tools ... ok
+test tests::rea_headers_call_returns_the_header_text ... ok
 
-test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
 
    Doc-tests rea_core
 
@@ -433,6 +613,6 @@ running 0 tests
 
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
-=== task 2 test rc=0 Mon Oct 26 01:18:18 CDT 2026 ===
-=== task 3 START Mon Oct 26 01:18:18 CDT 2026 ===
+=== task 2 test rc=0 Mon Oct 26 12:47:03 CDT 2026 ===
+=== task 3 START Mon Oct 26 12:47:03 CDT 2026 ===
 Working...

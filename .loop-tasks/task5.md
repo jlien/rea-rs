@@ -1,12 +1,11 @@
-Read .loop-tasks/00-common.md first and follow it.
+# A32 function seeds
 
-# Task 11 — Session: upstream Evidence-record export
+**Where:** `crates/rea-core/src/analysis.rs`
 
-crates/rea-core/src/session.rs. The session store is native; the doc honestly says "Not an upstream Evidence record". Add a compatibility EXPORT, not a rewrite:
+**Retires:** "Out of this tree": "A32 function seeds".
 
-1. `rea session ... export --format evidence` (or `--evidence` flag on `diff`/`show` — your call, keep it CLI-consistent): emits an upstream-morphic Evidence JSON shape: tool name, arguments echo, bounded output payload, timestamp, and a session identifier — mapped FROM the native session file records recorded so far (including the identity summary and embedded tool outputs from iteration 1).
-2. Fields the native store does not capture (e.g. upstream's session handle types, live mapping) are emitted as explicit `null` fields, never fabricated.
-3. The MCP surface stays unchanged (17 tools); this export is CLI-only — say so in the docs.
-4. Fixture tests: export of a session with identity + one recorded tool; assert shape keys and null-for-unknown, cap/truncation marker preserved.
-5. Update README.md session bullet + review doc session row (relax "Not an upstream Evidence record" to name the export path and what fields stay null).
-6. Commit: `rea-rs: evidence-format session export`.
+`Arch::Arm` prologue scan is Thumb only (`push {r7, lr}`, bytes `80 b5`). The PC-relative xref pass already disassembles A32 in a second Capstone handle. Also seed 4-byte-aligned `push {r11, lr}` / `stmfd sp!, {..., lr}` words, and disassemble those bodies in ARM mode, ending at `bx lr`. Thumb seeds stay in Thumb mode. Do not switch mode in the middle of a section. The funcs row "A ground-truth procedure list. Counts are a heuristic." stays. Update the `/bin/ls` call-graph numbers only if they move; `/bin/ls` on this machine is arm64, so the fixture is synthetic.
+
+**Difficulty:** medium
+
+**Commit:** `rea-rs: a32 function seeds`
