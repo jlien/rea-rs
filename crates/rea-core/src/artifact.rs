@@ -2,9 +2,10 @@
 //!
 //! `reconstruct` reads a NIBArchive object list and a BOMStore block directory,
 //! including a CARHEADER rendition count. Nib objects render their scalar
-//! values beside their keys, capped at 128 objects. The RENDITIONS tree reports
-//! a name, pixel dimensions, and a pixel-format string per rendition; pixel
-//! data itself is never decoded. An unrecognized path is `Ok(None)`. A magic
+//! values beside their keys, capped at 128 objects. The RENDITIONS tree
+//! reports a name, pixel dimensions, a pixel-format string, and the payload
+//! length after the 184-byte header per rendition; pixel data itself is never
+//! decoded. An unrecognized path is `Ok(None)`. A magic
 //! that does not fit stays kind-only.
 
 use crate::{Error, Result};
@@ -61,7 +62,8 @@ pub struct Reconstruction {
     pub rendition_count: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
-    /// `"<name> <width>x<height> <pixel-format>"` per rendition, capped at 128.
+    /// `"<name> <width>x<height> <pixel-format> payload <n> bytes"` per
+    /// rendition, capped at 128.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub renditions: Option<Vec<String>>,
 }
@@ -329,8 +331,9 @@ fn car_header(bytes: &[u8], address: usize, length: usize) -> (Option<u32>, Opti
 /// block internals). Internal nodes point at child node blocks; leaves carry
 /// `{ value block, key block }` pairs and chain through `forward`. The value
 /// block of a rendition is a CSI header: name at 40, width at 12, height at
-/// 16, pixel format at 24. Only those header fields are read; pixel payloads
-/// stay untouched.
+/// 16, pixel format at 24. Only those header fields are read, plus the
+/// payload length after the 184-byte header; the payload bytes stay
+/// untouched.
 fn rendition_facts(
     bytes: &[u8],
     address: usize,
@@ -402,7 +405,11 @@ fn rendition_facts(
     }
 }
 
-/// Name, dimensions, and pixel format from one CSI header.
+/// Name, dimensions, and pixel format from one CSI header, plus the payload
+/// length after the 184-byte header. The payload bytes themselves stay
+/// unread: on real catalogs that region holds tag-length-value metadata
+/// (tags 1001, 1003, 1010, ...), not raw pixels, so nothing is shown or
+/// decoded from it.
 fn csi_line(bytes: &[u8], address: usize, length: usize) -> Option<String> {
     if length < 184 {
         return None;
@@ -427,6 +434,7 @@ fn csi_line(bytes: &[u8], address: usize, length: usize) -> Option<String> {
         line.push(' ');
         line.push_str(&format);
     }
+    line.push_str(&format!(" payload {} bytes", length.saturating_sub(184)));
     Some(line)
 }
 
@@ -578,7 +586,58 @@ mod tests {
         assert_eq!(got.version.as_deref(), Some("1.0"));
         assert_eq!(
             got.renditions.unwrap(),
-            vec!["icon 32x16 BGRA8".to_string()]
+            vec!["icon 32x16 BGRA8 payload 0 bytes".to_string()]
+        );
+    }
+
+    #[test]
+    fn csi_payload_length_is_reported_but_bytes_stay_unread() {
+        // Same catalog as above, but the CSI block is 232 bytes: 184 header
+        // plus 48 payload bytes that look like the tag-length-value metadata a
+        // real catalog carries there. The line reports the length only.
+        let mut buf = vec![0u8; 525];
+        buf[..8].copy_from_slice(b"BOMStore");
+        buf[16..20].copy_from_slice(&32u32.to_be_bytes());
+        buf[24..28].copy_from_slice(&68u32.to_be_bytes());
+        buf[32..36].copy_from_slice(&4u32.to_be_bytes());
+        buf[36..40].copy_from_slice(&104u32.to_be_bytes());
+        buf[40..44].copy_from_slice(&148u32.to_be_bytes());
+        buf[44..48].copy_from_slice(&252u32.to_be_bytes());
+        buf[48..52].copy_from_slice(&21u32.to_be_bytes());
+        buf[52..56].copy_from_slice(&273u32.to_be_bytes());
+        buf[56..60].copy_from_slice(&20u32.to_be_bytes());
+        buf[60..64].copy_from_slice(&293u32.to_be_bytes());
+        buf[64..68].copy_from_slice(&232u32.to_be_bytes());
+        // Vars: CARHEADER -> block 0, RENDITIONS -> block 1.
+        buf[68..72].copy_from_slice(&2u32.to_be_bytes());
+        buf[72..76].copy_from_slice(&0u32.to_be_bytes());
+        buf[76] = 9;
+        buf[77..86].copy_from_slice(b"CARHEADER");
+        buf[86..90].copy_from_slice(&1u32.to_be_bytes());
+        buf[90] = 10;
+        buf[91..101].copy_from_slice(b"RENDITIONS");
+        // Tree descriptor and leaf node as before.
+        buf[252..256].copy_from_slice(b"tree");
+        buf[260..264].copy_from_slice(&2u32.to_be_bytes());
+        buf[268..272].copy_from_slice(&1u32.to_be_bytes());
+        buf[273..275].copy_from_slice(&1u16.to_be_bytes());
+        buf[275..277].copy_from_slice(&1u16.to_be_bytes());
+        buf[285..289].copy_from_slice(&3u32.to_be_bytes());
+        buf[289..293].copy_from_slice(&1u32.to_be_bytes());
+        // CSI header: 32x16 BGRA named "icon".
+        buf[293..297].copy_from_slice(b"ISTC");
+        buf[305..309].copy_from_slice(&32u32.to_le_bytes());
+        buf[309..313].copy_from_slice(&16u32.to_le_bytes());
+        buf[317..321].copy_from_slice(b"ARGB");
+        buf[333..338].copy_from_slice(b"icon\0");
+        // Payload region: a tag-length-value pair, then non-UTF-8 bytes.
+        buf[477..481].copy_from_slice(&1001u32.to_le_bytes());
+        buf[481..485].copy_from_slice(&20u32.to_le_bytes());
+        buf[490..494].copy_from_slice(&[0x89, 0xff, 0xfe, 0x80]);
+        let got = reconstruct(&buf).unwrap();
+        assert_eq!(
+            got.renditions.unwrap(),
+            vec!["icon 32x16 BGRA8 payload 48 bytes".to_string()]
         );
     }
 
