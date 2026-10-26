@@ -152,9 +152,9 @@
 <main>
   <h1>rea-rs, as of this tree</h1>
   <p class="lede">Local static inspection of Mach-O, ELF, PE, and LE. It follows the pitch of <a href="https://github.com/morluto/rea">morluto/rea</a>. API compatibility is none.</p>
-  <p class="meta" id="now">26 Oct 2026. Newest code commit is <code>296fcf8</code>. These commits are on <code>tasks-loop-5</code>. The Done table lists them newest first. Upstream tool names were read from <code>morluto/rea</code> <code>src/contracts</code> on 12 Oct 2026.</p>
+  <p class="meta" id="now">26 Oct 2026. Newest code commit is <code>b928ecd</code>. These commits are on <code>tasks-loop-5</code>. The Done table lists them newest first. Upstream tool names were read from <code>morluto/rea</code> <code>src/contracts</code> on 12 Oct 2026.</p>
   <div class="banner">
-    <p><code>cargo test --workspace --offline</code> — rea-core 230 passed, rea-mcp 10 passed, rea-cli 4 passed. The build and test runs are warning-free.</p>
+    <p><code>cargo test --workspace --offline</code> — rea-core 233 passed, rea-mcp 10 passed, rea-cli 4 passed. The build and test runs are warning-free.</p>
   </div>
 
   <h2 id="done">Since <code>edb709d</code></h2>
@@ -162,6 +162,7 @@
   <table>
     <thead><tr><th>Commit</th><th>What it added</th></tr></thead>
     <tbody>
+      <tr><td><code>b928ecd</code></td><td>The LE walker reads the entry table beside the object table, page map, and data page, from the header fields that point at it (entry-table offset at <code>+0x5c</code>). Each entry reports its 1-based ordinal, object index, and offset, and <code>LeImage::entry_addresses</code> translates those to linear addresses. Bundle types 0 (unused), 1 (16-bit), 2 (286 call gate), and 3 (32-bit) are consumed per the OS/2 <code>exe386</code> layout. A forwarder bundle (type 4) and a bundle flag past the defined types are counted and skipped, an unrecognized one ending the walk because its on-disk size is unknown. The entries are not seeded into <code>rea funcs</code>. Iterated (compressed) pages stay unread until task 6.5.</td></tr>
       <tr><td><code>296fcf8</code></td><td><code>rea macho</code> and <code>rea_macho</code> read <code>objc_strings</code>: NUL-terminated printable C strings from every section whose name contains <code>objc</code>, in file order, capped at 128 with a trailing <code>... N more</code> marker. A section that holds pointers instead of characters (for example <code>__objc_classlist</code>) yields no printable runs and contributes nothing; a binary with no <code>objc</code> section stores an empty list and does not fail the parse; each fat slice carries its own list. No <code>class_ro_t</code>, method list, or protocol is walked, and Swift names are not demangled. A printable run with no terminating NUL stays unread.</td></tr>
       <tr><td><code>cc33905</code></td><td>The loader recognizes a database before <code>goblin::peek</code> fails: a file whose 100-byte header <code>sqlite::header</code> accepts loads as format <code>sqlite</code> (arch <code>unknown</code>, 64-bit, little-endian, no entry, no sections, no symbols), and <code>rea info</code>/<code>rea_info</code> report the application id and the <code>sqlite_schema</code> object count <code>sqlite::schema</code> computes under a <code>sqlite</code> key. <code>Target::require_native</code> keeps <code>rea disasm</code>, <code>rea funcs</code>, <code>rea decompile</code>, and <code>rea xrefs</code> erroring on the format with a named message, and <code>--arch</code> still rejects a database. Row reads, the WAL, and the caps (1024 rows, pages <code>1..=1048576</code>) stay on <code>rea sqlite</code>, which reads the file itself. Fixtures: a loader test that loads one 512-byte page with application id <code>0x01020304</code> and one schema row, a magic prefix the header rejects, and CLI and MCP smoke tests pinning <code>rea info</code> and the <code>funcs</code> rejection.</td></tr>
       <tr><td><code>eacfd76</code></td><td>The <code>rea_headers</code> tool description said a Rust path with no parentheses is omitted, while the code prints such a path as a comment line <code>/* foo::bar */</code>. The description now states that a demangled path with <code>::</code> but no parameter list becomes a comment line, never a declaration, matching <code>headers.rs</code>, the README, and the command table.</td></tr>
@@ -312,7 +313,7 @@
   </table>
 
   <h3>Out of this tree</h3>
-  <p>Launching Hopper, Ghidra, IDA, JEB, or Frida. Attaching to a process, driving a browser, or running adb. A full type-recovering decompiler beyond same-function flow and the carried width types, and an upstream Evidence record. WASI, memory access at execute time, and calling a host import (one is named, not called). Apple trust evaluation of a code signature. Undecoded asset-catalog pixel payloads. A Go pointer that leaves the file. Swift demangling. Metadata tables other than the CLR table above. A32 function seeds, and LE entry bundles and iterated pages.</p>
+  <p>Launching Hopper, Ghidra, IDA, JEB, or Frida. Attaching to a process, driving a browser, or running adb. A full type-recovering decompiler beyond same-function flow and the carried width types, and an upstream Evidence record. WASI, memory access at execute time, and calling a host import (one is named, not called). Apple trust evaluation of a code signature. Undecoded asset-catalog pixel payloads. A Go pointer that leaves the file. Swift demangling. Metadata tables other than the CLR table above. A32 function seeds, and LE iterated (compressed) pages.</p>
 
   <details class="archive" id="log">
     <summary>Evidence log — how each check was recorded</summary>
@@ -331,6 +332,12 @@
         <td>Static facts in <code>49ed804</code></td>
         <td><code>rea macho</code>, <code>rea pe</code>, <code>rea symbols</code>, <code>rea xrefs</code>, <code>rea sections --arch</code>, <code>rea disasm --arch</code>, <code>rea headers</code>, <code>rea plist</code>, <code>rea crash</code>, <code>rea artifact</code>.</td>
         <td>CMS blob length 8 and bytes <code>CMS-BLOB</code>. Hash slots <code>aabb</code> and <code>ccdd</code>. Resource payload <code>SECR</code> and overlay size 5. <code>_Z3fooi</code> demangles to <code>foo(int)</code> and the header contains <code>plain</code>. A non-host slice disassembles. Kinds are app bundle, nib, and asset catalog.</td>
+        <td><span class="tag have">landed</span></td>
+      </tr>
+      <tr>
+        <td>Entry bundles in <code>b928ecd</code></td>
+        <td><code>le.rs</code> entry-table walker, beside the object table, page map, and data page reads.</td>
+        <td>In-crate fixtures: a bundle walk covering unused, 32-bit, and 16-bit bundles with ordinals advancing across a skip (<code>entry_bundles_report_object_index_and_offset</code>), an unrecognized flag <code>0x83</code> counted and skipped (<code>unrecognized_bundle_flag_is_counted_and_skipped</code>), and forwarders advancing ordinals without an object (<code>forwarder_bundle_advances_ordinals_without_an_object</code>). <code>cargo test --workspace --offline</code>: rea-core 233 passed, rea-mcp 10 passed, rea-cli 4 passed.</td>
         <td><span class="tag have">landed</span></td>
       </tr>
       <tr>
@@ -519,7 +526,7 @@
       </tr>
       <tr>
         <td>LE / DOS/4GW</td>
-        <td>Custom loader. Internal fixups run on every LE load. Entry bundles and iterated pages are not handled.</td>
+        <td>Custom loader. Internal fixups run on every LE load. The entry table is read beside the object table and page map: each entry's object index and offset (bundle types 0-3), forwarders and unrecognized bundle flags counted and skipped. Iterated pages are not handled.</td>
         <td>No Watcom LE contract. <code>inspect_native_load_image</code> covers DOS MZ and COM.</td>
         <td><span class="tag have">local only</span></td>
       </tr>
@@ -589,7 +596,14 @@
     <span class="tag have">fixed</span>
     <h3>The header comment, the tests, and the stats example</h3>
     <p class="where">le.rs module comment, synthetic fixtures, examples/le_fixup_stats.rs</p>
-    <p>The module comment now says internal fixups are in scope and that entry bundles and iterated pages are not. The stats example prints how many fixups it applied to the file you pass.</p>
+    <p>The module comment now says internal fixups are in scope and that iterated (compressed) pages are not; the entry-table half is in scope as of <code>b928ecd</code>. The stats example prints how many fixups it applied to the file you pass.</p>
+  </article>
+
+  <article class="issue">
+    <span class="tag have">fixed</span>
+    <h3>Entry bundles were not read</h3>
+    <p class="where">le.rs <code>parse_entry_table</code>, <code>LeEntry</code>, <code>SkippedBundle</code>, <code>LeImage::entry_addresses</code></p>
+    <p>The walker reads the entry table from the header field at <code>+0x5c</code>. Bundle types 0, 1, 2, and 3 yield entries with their ordinal, object index, and offset; type 4 (forwarder) and any flag past the defined types are counted in <code>skipped_bundles</code> and skipped, an unrecognized one ending the walk because its on-disk size is unknown. The fixtures pin a skip-then-two-bundle walk, the unknown flag <code>0x83</code>, and a forwarder bundle. The addresses are not seeded into <code>rea funcs</code>.</p>
   </article>
 
   <footer>
