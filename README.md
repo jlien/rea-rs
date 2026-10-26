@@ -43,6 +43,7 @@ rea disasm fat-binary --arch arm64 --address 0x1000 --count 1
 # C header of recovered names, plist and crash identity, artifact kind, nib values, rendition dimensions and pixel formats
 rea headers /bin/ls
 rea plist Info.plist
+rea plist binary-Info.plist  # a bplist00 binary plist reads the same three keys
 rea crash report.crash
 rea artifact Example.app
 

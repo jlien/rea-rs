@@ -127,7 +127,7 @@ enum Command {
     },
     /// C header of recovered local and export names. An Itanium demangle becomes a declaration.
     Headers { path: String },
-    /// Identifying fields of an XML Info.plist. A binary plist or a file with none of the keys prints null.
+    /// Identifying fields of an XML or binary Info.plist. A file with none of the keys prints null.
     Plist { path: String },
     /// Identifying lines of a text crash report. A report with none of them prints null.
     Crash { path: String },
