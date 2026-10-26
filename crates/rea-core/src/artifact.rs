@@ -1,8 +1,11 @@
 //! Static kind of an app bundle, a compiled nib, or an asset catalog.
 //!
 //! `reconstruct` reads a NIBArchive object list and a BOMStore block directory,
-//! including a CARHEADER rendition count. It does not decode pixels. An
-//! unrecognized path is `Ok(None)`. A magic that does not fit stays kind-only.
+//! including a CARHEADER rendition count. Nib objects render their scalar
+//! values beside their keys, capped at 128 objects. The RENDITIONS tree reports
+//! a name, pixel dimensions, and a pixel-format string per rendition; pixel
+//! data itself is never decoded. An unrecognized path is `Ok(None)`. A magic
+//! that does not fit stays kind-only.
 
 use crate::{Error, Result};
 use std::path::Path;
@@ -49,12 +52,18 @@ pub struct Reconstruction {
     pub keys: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub classes: Option<Vec<String>>,
+    /// `"<class>.<key> = <value>"` per coder value, objects capped at 128.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub values: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blocks: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rendition_count: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// `"<name> <width>x<height> <pixel-format>"` per rendition, capped at 128.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub renditions: Option<Vec<String>>,
 }
 
 pub fn reconstruct(bytes: &[u8]) -> Option<Reconstruction> {
@@ -71,9 +80,12 @@ fn parse_nib(bytes: &[u8]) -> Option<Reconstruction> {
     if bytes.len() < 50 {
         return None;
     }
-    let object_count = le_u32(bytes, 18)?;
+    let object_count = le_u32(bytes, 18)? as usize;
+    let object_off = le_u32(bytes, 22)? as usize;
     let key_count = le_u32(bytes, 26)?;
     let key_off = le_u32(bytes, 30)? as usize;
+    let value_count = le_u32(bytes, 34)?;
+    let value_off = le_u32(bytes, 38)? as usize;
     let class_count = le_u32(bytes, 42)?;
     let class_off = le_u32(bytes, 46)? as usize;
     if key_count > 4096 || class_count > 4096 {
@@ -105,15 +117,112 @@ fn parse_nib(bytes: &[u8]) -> Option<Reconstruction> {
         let end = raw.iter().rposition(|b| *b != 0).map(|i| i + 1).unwrap_or(0);
         classes.push(String::from_utf8(raw[..end].to_vec()).ok()?);
     }
+    // Objects: class index, first value index, value count. A truncated table
+    // just stops the list instead of failing keys and classes above.
+    let mut objects = Vec::new();
+    let mut at = object_off;
+    while objects.len() < object_count {
+        let class_idx = match nib_varint(bytes, &mut at) {
+            Some(v) => v as usize,
+            None => break,
+        };
+        let start = match nib_varint(bytes, &mut at) {
+            Some(v) => v as usize,
+            None => break,
+        };
+        let count = match nib_varint(bytes, &mut at) {
+            Some(v) => v as usize,
+            None => break,
+        };
+        objects.push((class_idx, start, count));
+    }
+    // Coder values: key index, type tag, payload. A value whose type is not in
+    // the table, or whose payload is cut short, renders as `type N`.
+    let mut rendered = Vec::new();
+    at = value_off;
+    for _ in 0..value_count {
+        let key_id = match nib_varint(bytes, &mut at) {
+            Some(v) => v as usize,
+            None => break,
+        };
+        let tag = match bytes.get(at) {
+            Some(&b) => {
+                at += 1;
+                b
+            }
+            None => break,
+        };
+        let key = keys.get(key_id).map(String::as_str).unwrap_or("key?");
+        let text = match tag {
+            0 => fixed(bytes, &mut at, 1).map(|r| (r[0] as i8).to_string()),
+            1 => fixed(bytes, &mut at, 2).map(|r| i16::from_le_bytes(r.try_into().unwrap()).to_string()),
+            2 => fixed(bytes, &mut at, 4).map(|r| i32::from_le_bytes(r.try_into().unwrap()).to_string()),
+            3 => fixed(bytes, &mut at, 8).map(|r| i64::from_le_bytes(r.try_into().unwrap()).to_string()),
+            4 => Some("true".to_string()),
+            5 => Some("false".to_string()),
+            6 => fixed(bytes, &mut at, 4).map(|r| f32::from_le_bytes(r.try_into().unwrap()).to_string()),
+            7 => fixed(bytes, &mut at, 8).map(|r| f64::from_le_bytes(r.try_into().unwrap()).to_string()),
+            8 => {
+                let mut probe = at;
+                match nib_varint(bytes, &mut probe) {
+                    Some(n) if probe + n as usize <= bytes.len() => {
+                        at = probe + n as usize;
+                        Some(format!("{n} bytes"))
+                    }
+                    _ => None,
+                }
+            }
+            9 => Some("nil".to_string()),
+            10 => fixed(bytes, &mut at, 4).map(|r| format!("object {}", u32::from_le_bytes(r.try_into().unwrap()))),
+            _ => Some(format!("type {tag}")),
+        };
+        match text {
+            Some(text) => rendered.push(format!("{key} = {text}")),
+            None => {
+                rendered.push(format!("{key} = type {tag}"));
+                break;
+            }
+        }
+    }
+    let mut values = Vec::new();
+    for (i, &(class_idx, start, count)) in objects.iter().enumerate() {
+        if i == MAX_RENDERED_OBJECTS {
+            break;
+        }
+        let class = classes.get(class_idx).map(String::as_str).unwrap_or("class?");
+        for tail in rendered.get(start..start.saturating_add(count)).unwrap_or(&[]) {
+            values.push(format!("{class}.{tail}"));
+        }
+    }
+    if objects.len() > MAX_RENDERED_OBJECTS {
+        values.push(format!(
+            "... {} more objects",
+            objects.len() - MAX_RENDERED_OBJECTS
+        ));
+    }
     Some(Reconstruction {
         kind: "nib".into(),
-        object_count: Some(object_count),
+        object_count: Some(object_count as u32),
         keys: Some(keys),
         classes: Some(classes),
+        values: Some(values),
         blocks: None,
         rendition_count: None,
         version: None,
+        renditions: None,
     })
+}
+
+/// Objects rendered before the `... more objects` marker.
+const MAX_RENDERED_OBJECTS: usize = 128;
+
+/// Renditions reported before the `... more renditions` marker.
+const MAX_RENDITIONS: usize = 128;
+
+fn fixed<'a>(bytes: &'a [u8], at: &mut usize, n: usize) -> Option<&'a [u8]> {
+    let raw = bytes.get(*at..*at + n)?;
+    *at += n;
+    Some(raw)
 }
 
 /// NIBArchive varint: 7-bit groups, low group first. The terminal byte has bit 7 set.
@@ -159,6 +268,7 @@ fn parse_bom(bytes: &[u8]) -> Option<Reconstruction> {
     cursor = vars_off + 4;
     let mut blocks = Vec::new();
     let mut car: Option<(usize, usize)> = None;
+    let mut renditions_id: Option<usize> = None;
     for _ in 0..var_count {
         let index = be_u32(bytes, cursor)? as usize;
         cursor += 4;
@@ -169,6 +279,8 @@ fn parse_bom(bytes: &[u8]) -> Option<Reconstruction> {
         let name = std::str::from_utf8(name).ok()?.to_string();
         if name == "CARHEADER" {
             car = addresses.get(index).copied();
+        } else if name == "RENDITIONS" {
+            renditions_id = Some(index);
         }
         blocks.push(name);
     }
@@ -176,14 +288,19 @@ fn parse_bom(bytes: &[u8]) -> Option<Reconstruction> {
         Some((address, length)) => car_header(bytes, address, length),
         None => (None, None),
     };
+    let renditions = renditions_id
+        .and_then(|id| addresses.get(id))
+        .and_then(|&(address, length)| rendition_facts(bytes, address, length, &addresses));
     Some(Reconstruction {
         kind: "asset-catalog".into(),
         object_count: None,
         keys: None,
         classes: None,
+        values: None,
         blocks: Some(blocks),
         rendition_count,
         version,
+        renditions,
     })
 }
 
@@ -208,6 +325,129 @@ fn car_header(bytes: &[u8], address: usize, length: usize) -> (Option<u32>, Opti
     (count, version)
 }
 
+/// RENDITIONS block: a BOM tree ("tree" descriptor, big-endian like all BOM
+/// block internals). Internal nodes point at child node blocks; leaves carry
+/// `{ value block, key block }` pairs and chain through `forward`. The value
+/// block of a rendition is a CSI header: name at 40, width at 12, height at
+/// 16, pixel format at 24. Only those header fields are read; pixel payloads
+/// stay untouched.
+fn rendition_facts(
+    bytes: &[u8],
+    address: usize,
+    length: usize,
+    blocks: &[(usize, usize)],
+) -> Option<Vec<String>> {
+    let tree = bytes.get(address..address + length)?;
+    if tree.len() < 21 {
+        return None;
+    }
+    match tree.get(..4) {
+        Some(b"tree") => {}
+        _ => return None,
+    }
+    let total = be_u32(tree, 16)? as usize;
+    let mut node = be_u32(tree, 8)? as usize;
+    let mut seen = std::collections::HashSet::new();
+    let mut facts: Vec<String> = Vec::new();
+    loop {
+        if !seen.insert(node) {
+            break;
+        }
+        let (addr, len) = match blocks.get(node) {
+            Some(&(0, 0)) | None => break,
+            Some(&pair) => pair,
+        };
+        let block = match bytes.get(addr..addr + len) {
+            Some(block) if block.len() >= 12 => block,
+            _ => break,
+        };
+        let is_leaf = be_u16(block, 0)?;
+        let count = be_u16(block, 2)? as usize;
+        let forward = be_u32(block, 4)? as usize;
+        if is_leaf != 1 {
+            // Internal node: the first entry points at a child node block.
+            if count == 0 {
+                break;
+            }
+            node = be_u32(block, 12)? as usize;
+            continue;
+        }
+        for entry in 0..count {
+            let at = 12 + entry * 8;
+            if at + 8 > block.len() {
+                break;
+            }
+            let value_id = be_u32(block, at)? as usize;
+            let line = match blocks.get(value_id) {
+                Some(&(0, 0)) | None => None,
+                Some(&(vaddr, vlen)) => csi_line(bytes, vaddr, vlen),
+            };
+            if let Some(line) = line {
+                facts.push(line);
+            }
+            if facts.len() >= MAX_RENDITIONS {
+                facts.push(format!("... {} more renditions", total.saturating_sub(facts.len())));
+                return Some(facts);
+            }
+        }
+        if forward == 0 {
+            break;
+        }
+        node = forward;
+    }
+    if facts.is_empty() {
+        None
+    } else {
+        Some(facts)
+    }
+}
+
+/// Name, dimensions, and pixel format from one CSI header.
+fn csi_line(bytes: &[u8], address: usize, length: usize) -> Option<String> {
+    if length < 184 {
+        return None;
+    }
+    match bytes.get(address..address + 4)? {
+        b"ISTC" => {}
+        _ => return None,
+    }
+    let width = le_u32(bytes, address + 12)?;
+    let height = le_u32(bytes, address + 16)?;
+    let raw = bytes.get(address + 24..address + 28)?;
+    let name_raw = bytes.get(address + 40..address + 168)?;
+    let end = name_raw.iter().position(|&b| b == 0).unwrap_or(name_raw.len());
+    let name = String::from_utf8_lossy(&name_raw[..end]);
+    let mut line = String::new();
+    if !name.is_empty() {
+        line.push_str(&name);
+        line.push(' ');
+    }
+    line.push_str(&format!("{width}x{height}"));
+    if let Some(format) = pixel_format(raw) {
+        line.push(' ');
+        line.push_str(&format);
+    }
+    Some(line)
+}
+
+/// The pixel-format word is four ASCII bytes, e.g. `ARGB` on disk for BGRA.
+/// Zero means the rendition carries no pixels (links, colors, stubs).
+fn pixel_format(raw: &[u8]) -> Option<String> {
+    if raw.iter().all(|&b| b == 0) {
+        return None;
+    }
+    Some(match raw {
+        b"ARGB" => "BGRA8".to_string(),
+        b"GA8 " => "GA8".to_string(),
+        b"WBGR" => "RGBA16F".to_string(),
+        b"GA16" => "GA16".to_string(),
+        b"SVG " => "SVG".to_string(),
+        b"DATA" => "DATA".to_string(),
+        b"GEPJ" => "JPEG".to_string(),
+        _ => String::from_utf8_lossy(raw).trim_end().to_string(),
+    })
+}
+
 fn le_u32(bytes: &[u8], at: usize) -> Option<u32> {
     let raw = bytes.get(at..at + 4)?;
     Some(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
@@ -216,6 +456,11 @@ fn le_u32(bytes: &[u8], at: usize) -> Option<u32> {
 fn be_u32(bytes: &[u8], at: usize) -> Option<u32> {
     let raw = bytes.get(at..at + 4)?;
     Some(u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]))
+}
+
+fn be_u16(bytes: &[u8], at: usize) -> Option<u16> {
+    let raw = bytes.get(at..at + 2)?;
+    Some(u16::from_be_bytes([raw[0], raw[1]]))
 }
 
 #[cfg(test)]
@@ -283,25 +528,159 @@ mod tests {
     }
 
     #[test]
-    fn bom_lists_carheader_without_pixels() {
+    fn bom_lists_carheader_and_rendition_facts() {
         assert_eq!(reconstruct(b"BOMStore"), None);
-        let mut buf = vec![0u8; 64 + 148];
+        // Blocks: 0 CARHEADER at 104, 1 tree descriptor at 252, 2 leaf node at
+        // 273, 3 CSI header at 293. Vars sit at 68 and end at 101.
+        let mut buf = vec![0u8; 480];
         buf[..8].copy_from_slice(b"BOMStore");
         buf[16..20].copy_from_slice(&32u32.to_be_bytes());
-        buf[24..28].copy_from_slice(&44u32.to_be_bytes());
-        buf[32..36].copy_from_slice(&1u32.to_be_bytes());
-        buf[36..40].copy_from_slice(&64u32.to_be_bytes());
+        buf[24..28].copy_from_slice(&68u32.to_be_bytes());
+        buf[32..36].copy_from_slice(&4u32.to_be_bytes());
+        buf[36..40].copy_from_slice(&104u32.to_be_bytes());
         buf[40..44].copy_from_slice(&148u32.to_be_bytes());
-        buf[44..48].copy_from_slice(&1u32.to_be_bytes());
-        buf[48..52].copy_from_slice(&0u32.to_be_bytes());
-        buf[52] = 9;
-        buf[53..62].copy_from_slice(b"CARHEADER");
-        buf[64..68].copy_from_slice(b"RATC");
-        buf[80..84].copy_from_slice(&3u32.to_be_bytes());
-        buf[84..87].copy_from_slice(b"1.0");
+        buf[44..48].copy_from_slice(&252u32.to_be_bytes());
+        buf[48..52].copy_from_slice(&21u32.to_be_bytes());
+        buf[52..56].copy_from_slice(&273u32.to_be_bytes());
+        buf[56..60].copy_from_slice(&20u32.to_be_bytes());
+        buf[60..64].copy_from_slice(&293u32.to_be_bytes());
+        buf[64..68].copy_from_slice(&184u32.to_be_bytes());
+        // Vars: CARHEADER -> block 0, RENDITIONS -> block 1.
+        buf[68..72].copy_from_slice(&2u32.to_be_bytes());
+        buf[72..76].copy_from_slice(&0u32.to_be_bytes());
+        buf[76] = 9;
+        buf[77..86].copy_from_slice(b"CARHEADER");
+        buf[86..90].copy_from_slice(&1u32.to_be_bytes());
+        buf[90] = 10;
+        buf[91..101].copy_from_slice(b"RENDITIONS");
+        // CARHEADER block: magic RATC, rendition count 3, version "1.0".
+        buf[104..108].copy_from_slice(b"RATC");
+        buf[120..124].copy_from_slice(&3u32.to_be_bytes());
+        buf[124..127].copy_from_slice(b"1.0");
+        // Tree descriptor: child = block 2 (field at +8), path count 1 (+16).
+        buf[252..256].copy_from_slice(b"tree");
+        buf[260..264].copy_from_slice(&2u32.to_be_bytes());
+        buf[268..272].copy_from_slice(&1u32.to_be_bytes());
+        // Leaf node: one entry, value block 3, key block 1.
+        buf[273..275].copy_from_slice(&1u16.to_be_bytes());
+        buf[275..277].copy_from_slice(&1u16.to_be_bytes());
+        buf[285..289].copy_from_slice(&3u32.to_be_bytes());
+        buf[289..293].copy_from_slice(&1u32.to_be_bytes());
+        // CSI header: 32x16 BGRA named "icon".
+        buf[293..297].copy_from_slice(b"ISTC");
+        buf[305..309].copy_from_slice(&32u32.to_le_bytes());
+        buf[309..313].copy_from_slice(&16u32.to_le_bytes());
+        buf[317..321].copy_from_slice(b"ARGB");
+        buf[333..338].copy_from_slice(b"icon\0");
         let got = reconstruct(&buf).unwrap();
-        assert_eq!(got.blocks.unwrap(), vec!["CARHEADER".to_string()]);
+        assert_eq!(got.blocks.unwrap(), vec!["CARHEADER".to_string(), "RENDITIONS".to_string()]);
         assert_eq!(got.rendition_count, Some(3));
         assert_eq!(got.version.as_deref(), Some("1.0"));
+        assert_eq!(
+            got.renditions.unwrap(),
+            vec!["icon 32x16 BGRA8".to_string()]
+        );
     }
+
+    #[test]
+    fn nib_renders_scalar_values_beside_keys() {
+        let mut buf = vec![0u8; 50];
+        buf[..10].copy_from_slice(b"NIBArchive");
+        buf[18..22].copy_from_slice(&1u32.to_le_bytes());
+        buf[22..26].copy_from_slice(&50u32.to_le_bytes());
+        buf[26..30].copy_from_slice(&2u32.to_le_bytes());
+        buf[30..34].copy_from_slice(&53u32.to_le_bytes());
+        buf[34..38].copy_from_slice(&2u32.to_le_bytes());
+        buf[38..42].copy_from_slice(&62u32.to_le_bytes());
+        buf[42..46].copy_from_slice(&1u32.to_le_bytes());
+        buf[46..50].copy_from_slice(&70u32.to_le_bytes());
+        // Object 0: class 0, values from index 0, count 2.
+        buf.push(0x80);
+        buf.push(0x80);
+        buf.push(0x82);
+        // Keys "alpha" and "on".
+        buf.push(0x85);
+        buf.extend_from_slice(b"alpha");
+        buf.push(0x82);
+        buf.extend_from_slice(b"on");
+        // Value 0: int32 7. Value 1: true.
+        buf.push(0x80);
+        buf.push(2);
+        buf.extend_from_slice(&7i32.to_le_bytes());
+        buf.push(0x81);
+        buf.push(4);
+        // Class "NSObject".
+        buf.push(0x89);
+        buf.push(0x80);
+        buf.extend_from_slice(b"NSObject\0");
+        let got = reconstruct(&buf).unwrap();
+        assert_eq!(
+            got.values.unwrap(),
+            vec!["NSObject.alpha = 7".to_string(), "NSObject.on = true".to_string()]
+        );
+    }
+
+    #[test]
+    fn nib_caps_objects_and_marks_undecodable_types() {
+        let mut buf = vec![0u8; 50];
+        buf[..10].copy_from_slice(b"NIBArchive");
+        buf[18..22].copy_from_slice(&130u32.to_le_bytes());
+        buf[22..26].copy_from_slice(&50u32.to_le_bytes());
+        buf[26..30].copy_from_slice(&1u32.to_le_bytes());
+        buf[30..34].copy_from_slice(&440u32.to_le_bytes());
+        buf[34..38].copy_from_slice(&1u32.to_le_bytes());
+        buf[38..42].copy_from_slice(&442u32.to_le_bytes());
+        buf[42..46].copy_from_slice(&1u32.to_le_bytes());
+        buf[46..50].copy_from_slice(&444u32.to_le_bytes());
+        for _ in 0..130 {
+            buf.push(0x80);
+            buf.push(0x80);
+            buf.push(0x80);
+        }
+        buf.push(0x81);
+        buf.extend_from_slice(b"k");
+        buf.push(0x80);
+        buf.push(200);
+        buf.push(0x89);
+        buf.push(0x80);
+        buf.extend_from_slice(b"NSObject\0");
+        let got = reconstruct(&buf).unwrap();
+        assert_eq!(got.object_count, Some(130));
+        assert_eq!(got.values.unwrap(), vec!["... 2 more objects".to_string()]);
+    }
+
+    #[test]
+    fn nib_undecodable_value_renders_type_and_stops() {
+        let mut buf = vec![0u8; 50];
+        buf[..10].copy_from_slice(b"NIBArchive");
+        buf[18..22].copy_from_slice(&1u32.to_le_bytes());
+        buf[22..26].copy_from_slice(&50u32.to_le_bytes());
+        buf[26..30].copy_from_slice(&1u32.to_le_bytes());
+        buf[30..34].copy_from_slice(&53u32.to_le_bytes());
+        buf[34..38].copy_from_slice(&2u32.to_le_bytes());
+        buf[38..42].copy_from_slice(&55u32.to_le_bytes());
+        buf[42..46].copy_from_slice(&1u32.to_le_bytes());
+        buf[46..50].copy_from_slice(&63u32.to_le_bytes());
+        buf.push(0x80);
+        buf.push(0x80);
+        buf.push(0x82);
+        buf.push(0x81);
+        buf.extend_from_slice(b"k");
+        // Value 0: int32 5. Value 1: type 200 has an unknown shape with no
+        // way to know its length; it renders as `type 200` and the list stops.
+        buf.push(0x80);
+        buf.push(2);
+        buf.extend_from_slice(&5i32.to_le_bytes());
+        buf.push(0x80);
+        buf.push(200);
+        buf.push(0x89);
+        buf.push(0x80);
+        buf.extend_from_slice(b"NSObject\0");
+        let got = reconstruct(&buf).unwrap();
+        assert_eq!(
+            got.values.unwrap(),
+            vec!["NSObject.k = 5".to_string(), "NSObject.k = type 200".to_string()]
+        );
+    }
+
 }
