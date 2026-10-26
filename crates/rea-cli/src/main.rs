@@ -130,7 +130,7 @@ enum Command {
     Crash { path: String },
     /// Kind of an app bundle, a compiled nib, or an asset catalog. A fitting nib or catalog also lists keys, classes, or block names. Pixels are not decoded.
     Artifact { path: String },
-    /// Evidence session JSON. Does not map the binary. `--dir` chooses where the files are written.
+    /// Evidence session JSON. `open` maps a loadable binary once for its identity summary; the file on disk stays the source of truth. `--dir` chooses where the files are written.
     Session {
         #[arg(long)]
         dir: String,
@@ -148,10 +148,15 @@ enum Command {
 
 #[derive(Subcommand)]
 enum SessionCmd {
-    /// Create a session file for a path. The binary is not mapped.
+    /// Create a session file for a path. A loadable binary is mapped once for its identity summary; a path that does not load still opens.
     Open { path: String },
-    /// Append a tool name and a summary.
-    Record { id: String, tool: String, summary: String },
+    /// Append a record. `--tool` names a rea command (`info`, `sections`, `symbols`, `strings`, `funcs`, `disasm`) whose output is re-run against the session's binary and embedded, capped at 16 KiB.
+    Record {
+        id: String,
+        #[arg(long)]
+        tool: Option<String>,
+        summary: String,
+    },
     /// Compare two session ids in `--dir`.
     Diff { left: String, right: String },
 }
@@ -286,7 +291,7 @@ fn main() -> anyhow::Result<()> {
                     rea_core::session::open(dir, path).map_err(|e| anyhow::anyhow!("{e}"))?,
                 )?,
                 SessionCmd::Record { id, tool, summary } => serde_json::to_value(
-                    rea_core::session::record(dir, id, tool, summary)
+                    rea_core::session::record(dir, id, tool.as_deref(), summary)
                         .map_err(|e| anyhow::anyhow!("{e}"))?,
                 )?,
                 SessionCmd::Diff { left, right } => {

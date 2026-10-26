@@ -308,7 +308,7 @@ fn session_call(args: &Value) -> Result<Value, String> {
         }
         "record" => {
             let id = args.get("id").and_then(Value::as_str).unwrap_or("");
-            let tool = args.get("tool").and_then(Value::as_str).unwrap_or("");
+            let tool = args.get("tool").and_then(Value::as_str);
             let summary = args.get("summary").and_then(Value::as_str).unwrap_or("");
             serde_json::to_value(
                 rea_core::session::record(dir, id, tool, summary).map_err(|e| e.to_string())?,
@@ -468,15 +468,15 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "rea_session",
-            "description": "Evidence session JSON: open, record a tool and summary, or diff two sessions. Does not map the binary. dir is the directory of the session files.",
+            "description": "Evidence session JSON: open, record a tool and summary, or diff two sessions. open maps a loadable binary once for its identity summary; the file on disk stays the source of truth. record with tool embeds that command's output, capped at 16 KiB. dir is the directory of the session files.",
             "inputSchema": json!({
                 "type": "object",
                 "properties": {
                     "action": { "type": "string", "enum": ["open", "record", "diff"] },
                     "dir": { "type": "string", "description": "Directory of session JSON files." },
-                    "path": { "type": "string", "description": "Path recorded by open. The file is not mapped." },
+                    "path": { "type": "string", "description": "Path recorded by open." },
                     "id": { "type": "string" },
-                    "tool": { "type": "string" },
+                    "tool": { "type": "string", "description": "Optional rea command to re-run against the session's binary: info, sections, symbols, strings, funcs, or disasm." },
                     "summary": { "type": "string" },
                     "left": { "type": "string" },
                     "right": { "type": "string" }
