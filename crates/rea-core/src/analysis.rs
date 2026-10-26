@@ -275,7 +275,7 @@ fn symbol_seeds(target: &Target) -> Vec<u64> {
             target.sections.iter().any(|sec| {
                 matches!(sec.name.as_str(), "__text" | ".text" | "CODE" | ".init" | ".fini")
                     && sym.addr >= sec.addr
-                    && sym.addr < sec.addr + sec.size
+                    && sym.addr < sec.addr.saturating_add(sec.size)
             })
         })
         .map(|sym| sym.addr)
@@ -729,14 +729,14 @@ pub fn strings_with_xrefs(target: &Target, min_len: usize) -> Vec<AnnotatedStrin
         let Some(sec) = target
             .sections
             .iter()
-            .find(|s| hit.offset >= s.file_offset && hit.offset < s.file_offset + s.size)
+            .find(|s| hit.offset >= s.file_offset && hit.offset < s.file_offset.saturating_add(s.size))
         else {
             continue;
         };
-        let vaddr = sec.addr + (hit.offset - sec.file_offset);
+        let vaddr = sec.addr.saturating_add(hit.offset - sec.file_offset);
         let len = hit.value.len() as u64;
         let lo = vaddr.saturating_sub(16);
-        let hi = vaddr + len;
+        let hi = vaddr.saturating_add(len);
         let mut refs: Vec<u64> = Vec::new();
         let mut p = lo;
         while p <= hi {
@@ -750,6 +750,9 @@ pub fn strings_with_xrefs(target: &Target, min_len: usize) -> Vec<AnnotatedStrin
             }
             if let Some(locs) = pcrel.get(&p) {
                 refs.extend_from_slice(locs);
+            }
+            if p == hi {
+                break;
             }
             p += 1;
         }
@@ -777,6 +780,98 @@ pub struct AnnotatedString {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Format, Section, Symbol, SymbolKind, Target};
+
+    #[test]
+    fn a_symbol_in_a_high_section_does_not_panic_discovery() {
+        // Regression: symbol_seeds computed `sec.addr + sec.size`, which
+        // overflowed for a section near u64::MAX carrying a symbol.
+        let t = Target {
+            path: "fixture".into(),
+            format: Format::Elf,
+            arch: Arch::X86_64,
+            bits: 64,
+            little_endian: true,
+            entry: 0,
+            sections: vec![Section {
+                name: ".text".into(),
+                addr: 0xffff_ffff_ffff_fff0,
+                size: 0x20,
+                file_offset: 0,
+                perms: "r-x".into(),
+                sh_type: None,
+                sh_flags: None,
+            }],
+            symbols: vec![Symbol {
+                addr: 0xffff_ffff_ffff_fff0,
+                size: 0,
+                name: "f".into(),
+                demangled: None,
+                kind: SymbolKind::Export,
+            }],
+            page_map: None,
+            bytes: vec![0x90; 32],
+        };
+        let _ = discover_functions(&t); // must simply not panic
+    }
+
+    #[test]
+    fn strings_xrefs_survive_hostile_section_bounds() {
+        // Regression: strings_with_xrefs added file_offset + size at :732,
+        // which overflowed for size u64::MAX - 4. The string sits at file
+        // offset 8 so the section lookup actually evaluates the add.
+        let mut bytes = vec![0u8; 8];
+        bytes.extend_from_slice(b"hello world!!!!\0");
+        let t = Target {
+            path: "fixture".into(),
+            format: Format::Elf,
+            arch: Arch::X86_64,
+            bits: 64,
+            little_endian: true,
+            entry: 0,
+            sections: vec![Section {
+                name: ".text".into(),
+                addr: 0xffff_ffff_ffff_fff0,
+                size: u64::MAX - 4,
+                file_offset: 8,
+                perms: "r-x".into(),
+                sh_type: None,
+                sh_flags: None,
+            }],
+            symbols: Vec::new(),
+            page_map: None,
+            bytes,
+        };
+        let _ = strings_with_xrefs(&t, 8); // must simply not panic
+    }
+
+    #[test]
+    fn strings_xrefs_walk_stops_at_u64_max() {
+        // Regression: the xref walk did p += 1 after reaching hi == u64::MAX
+        // and overflowed at :754. A 15-byte run at vaddr u64::MAX - 15 puts
+        // hi exactly at u64::MAX without any add overflowing.
+        let t = Target {
+            path: "fixture".into(),
+            format: Format::Elf,
+            arch: Arch::X86_64,
+            bits: 64,
+            little_endian: true,
+            entry: 0,
+            sections: vec![Section {
+                name: ".text".into(),
+                addr: u64::MAX - 15,
+                size: 16,
+                file_offset: 0,
+                perms: "r-x".into(),
+                sh_type: None,
+                sh_flags: None,
+            }],
+            symbols: Vec::new(),
+            page_map: None,
+            bytes: b"hello world!!!!\0".to_vec(),
+        };
+        let _ = strings_with_xrefs(&t, 8); // must simply not panic
+    }
 
     #[test]
     fn finds_data_xref_pattern() {
