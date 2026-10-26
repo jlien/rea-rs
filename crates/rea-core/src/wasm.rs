@@ -274,7 +274,8 @@ pub fn inspect(bytes: &[u8]) -> Result<WasmModule> {
 
 /// Run one exported function. Only i32 locals and `i32.const`, `i32.add`,
 /// `i32.sub`, `i32.mul`, `local.get`, `local.set`, `drop`, `call`, and `end`
-/// are executed. The step cap is 4096. A host import or any other opcode is an error.
+/// are executed. The step cap is 4096. A host import is named (`module.name`)
+/// and not called; any other undecoded opcode is an error.
 pub fn execute(bytes: &[u8], name: &str, args: &[i32]) -> Result<Vec<i32>> {
     let module = inspect(bytes)?;
     let export = module
@@ -282,20 +283,23 @@ pub fn execute(bytes: &[u8], name: &str, args: &[i32]) -> Result<Vec<i32>> {
         .iter()
         .find(|item| item.name == name && item.kind == "func")
         .ok_or_else(|| Error::Parse(format!("wasm: export {name} is missing")))?;
-    let imports = module
+    let import_names: Vec<String> = module
         .imports
         .iter()
         .filter(|item| item.kind == "func")
-        .count() as u32;
-    if export.index < imports {
-        return Err(Error::Parse("wasm: imported function is not executed".into()));
+        .map(|item| format!("{}.{}", item.module, item.name))
+        .collect();
+    if let Some(import) = import_names.get(export.index as usize) {
+        return Err(Error::Parse(format!(
+            "wasm: host import {import} is not executed"
+        )));
     }
-    let index = (export.index - imports) as usize;
+    let index = (export.index - import_names.len() as u32) as usize;
     let ops = function_ops(bytes)?;
     let body = ops
         .get(index)
         .ok_or_else(|| Error::Parse("wasm: function body is missing".into()))?;
-    interpret(body, args, &ops)
+    interpret(body, args, &ops, &import_names)
 }
 
 /// A WAT-flavored readability listing of what `inspect` decoded. Sections are
@@ -917,11 +921,17 @@ fn read_i32_offset(r: &mut Reader<'_>) -> Result<i32> {
     Ok(value)
 }
 
-fn interpret(ops: &[Op], args: &[i32], all: &[Vec<Op>]) -> Result<Vec<i32>> {
-    interpret_depth(ops, args, all, 0)
+fn interpret(ops: &[Op], args: &[i32], all: &[Vec<Op>], imports: &[String]) -> Result<Vec<i32>> {
+    interpret_depth(ops, args, all, imports, 0)
 }
 
-fn interpret_depth(ops: &[Op], args: &[i32], all: &[Vec<Op>], depth: u32) -> Result<Vec<i32>> {
+fn interpret_depth(
+    ops: &[Op],
+    args: &[i32],
+    all: &[Vec<Op>],
+    imports: &[String],
+    depth: u32,
+) -> Result<Vec<i32>> {
     if depth > 8 {
         return Err(Error::Parse("wasm: call depth exceeded".into()));
     }
@@ -968,12 +978,19 @@ fn interpret_depth(ops: &[Op], args: &[i32], all: &[Vec<Op>], depth: u32) -> Res
                 pop(&mut stack)?;
             }
             Op::Call(n) => {
-                let callee = all.get(*n as usize).ok_or_else(|| {
+                let target = *n as usize;
+                if let Some(import) = imports.get(target) {
+                    return Err(Error::Parse(format!(
+                        "wasm: host import {import} is not executed"
+                    )));
+                }
+                let callee = all.get(target - imports.len()).ok_or_else(|| {
                     Error::Parse("wasm: call target is missing".into())
                 })?;
                 let arity = 0;
                 let _ = arity;
-                let returned = interpret_depth(callee, &[], all, depth + 1)?;
+                let returned =
+                    interpret_depth(callee, &[], all, imports, depth + 1)?;
                 stack.extend(returned);
             }
             Op::End => break,
@@ -1668,5 +1685,37 @@ mod tests {
         // version other than 1 is still accepted
         let m = inspect(&hex("0061736d02000000")).unwrap();
         assert_eq!(m.version, 2);
+    }
+
+    #[test]
+    fn execute_names_the_import_when_the_export_is_one() {
+        // Import env.m (func 0); export "f" is that import.
+        let bytes = hex(
+            "0061736d0100000001040160000002090103656e76016d00000302010\
+             0070501016600000a040102000b",
+        );
+        let err = execute(&bytes, "f", &[]).unwrap_err();
+        assert!(
+            matches!(&err, Error::Parse(msg)
+                if msg == "wasm: host import env.m is not executed")
+        );
+    }
+
+    #[test]
+    fn execute_names_the_import_when_a_call_reaches_one() {
+        // Import env.m (func 0). Defined "caller" (func 1) calls 0, the import;
+        // defined "other" (func 2) calls 3, "answer", a defined function.
+        let bytes = hex(
+            "0061736d0100000001040160000002090103656e76016d000003040300\
+             0000071b030663616c6c65720001056f74686572000206616e7377657200\
+             030a1003040010000b040010030b0400412a0b",
+        );
+        let err = execute(&bytes, "caller", &[]).unwrap_err();
+        assert!(
+            matches!(&err, Error::Parse(msg)
+                if msg == "wasm: host import env.m is not executed")
+        );
+        // A call past the import range still reaches the right defined body.
+        assert_eq!(execute(&bytes, "other", &[]).unwrap(), vec![42]);
     }
 }
