@@ -1532,9 +1532,12 @@ fn heap_blob(blobs: &[u8], index: u32) -> Option<&[u8]> {
         at += 1;
         (usize::from(first & 0x3f) << 8) | usize::from(second)
     } else {
-        let bytes: [u8; 4] = blobs.get(at..at + 4)?.try_into().ok()?;
-        at += 4;
-        u32::from_be_bytes(bytes) as usize
+        // Four bytes total from the first byte, masked to 29 bits
+        // (ECMA-335 II.24.2.4). The first byte counts as data, so nothing
+        // is skipped.
+        let raw: [u8; 4] = blobs.get(at - 1..at + 3)?.try_into().ok()?;
+        at += 3;
+        (u32::from_be_bytes(raw) & 0x1fff_ffff) as usize
     };
     let end = at.checked_add(len)?;
     if end > blobs.len() {
@@ -3103,6 +3106,65 @@ mod tests {
         assert_eq!(key.hex.len(), 64);
         assert!(key.hex.starts_with("0001020304"));
         assert!(key.hex.ends_with("1f"));
+    }
+
+    #[test]
+    fn clr_four_byte_blob_length_counts_the_first_byte() {
+        // ECMA-335 II.24.2.4: a first byte >= 0xC0 starts a four-byte
+        // little-endian... big-endian length covering the first byte, masked
+        // to 29 bits. [00, C0, 00, 00, 01, AA] at index 1 is a length of 1
+        // with payload AA; skipping the first byte would read 0x1AA and
+        // drop the blob.
+        let mut assembly = tilde_header(1u64 << 32, &[1]);
+        assembly.extend_from_slice(&0u32.to_le_bytes());
+        assembly.extend_from_slice(&1u16.to_le_bytes());
+        assembly.extend_from_slice(&2u16.to_le_bytes());
+        assembly.extend_from_slice(&3u16.to_le_bytes());
+        assembly.extend_from_slice(&4u16.to_le_bytes());
+        assembly.extend_from_slice(&0u32.to_le_bytes());
+        assembly.extend_from_slice(&1u16.to_le_bytes());
+        assembly.extend_from_slice(&1u16.to_le_bytes());
+        assembly.extend_from_slice(&0u16.to_le_bytes());
+        let mut names = vec![0u8];
+        names.extend_from_slice(b"Demo\0");
+        let mut blobs = vec![0u8];
+        blobs.extend_from_slice(&[0xC0, 0x00, 0x00, 0x01, 0xAA]);
+        let (file, streams) = with_blobs(&assembly, &names, &blobs);
+        let meta = read_metadata_names(&file, Some(0), &streams);
+        assert_eq!(
+            meta.assemblies[0].public_key,
+            Some(ClrBlob {
+                len: 1,
+                hex: "aa".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn clr_four_byte_blob_length_reads_a_16384_byte_blob() {
+        // The only legal encoding of a 16384-byte blob is C0 00 40 00 plus
+        // the payload; the old skip-first-byte decode inflated the length
+        // and returned None.
+        let mut assembly = tilde_header(1u64 << 32, &[1]);
+        assembly.extend_from_slice(&0u32.to_le_bytes());
+        assembly.extend_from_slice(&1u16.to_le_bytes());
+        assembly.extend_from_slice(&2u16.to_le_bytes());
+        assembly.extend_from_slice(&3u16.to_le_bytes());
+        assembly.extend_from_slice(&4u16.to_le_bytes());
+        assembly.extend_from_slice(&0u32.to_le_bytes());
+        assembly.extend_from_slice(&1u16.to_le_bytes());
+        assembly.extend_from_slice(&1u16.to_le_bytes());
+        assembly.extend_from_slice(&0u16.to_le_bytes());
+        let mut names = vec![0u8];
+        names.extend_from_slice(b"Demo\0");
+        let mut blobs = vec![0u8];
+        blobs.extend_from_slice(&[0xC0, 0x00, 0x40, 0x00]);
+        blobs.extend_from_slice(&vec![0x77u8; 16384]);
+        let (file, streams) = with_blobs(&assembly, &names, &blobs);
+        let meta = read_metadata_names(&file, Some(0), &streams);
+        let key = meta.assemblies[0].public_key.as_ref().unwrap();
+        assert_eq!(key.len, 16384);
+        assert_eq!(key.hex, "77".repeat(32));
     }
 
     #[test]
