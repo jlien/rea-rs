@@ -1,45 +1,241 @@
-//! Straight-line pseudo-C from Capstone for the architectures already disassembled.
+//! Pseudo-C from Capstone for the architectures already disassembled.
 //!
-//! This is a structured listing: assignments, calls, gotos, and returns. On x86_64
-//! and arm64, registers that receive a value of known width inside the window are
-//! rendered as synthetic typed locals (`int v1; void* v2;`): loads are typed by
-//! the signedness and width of the load mnemonic, and `lea` / `adrp`+`add`
-//! targets become `void*`. Where a typed value flows into a call argument or a
-//! return, the statement carries a cast. It is still not a type-recovering
-//! decompiler: inference stays inside the straight-line window, there is no
-//! dataflow across basic blocks, and memory objects keep no types. A short or
+//! This is a structured listing: assignments, calls, gotos, and returns, that
+//! follows unconditional `jmp` / `b` / `br` with a direct target inside the
+//! enclosing function — bounds come from rea-core's function discovery, or
+//! from the forward-jump walk from the address itself when no discovered
+//! function covers it. The listing keeps the 64-instruction cap and follows
+//! at most 8 hops; a repeated target, an out-of-function branch, an indirect
+//! jump, or a `ret` ends it. On x86_64 and arm64, registers that receive a
+//! value of known width are rendered as synthetic typed locals
+//! (`int v1; void* v2;`): loads are typed by the signedness and width of the
+//! load mnemonic, and `lea` / `adrp`+`add` targets become `void*`. A type
+//! flows through a followed join while the register state is trivially
+//! carried (same physical register, no writes in the skipped gap); an
+//! unsound join drops the type instead of guessing. It is still not a
+//! type-recovering decompiler: memory objects keep no types, and struct
+//! recovery and cross-function dataflow stay out of scope. A short or
 //! unmapped body returns an error from disassembly and does not invent
 //! instructions.
 
-use crate::{disasm, Arch, Error, Result, Target};
-use std::collections::HashMap;
+use crate::{analysis, disasm, Arch, Error, Result, Target};
+use std::collections::{HashMap, HashSet};
 
-/// Pseudo-C for at most `limit` instructions at `addr`. `limit` is capped at 64.
+/// Unconditional-jump hops the window follows within one function.
+const MAX_HOPS: u32 = 8;
+
+/// Gap instructions decoded per hop to check for register writes. A longer
+/// or undecodable gap is unknown, and carried types are dropped at the join.
+const MAX_GAP: usize = 16;
+
+/// A skipped gap behind a followed jump. `after` is the window index of the
+/// first instruction at the join; `insns` are the skipped instructions when
+/// they decoded fully, `None` otherwise.
+struct Gap {
+    after: usize,
+    insns: Option<Vec<disasm::Instruction>>,
+}
+
+/// Pseudo-C for at most `limit` instructions from `addr`, following
+/// unconditional jumps inside the enclosing function. `limit` is capped at 64.
 pub fn decompile(target: &Target, addr: u64, limit: usize) -> Result<String> {
     let limit = limit.clamp(1, 64);
-    let insns = disasm::disassemble(target, addr, limit).map_err(|e| Error::Parse(e.to_string()))?;
+    let (insns, skipped, gaps) = walk(target, addr, limit)?;
     if insns.is_empty() {
         return Err(Error::Parse("decompile: no instructions".into()));
     }
     let typed = plan_types(&insns, target.arch);
+    let (declared, kills) = carry_types(&typed, &gaps, target.arch);
     let mut names = Names::new(target.arch);
     let mut next = 0usize;
+    let mut dead = 0usize;
     let mut body = String::new();
     for (i, insn) in insns.iter().enumerate() {
-        // A register carries its type from the instruction that typed it on;
-        // earlier statements keep raw register names.
-        while next < typed.len() && typed[next].first <= i {
-            names.activate(&typed[next], next + 1);
+        // A register carries its type from the instruction that typed it on,
+        // until a join where its state is not trivially carried.
+        while next < declared.len() && declared[next].0.first <= i {
+            let (reg, n) = declared[next];
+            names.activate(reg, n);
             next += 1;
+        }
+        while dead < kills.len() && kills[dead].0 <= i {
+            names.deactivate(&kills[dead].1);
+            dead += 1;
+        }
+        // A followed jump renders nothing: the target block carries a label.
+        if skipped.contains(&i) {
+            continue;
         }
         body.push_str(&format!("loc_{:x}:\n  {};\n", insn.addr, statement(insn, &names)));
     }
-    let header: String = typed
+    let header: String = declared
         .iter()
-        .enumerate()
-        .map(|(i, r)| format!("  {} v{};\n", r.ty, i + 1))
+        .map(|(r, n)| format!("  {} v{};\n", r.ty, n))
         .collect();
     Ok(format!("void sub_{addr:x}() {{\n{header}{body}}}\n"))
+}
+
+/// Walk the window from `addr`, following unconditional jumps whose direct
+/// target stays inside `[fstart, fend)`. Returns the flow-ordered
+/// instructions, the indices of followed jumps (not rendered), and the gaps
+/// behind them. Stops at `ret`, an indirect or out-of-bounds branch (rendered
+/// as `goto`), a repeated target, the instruction cap, or undecodable bytes.
+fn walk(
+    target: &Target,
+    addr: u64,
+    limit: usize,
+) -> Result<(Vec<disasm::Instruction>, HashSet<usize>, Vec<Gap>)> {
+    let (fstart, fend) = function_bounds(target, addr);
+    let mut out: Vec<disasm::Instruction> = Vec::new();
+    let mut gaps: Vec<Gap> = Vec::new();
+    let mut skipped: HashSet<usize> = HashSet::new();
+    let mut visited: HashSet<u64> = HashSet::new();
+    let mut cur = addr;
+    let mut remaining = limit;
+    let mut hops = 0u32;
+    loop {
+        let chunk = match disasm::disassemble(target, cur, remaining) {
+            Ok(c) => c,
+            Err(e) => {
+                if out.is_empty() {
+                    return Err(Error::Parse(e.to_string()));
+                }
+                break;
+            }
+        };
+        if chunk.is_empty() {
+            break;
+        }
+        // Capstone stops at invalid bytes: a short chunk has no continuation.
+        let complete = chunk.len() == remaining;
+        let mut stop = false;
+        let mut jumped = false;
+        for insn in &chunk {
+            visited.insert(insn.addr);
+            out.push(insn.clone());
+            remaining -= 1;
+            let m = insn.mnemonic.as_str();
+            if m == "jmp" || m == "b" || m == "br" {
+                let t = analysis::direct_target(&insn.operands);
+                let followable = matches!(t, Some(t) if t > insn.addr
+                    && t >= fstart
+                    && t < fend
+                    && !visited.contains(&t)
+                    && hops < MAX_HOPS
+                    && remaining > 0);
+                match t {
+                    Some(t) if followable => {
+                        let gap_end = insn.addr + insn.size as u64;
+                        let gap = if t > gap_end {
+                            scan_gap(target, gap_end, t)
+                        } else {
+                            Some(Vec::new())
+                        };
+                        gaps.push(Gap { after: out.len(), insns: gap });
+                        skipped.insert(out.len() - 1);
+                        hops += 1;
+                        cur = t;
+                        jumped = true;
+                    }
+                    _ => stop = true,
+                }
+                break;
+            }
+            if m == "ret" || m == "retf" {
+                stop = true;
+                break;
+            }
+            if remaining == 0 {
+                stop = true;
+                break;
+            }
+        }
+        if stop {
+            break;
+        }
+        if jumped {
+            continue;
+        }
+        if !complete {
+            break;
+        }
+        let last = chunk.last().unwrap();
+        cur = last.addr + last.size as u64;
+    }
+    Ok((out, skipped, gaps))
+}
+
+/// Instructions in the skipped gap `(from, to)`, decoded to check for
+/// register writes. `None` when the gap does not decode fully: the carried
+/// state is then unknown and dropped at the join.
+fn scan_gap(target: &Target, from: u64, to: u64) -> Option<Vec<disasm::Instruction>> {
+    let insns = disasm::disassemble(target, from, MAX_GAP).ok()?;
+    let last = insns.last()?;
+    if last.addr + (last.size as u64) < to {
+        return None;
+    }
+    Some(insns.into_iter().take_while(|i| i.addr < to).collect())
+}
+
+/// Bounds of the function containing `addr`, from rea-core's function
+/// discovery. When no discovered function covers `addr`, the forward-jump
+/// walk from `addr` itself gives conservative bounds.
+fn function_bounds(target: &Target, addr: u64) -> (u64, u64) {
+    let covered = analysis::discover_functions(target)
+        .iter()
+        .find(|f| f.addr <= addr && addr < f.addr + f.size)
+        .map(|f| (f.addr, f.addr + f.size));
+    covered.unwrap_or_else(|| {
+        let (size, _) = analysis::function_body(target, addr, 0x20000);
+        (addr, addr + size)
+    })
+}
+
+/// The canonical register an instruction writes through its first operand,
+/// if it names one.
+fn written_reg(insn: &disasm::Instruction, arch: Arch) -> Option<String> {
+    let (dst, _) = split_first(&insn.operands)?;
+    canonical_of(arch, dst)
+}
+
+/// Resolve which typed registers survive the followed joins. A register keeps
+/// its type across a hop when the skipped gap holds no write to it (same
+/// physical register, no intervening writes); an undecodable gap drops every
+/// type carried into the join. Returns the declared registers with their
+/// synthetic-local numbers, and the window index after which each type dies.
+fn carry_types<'a>(
+    typed: &'a [TypedReg],
+    gaps: &[Gap],
+    arch: Arch,
+) -> (Vec<(&'a TypedReg, usize)>, Vec<(usize, String)>) {
+    let mut kill: HashMap<String, usize> = HashMap::new();
+    for gap in gaps {
+        let dead: Vec<String> = match &gap.insns {
+            Some(insns) => insns.iter().filter_map(|i| written_reg(i, arch)).collect(),
+            None => typed.iter().map(|r| r.aliases[0].clone()).collect(),
+        };
+        for reg in dead {
+            let first = typed.iter().find(|r| r.aliases[0] == reg).map(|r| r.first);
+            if first.map_or(false, |f| f < gap.after) {
+                kill.entry(reg)
+                    .and_modify(|k| *k = (*k).min(gap.after))
+                    .or_insert(gap.after);
+            }
+        }
+    }
+    let declared: Vec<(&TypedReg, usize)> =
+        typed.iter().enumerate().map(|(n, r)| (r, n + 1)).collect();
+    let mut kills: Vec<(usize, String)> = typed
+        .iter()
+        .filter_map(|r| {
+            kill.get(&r.aliases[0])
+                .copied()
+                .filter(|k| *k > r.first)
+                .map(|k| (k, r.aliases[0].clone()))
+        })
+        .collect();
+    kills.sort_by_key(|k| k.0);
+    (declared, kills)
 }
 
 fn statement(insn: &disasm::Instruction, names: &Names) -> String {
@@ -181,6 +377,15 @@ impl Names {
             self.alias.insert(a.clone(), v.clone());
         }
         self.types.insert(reg.aliases[0].clone(), reg.ty);
+    }
+
+    /// Drop a register's type at a join where its state is not trivially
+    /// carried: statements from there on use the raw register name again.
+    fn deactivate(&mut self, canon: &str) {
+        for a in aliases_of(canon) {
+            self.alias.remove(&a);
+        }
+        self.types.remove(canon);
     }
 
     fn name<'a>(&'a self, canon: &'a str) -> &'a str {
@@ -551,5 +756,91 @@ mod tests {
         assert!(text.contains("v1 = [x9]"), "{text}");
         assert!(text.contains("uint8_t v2;"), "{text}");
         assert!(text.contains("v2 = [x10]"), "{text}");
+    }
+
+    #[test]
+    fn x86_64_jmp_chain_continues_at_the_target() {
+        // mov eax, 1; jmp 0x1007; mov ebx, 2; ret
+        let code = [
+            0xb8, 0x01, 0x00, 0x00, 0x00, 0xeb, 0x00, 0xbb, 0x02, 0x00, 0x00, 0x00, 0xc3,
+        ];
+        let text = decompile(&target(Arch::X86_64, 64, &code), 0x1000, 16).unwrap();
+        assert!(text.contains("loc_1007:"), "{text}");
+        assert!(text.contains("ebx = 2"), "{text}");
+        assert!(text.contains("return"), "{text}");
+        assert!(!text.contains("goto"), "{text}");
+    }
+
+    #[test]
+    fn arm64_b_chain_continues_at_the_target() {
+        // movz x8, #1; b 0x1008; movz x9, #2; ret
+        let code = [
+            0x28, 0x00, 0x80, 0xd2, 0x01, 0x00, 0x00, 0x14, 0x49, 0x00, 0x80, 0xd2, 0xc0, 0x03,
+            0x5f, 0xd6,
+        ];
+        let text = decompile(&target(Arch::Arm64, 64, &code), 0x1000, 16).unwrap();
+        assert!(text.contains("loc_1008:"), "{text}");
+        assert!(text.contains("x9 = #2"), "{text}");
+        assert!(text.contains("return"), "{text}");
+        assert!(!text.contains("goto"), "{text}");
+    }
+
+    #[test]
+    fn x86_64_loop_back_to_a_visited_target_ends_with_a_goto() {
+        // 0x1000: jmp 0x1004; nop; 0x1004: jmp 0x1000
+        let code = [0xeb, 0x02, 0x90, 0x90, 0xeb, 0xfa];
+        let text = decompile(&target(Arch::X86_64, 64, &code), 0x1000, 16).unwrap();
+        assert!(text.contains("goto 0x1000;\n}"), "{text}");
+    }
+
+    #[test]
+    fn arm64_loop_back_to_a_visited_target_ends_with_a_goto() {
+        // 0x1000: b 0x1008; nop; 0x1008: b 0x1000
+        let code = [
+            0x02, 0x00, 0x00, 0x14, 0x1f, 0x20, 0x03, 0xd5, 0xfe, 0xff, 0xff, 0x17,
+        ];
+        let text = decompile(&target(Arch::Arm64, 64, &code), 0x1000, 16).unwrap();
+        assert!(text.contains("goto #0x1000;\n}"), "{text}");
+    }
+
+    #[test]
+    fn x86_64_jmp_out_of_the_function_ends_with_a_goto() {
+        // mov eax, 1; jmp 0x9000
+        let code = [0xb8, 0x01, 0x00, 0x00, 0x00, 0xe9, 0xf6, 0x7f, 0x00, 0x00];
+        let text = decompile(&target(Arch::X86_64, 64, &code), 0x1000, 16).unwrap();
+        assert!(text.contains("goto 0x9000;\n}"), "{text}");
+    }
+
+    #[test]
+    fn arm64_b_out_of_the_function_ends_with_a_goto() {
+        // b 0x9000
+        let code = [0x00, 0x20, 0x00, 0x14];
+        let text = decompile(&target(Arch::Arm64, 64, &code), 0x1000, 16).unwrap();
+        assert!(text.contains("goto #0x9000;\n}"), "{text}");
+    }
+
+    #[test]
+    fn x86_64_typed_register_flows_through_a_followed_join() {
+        // movsxd rax, dword ptr [rip + 0]; jmp 0x1009; ret
+        let code = [
+            0x48, 0x63, 0x05, 0x00, 0x00, 0x00, 0x00, 0xeb, 0x00, 0xc3,
+        ];
+        let text = decompile(&target(Arch::X86_64, 64, &code), 0x1000, 16).unwrap();
+        assert!(text.contains("int v1;"), "{text}");
+        assert!(text.contains("return (int)v1"), "{text}");
+    }
+
+    #[test]
+    fn x86_64_type_writes_in_the_skipped_gap_drop_the_type_at_the_join() {
+        // movsxd rax, dword ptr [rip + 0]; jmp 0x100e; mov rax, rbx; nop; nop; ret
+        let code = [
+            0x48, 0x63, 0x05, 0x00, 0x00, 0x00, 0x00, 0xeb, 0x05, 0x48, 0x89, 0xd8, 0x90, 0x90,
+            0xc3,
+        ];
+        let text = decompile(&target(Arch::X86_64, 64, &code), 0x1000, 16).unwrap();
+        assert!(text.contains("int v1;"), "{text}");
+        assert!(text.contains("v1 = dword ptr [rip"), "{text}");
+        assert!(text.contains("  return;\n"), "{text}");
+        assert!(!text.contains("return (int)"), "{text}");
     }
 }

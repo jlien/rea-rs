@@ -183,10 +183,12 @@ impl Target {
         })
     }
 
-    /// Read `len` bytes at a virtual address.
+    /// Read `len` bytes at a virtual address, clamped to the end of the
+    /// mapped bytes so a window that overruns the file still reads.
     pub fn read_at_vaddr(&self, vaddr: u64, len: u64) -> Option<&[u8]> {
         let off = self.vaddr_to_offset(vaddr)? as usize;
-        self.bytes.get(off..off + len as usize)
+        let end = off.checked_add(len as usize)?.min(self.bytes.len());
+        self.bytes.get(off..end)
     }
 }
 

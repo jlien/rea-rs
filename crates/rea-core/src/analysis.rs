@@ -178,7 +178,7 @@ fn scan_thumb_push_prologues(
 /// (`jmp`, `b`), stops at `ret`, indirect jumps (`br` / register `jmp`),
 /// and invalid bytes — so functions no longer bleed into padding or the
 /// next function. Conditional branches fall through.
-fn function_body(target: &Target, start: u64, max: u64) -> (u64, Vec<u64>) {
+pub(crate) fn function_body(target: &Target, start: u64, max: u64) -> (u64, Vec<u64>) {
     let mut visited: BTreeSet<u64> = BTreeSet::new();
     let mut calls: Vec<u64> = Vec::new();
     let mut work = vec![start];
@@ -250,7 +250,7 @@ fn function_body(target: &Target, start: u64, max: u64) -> (u64, Vec<u64>) {
 
 /// First operand when it is a bare hex immediate (`0x…` or Capstone's `#0x…`).
 /// Memory operands (`qword ptr [rip + 0x10]`) and anything non-hex are rejected.
-fn direct_target(operands: &str) -> Option<u64> {
+pub(crate) fn direct_target(operands: &str) -> Option<u64> {
     let token = operands
         .split(|c: char| c == ',' || c == ' ' || c == '\t')
         .next()
