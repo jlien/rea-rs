@@ -435,6 +435,9 @@ pub fn wat_full(module: &WasmModule) -> String {
     let mut mem_i = 0usize;
     let mut table_i = 0usize;
     let mut global_i = 0usize;
+    // Function index space starts with the imported functions, in import
+    // order. `imp.index` is the type index, not the function index.
+    let mut ifunc_i = 0u32;
     for &id in &module.sections {
         match id {
             0 => {
@@ -458,7 +461,12 @@ pub fn wat_full(module: &WasmModule) -> String {
             2 => {
                 for imp in &module.imports {
                     let desc = match imp.kind.as_str() {
-                        "func" => format!("(func ${} (type {}))", imp.index, imp.index),
+                        "func" => {
+                            let s =
+                                format!("(func ${ifunc_i} (type {}))", imp.index);
+                            ifunc_i += 1;
+                            s
+                        }
                         "mem" => {
                             let limits = module.imported_memories.get(mem_i);
                             mem_i += 1;
@@ -1430,7 +1438,7 @@ mod tests {
         assert!(text.contains("  (import \"e\" \"m\" (memory 2 4 shared))\n"));
         assert!(text.contains("  (import \"e\" \"t\" (table 2 4 funcref))\n"));
         assert!(text.contains("  (import \"e\" \"g\" (global (mut i32)))\n"));
-        assert!(text.contains("  (import \"e\" \"f\" (func $5 (type 5)))\n"));
+        assert!(text.contains("  (import \"e\" \"f\" (func $0 (type 5)))\n"));
     }
 
     #[test]
