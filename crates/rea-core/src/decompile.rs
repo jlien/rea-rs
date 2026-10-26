@@ -860,4 +860,13 @@ mod tests {
         assert!(text.contains("  return;\n"), "{text}");
         assert!(!text.contains("return (int)"), "{text}");
     }
+
+    #[test]
+    fn decompiling_an_address_beyond_every_section_is_an_error_not_a_panic() {
+        // Regression: function_body used `start + max`, which overflowed for
+        // addresses near u64::MAX.
+        let t = target(Arch::X86_64, 64, &[0xc3]);
+        let out = decompile(&t, 0xffff_ffff_fffe_0000, 4);
+        assert!(out.is_err(), "expected Err, got {out:?}");
+    }
 }

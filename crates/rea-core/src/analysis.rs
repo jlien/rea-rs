@@ -184,7 +184,7 @@ pub(crate) fn function_body(target: &Target, start: u64, max: u64) -> (u64, Vec<
     let mut work = vec![start];
     let mut end = start;
     while let Some(addr) = work.pop() {
-        if addr < start || addr >= start + max || !visited.insert(addr) {
+        if addr < start || addr >= start.saturating_add(max) || !visited.insert(addr) {
             continue;
         }
         let Ok(insns) = disasm::disassemble(target, addr, 64) else {

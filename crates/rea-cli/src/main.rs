@@ -110,7 +110,7 @@ enum Command {
     Macho { path: String },
     /// PE subsystem, image base, raw COFF timestamp and its UTC date, data directories, CLR header, metadata streams, table row counts, type names, field names, method names, signatures, IL, parameter names, member-ref names, assembly names, property and event names, CodeView PDB path, resource names, payloads, and an overlay.
     Pe { path: String },
-    /// ELF file type, machine, interpreter, needed libraries, soname, rpath, runpath, GNU build-id, notes (owner, type name, descriptor), GNU property bits, section `sh_type` names and `SHF_` flags, and rpath or runpath file hits.
+    /// ELF file type, machine, interpreter, needed libraries, soname, rpath, runpath, GNU build-id, notes (owner, type name, descriptor), GNU property bits, and rpath or runpath file hits.
     Elf { path: String },
     /// SQLite header, schema, and optional rows of one table. `--wal` replays committed frames before the read.
     Sqlite {

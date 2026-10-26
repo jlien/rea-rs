@@ -50,7 +50,9 @@ pub fn method_sig(heap: &[u8], index: u32) -> Option<String> {
 pub fn property_sig(heap: &[u8], index: u32) -> Option<String> {
     let bytes = blob_bytes(heap, index)?;
     let conv = *bytes.first()?;
-    if conv & 0x0f != 0x08 {
+    // PROPERTY (0x08) or PROPERTY|HASTHIS (0x28) only; 0x18 (PROPERTY|GENERIC)
+    // is not a property convention (GENERIC is 0x10).
+    if conv & 0x0f != 0x08 || conv & 0x10 != 0 {
         return None;
     }
     let (count, n) = compressed(bytes, 1)?;

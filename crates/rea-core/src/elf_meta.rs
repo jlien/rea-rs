@@ -24,8 +24,8 @@ pub struct NoteFact {
 /// One GNU property (type, datasz, data) from a `NT_GNU_PROPERTY_TYPE_0` note.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct GnuProperty {
-    /// `x86 ISA`, `x86 feature 1 (IBT and SHSTK)`, `x86 feature 2 (APX)`,
-    /// `needed`, or `0x…` for unknown property types.
+    /// `x86 feature 1` (IBT and SHSTK), `x86 ISA needed` (baseline, v2, v3,
+    /// v4), or `0x…` for unknown property types.
     pub type_: String,
     /// Named bit list for the x86 property types; decimal `data` for others.
     pub data: String,
@@ -57,8 +57,14 @@ pub fn facts(bytes: &[u8]) -> crate::Result<ElfFacts> {
     let notes = collect_notes(&elf, bytes);
     let gnu_properties = notes
         .iter()
-        .filter(|n| n.type_ == "NT_GNU_PROPERTY_TYPE_0" && n.name == "GNU" && !n.truncated)
-        .filter_map(|n| hex_desc(&n.desc).map(|d| (d, n)))
+        .filter(|n| n.type_ == "NT_GNU_PROPERTY_TYPE_0" && n.name == "GNU")
+        .filter_map(|n| {
+            // A descriptor over the 128-byte cap renders as the first 128
+            // bytes in hex plus a ", …" marker; parse what is there instead
+            // of dropping the note.
+            let hex = n.desc.strip_suffix(", …").unwrap_or(&n.desc);
+            hex_desc(hex).map(|d| (d, n))
+        })
         .flat_map(|(d, _)| parse_gnu_properties(&d, elf.is_64))
         .collect();
     Ok(ElfFacts {
@@ -291,7 +297,11 @@ mod tests {
         assert!(!got.notes[0].truncated);
         assert_eq!(got.notes[1].name, "GNU");
         assert_eq!(got.notes[1].type_, "NT_GNU_PROPERTY_TYPE_0");
-        assert_eq!(got.notes[1].desc.len(), 96); // 48 descriptor bytes as hex
+        // 9 records × 16 bytes = 144 descriptor bytes: capped, marker kept,
+        // and the leading records still decode.
+        assert_eq!(got.notes[1].desc.chars().count(), 256 + 3);
+        assert!(got.notes[1].desc.ends_with(", …"));
+        assert!(got.notes[1].truncated);
         // Unknown types stay numeric, whatever the owner.
         assert_eq!(got.notes[2].name, "core");
         assert_eq!(got.notes[2].type_, "0x1234");
@@ -366,7 +376,7 @@ mod tests {
         // Records pad to 8 bytes on ELF64.
         let mut prop = Vec::new();
         prop.extend_from_slice(&4u32.to_le_bytes()); // namesz
-        prop.extend_from_slice(&48u32.to_le_bytes()); // descsz
+        prop.extend_from_slice(&144u32.to_le_bytes()); // descsz: 9 records × 16
         prop.extend_from_slice(&5u32.to_le_bytes()); // NT_GNU_PROPERTY_TYPE_0
         prop.extend_from_slice(b"GNU\0");
         prop.extend_from_slice(&0xc000_0002u32.to_le_bytes()); // x86 feature 1
@@ -381,6 +391,15 @@ mod tests {
         prop.extend_from_slice(&4u32.to_le_bytes());
         prop.extend_from_slice(&0xdead_beefu32.to_le_bytes());
         prop.extend_from_slice(&[0; 4]); // record pads to 8
+        // Filler records push the descriptor past the 128-byte render cap.
+        // Their feature-1 value is 0, so they decode to nothing — but the
+        // note must still parse its leading records.
+        for _ in 0..6 {
+            prop.extend_from_slice(&0xc000_0002u32.to_le_bytes());
+            prop.extend_from_slice(&4u32.to_le_bytes());
+            prop.extend_from_slice(&0u32.to_le_bytes());
+            prop.extend_from_slice(&[0; 4]);
+        }
         file.extend_from_slice(&prop);
         let note_sz = (file.len() - note_off) as u64;
 
