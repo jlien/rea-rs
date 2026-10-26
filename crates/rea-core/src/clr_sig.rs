@@ -44,6 +44,26 @@ pub fn method_sig(heap: &[u8], index: u32) -> Option<String> {
     Some(format!("{ret}({})", params.join(", ")))
 }
 
+/// `type(index-params)` for a Property signature (`0x08`). `ParamCount` includes the property type.
+pub fn property_sig(heap: &[u8], index: u32) -> Option<String> {
+    let bytes = blob_bytes(heap, index)?;
+    let conv = *bytes.first()?;
+    if conv != 0x08 {
+        return None;
+    }
+    let (count, n) = compressed(bytes, 1)?;
+    let mut at = 1 + n;
+    let (ty, n) = sig_type(bytes, at)?;
+    at += n;
+    let mut indexes = Vec::new();
+    for _ in 0..count.saturating_sub(1) {
+        let (param, n) = sig_type(bytes, at)?;
+        at += n;
+        indexes.push(param);
+    }
+    Some(format!("{ty}({})", indexes.join(", ")))
+}
+
 /// Opcode names from a tiny or fat method body. At most 48 instructions.
 /// An unmapped or truncated body is empty.
 pub fn il_ops(bytes: &[u8]) -> Vec<String> {
@@ -206,7 +226,7 @@ fn sig_type(bytes: &[u8], at: usize) -> Option<(String, usize)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{il_ops, method_sig};
+    use super::{il_ops, method_sig, property_sig};
 
     #[test]
     fn method_signature_is_return_and_params() {
@@ -221,5 +241,19 @@ mod tests {
         // codesize 2, ldarg.0, ret
         assert_eq!(il_ops(&[0x0a, 0x02, 0x2a]), vec!["ldarg.0".to_string(), "ret".to_string()]);
         assert!(il_ops(&[0x00]).is_empty());
+    }
+
+    #[test]
+    fn property_signature_is_type_and_index_params() {
+        // length 3, property calling convention, count 1 (the type), int32, no index params.
+        let heap = [0x00, 0x03, 0x08, 0x01, 0x08];
+        assert_eq!(property_sig(&heap, 1).as_deref(), Some("int32()"));
+        // count 2: int32 this[int16].
+        let heap = [0x00, 0x04, 0x08, 0x02, 0x08, 0x06];
+        assert_eq!(property_sig(&heap, 1).as_deref(), Some("int32(int16)"));
+        // A method convention or blob index 0 is not a property signature.
+        let method = [0x00, 0x04, 0x00, 0x01, 0x01, 0x08];
+        assert_eq!(property_sig(&method, 1), None);
+        assert_eq!(property_sig(&heap, 0), None);
     }
 }
