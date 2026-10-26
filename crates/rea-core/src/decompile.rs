@@ -117,8 +117,10 @@ fn walk(
             let m = insn.mnemonic.as_str();
             if m == "jmp" || m == "b" || m == "br" {
                 let t = analysis::direct_target(&insn.operands);
-                let followable = matches!(t, Some(t) if t > insn.addr
-                    && t >= fstart
+                // Any direct target inside the function follows, forward or
+                // backward; the visited set ends a path that re-enters code
+                // already listed, which is what bounds a loop.
+                let followable = matches!(t, Some(t) if t >= fstart
                     && t < fend
                     && !visited.contains(&t)
                     && hops < MAX_HOPS
@@ -803,6 +805,19 @@ mod tests {
         ];
         let text = decompile(&target(Arch::Arm64, 64, &code), 0x1000, 16).unwrap();
         assert!(text.contains("goto #0x1000;\n}"), "{text}");
+    }
+
+    #[test]
+    fn x86_64_backward_jump_to_unvisited_code_walks_it_then_ends_at_the_visited_loop_head() {
+        // 0x1000: jmp 0x1005; nop; nop; nop; 0x1005: jmp 0x1002.
+        // The backward jump at 0x1005 reaches unvisited 0x1002, which is
+        // walked; re-reaching the visited jmp at 0x1005 then ends the
+        // listing — the visited guard, not a forward-only rule, stops it.
+        let code = [0xeb, 0x03, 0x90, 0x90, 0x90, 0xeb, 0xfb];
+        let text = decompile(&target(Arch::X86_64, 64, &code), 0x1000, 16).unwrap();
+        assert!(text.contains("loc_1002:"), "{text}");
+        assert!(text.contains("nop"), "{text}");
+        assert!(text.contains("goto 0x1002;\n}"), "{text}");
     }
 
     #[test]

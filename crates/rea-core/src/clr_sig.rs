@@ -44,11 +44,13 @@ pub fn method_sig(heap: &[u8], index: u32) -> Option<String> {
     Some(format!("{ret}({})", params.join(", ")))
 }
 
-/// `type(index-params)` for a Property signature (`0x08`). `ParamCount` includes the property type.
+/// `type(index-params)` for a Property signature per ECMA-335 II.23.2.5:
+/// `PROPERTY HASTHIS? ParamCount Type Param*` — `ParamCount` is the number of
+/// index parameters. Both `0x08` (static) and `0x28` (instance) decode.
 pub fn property_sig(heap: &[u8], index: u32) -> Option<String> {
     let bytes = blob_bytes(heap, index)?;
     let conv = *bytes.first()?;
-    if conv != 0x08 {
+    if conv & 0x0f != 0x08 {
         return None;
     }
     let (count, n) = compressed(bytes, 1)?;
@@ -56,7 +58,7 @@ pub fn property_sig(heap: &[u8], index: u32) -> Option<String> {
     let (ty, n) = sig_type(bytes, at)?;
     at += n;
     let mut indexes = Vec::new();
-    for _ in 0..count.saturating_sub(1) {
+    for _ in 0..count {
         let (param, n) = sig_type(bytes, at)?;
         at += n;
         indexes.push(param);
@@ -245,11 +247,18 @@ mod tests {
 
     #[test]
     fn property_signature_is_type_and_index_params() {
-        // length 3, property calling convention, count 1 (the type), int32, no index params.
-        let heap = [0x00, 0x03, 0x08, 0x01, 0x08];
+        // ECMA-335 II.23.2.5: PROPERTY HASTHIS? ParamCount Type Param*.
+        // length 3, static property, count 0 index params, int32.
+        let heap = [0x00, 0x03, 0x08, 0x00, 0x08];
         assert_eq!(property_sig(&heap, 1).as_deref(), Some("int32()"));
-        // count 2: int32 this[int16].
-        let heap = [0x00, 0x04, 0x08, 0x02, 0x08, 0x06];
+        // The same blob with HASTHIS (instance property) decodes identically.
+        let heap = [0x00, 0x03, 0x28, 0x00, 0x08];
+        assert_eq!(property_sig(&heap, 1).as_deref(), Some("int32()"));
+        // count 1: static int32 this[int16].
+        let heap = [0x00, 0x04, 0x08, 0x01, 0x08, 0x06];
+        assert_eq!(property_sig(&heap, 1).as_deref(), Some("int32(int16)"));
+        // Instance indexer decodes the same way.
+        let heap = [0x00, 0x04, 0x28, 0x01, 0x08, 0x06];
         assert_eq!(property_sig(&heap, 1).as_deref(), Some("int32(int16)"));
         // A method convention or blob index 0 is not a property signature.
         let method = [0x00, 0x04, 0x00, 0x01, 0x01, 0x08];

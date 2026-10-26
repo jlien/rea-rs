@@ -293,11 +293,14 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn scratch() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::SeqCst);
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("rea-session-{stamp}"))
+        std::env::temp_dir().join(format!("rea-session-{stamp}-{n}"))
     }
 
     fn fixture_target() -> Target {

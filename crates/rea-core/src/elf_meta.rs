@@ -59,7 +59,7 @@ pub fn facts(bytes: &[u8]) -> crate::Result<ElfFacts> {
         .iter()
         .filter(|n| n.type_ == "NT_GNU_PROPERTY_TYPE_0" && n.name == "GNU" && !n.truncated)
         .filter_map(|n| hex_desc(&n.desc).map(|d| (d, n)))
-        .flat_map(|(d, _)| parse_gnu_properties(&d))
+        .flat_map(|(d, _)| parse_gnu_properties(&d, elf.is_64))
         .collect();
     Ok(ElfFacts {
         kind: elf_kind(elf.header.e_type),
@@ -171,10 +171,13 @@ fn collect_notes(elf: &goblin::elf::Elf<'_>, bytes: &[u8]) -> Vec<NoteFact> {
 }
 
 /// Parse a GNU property note descriptor (type u32, datasz u32, data) into
-/// readable rows. Unknown property types keep their hex id and raw data words.
-fn parse_gnu_properties(desc: &[u8]) -> Vec<GnuProperty> {
+/// readable rows. `is_64` selects the property-record alignment: 8 bytes on
+/// ELF64, 4 on ELF32. Unknown property types keep their hex id and raw data
+/// words.
+fn parse_gnu_properties(desc: &[u8], is_64: bool) -> Vec<GnuProperty> {
     let mut out = Vec::new();
     let mut at = 0usize;
+    let align = if is_64 { 8 } else { 4 };
     while desc.len() >= at + 8 {
         let ty = u32::from_le_bytes(desc[at..at + 4].try_into().unwrap());
         let datasz = u32::from_le_bytes(desc[at + 4..at + 8].try_into().unwrap()) as usize;
@@ -183,9 +186,9 @@ fn parse_gnu_properties(desc: &[u8]) -> Vec<GnuProperty> {
             break;
         };
         at += 8 + datasz;
-        at += (4 - at % 4) % 4; // properties pad to 4 bytes
+        at += (align - at % align) % align;
         match ty {
-            0xc000_8002 => {
+            0xc000_0002 => {
                 // GNU_PROPERTY_X86_FEATURE_1_AND: IBT (1), SHSTK (2).
                 let bits = data.first().copied().unwrap_or(0) as u32
                     | u32::from(data.get(1).copied().unwrap_or(0)) << 8
@@ -205,19 +208,10 @@ fn parse_gnu_properties(desc: &[u8]) -> Vec<GnuProperty> {
                     });
                 }
             }
-            0xc000_8003 => {
-                // GNU_PROPERTY_X86_ISA_1_NEEDED: bit0 baseline, bit1 SSE, bit2 SSE2...
-                const ISA: [&str; 9] = [
-                    "baseline",
-                    "SSE",
-                    "SSE2",
-                    "SSE3",
-                    "SSSE3",
-                    "SSE4_1",
-                    "SSE4_2",
-                    "AVX",
-                    "AVX2",
-                ];
+            0xc000_8002 => {
+                // GNU_PROPERTY_X86_ISA_1_NEEDED: baseline (1<<0), v2 (1<<1),
+                // v3 (1<<2), v4 (1<<3).
+                const ISA: [&str; 4] = ["baseline", "v2", "v3", "v4"];
                 let bits = data.first().copied().unwrap_or(0) as u32
                     | u32::from(data.get(1).copied().unwrap_or(0)) << 8
                     | u32::from(data.get(2).copied().unwrap_or(0)) << 16
@@ -297,7 +291,7 @@ mod tests {
         assert!(!got.notes[0].truncated);
         assert_eq!(got.notes[1].name, "GNU");
         assert_eq!(got.notes[1].type_, "NT_GNU_PROPERTY_TYPE_0");
-        assert_eq!(got.notes[1].desc.len(), 48); // 24 descriptor bytes as hex
+        assert_eq!(got.notes[1].desc.len(), 96); // 48 descriptor bytes as hex
         // Unknown types stay numeric, whatever the owner.
         assert_eq!(got.notes[2].name, "core");
         assert_eq!(got.notes[2].type_, "0x1234");
@@ -314,7 +308,11 @@ mod tests {
                     data: "IBT and SHSTK".into()
                 },
                 GnuProperty {
-                    type_: "0xc0000002".into(),
+                    type_: "x86 ISA needed".into(),
+                    data: "baseline".into()
+                },
+                GnuProperty {
+                    type_: "0xc0000004".into(),
                     data: "0xdeadbeef".into()
                 },
             ]
@@ -363,19 +361,26 @@ mod tests {
         file.extend_from_slice(&3u32.to_le_bytes());
         file.extend_from_slice(b"GNU\0");
         file.extend_from_slice(&[0x01, 0x02, 0x03, 0x04]);
-        // GNU property note: an x86 feature-1 entry (IBT|SHSTK) followed by an
-        // unknown property type that must render as hex.
+        // GNU property note: an x86 feature-1 entry (IBT|SHSTK), an ISA-needed
+        // entry (baseline), and an unknown property type that renders as hex.
+        // Records pad to 8 bytes on ELF64.
         let mut prop = Vec::new();
         prop.extend_from_slice(&4u32.to_le_bytes()); // namesz
-        prop.extend_from_slice(&24u32.to_le_bytes()); // descsz
+        prop.extend_from_slice(&48u32.to_le_bytes()); // descsz
         prop.extend_from_slice(&5u32.to_le_bytes()); // NT_GNU_PROPERTY_TYPE_0
         prop.extend_from_slice(b"GNU\0");
-        prop.extend_from_slice(&0xc000_8002u32.to_le_bytes()); // x86 feature 1
+        prop.extend_from_slice(&0xc000_0002u32.to_le_bytes()); // x86 feature 1
         prop.extend_from_slice(&4u32.to_le_bytes());
         prop.extend_from_slice(&3u32.to_le_bytes()); // IBT | SHSTK
-        prop.extend_from_slice(&0xc000_0002u32.to_le_bytes()); // unknown
+        prop.extend_from_slice(&[0; 4]); // record pads to 8
+        prop.extend_from_slice(&0xc000_8002u32.to_le_bytes()); // x86 ISA needed
+        prop.extend_from_slice(&4u32.to_le_bytes());
+        prop.extend_from_slice(&1u32.to_le_bytes()); // baseline
+        prop.extend_from_slice(&[0; 4]); // record pads to 8
+        prop.extend_from_slice(&0xc000_0004u32.to_le_bytes()); // unknown
         prop.extend_from_slice(&4u32.to_le_bytes());
         prop.extend_from_slice(&0xdead_beefu32.to_le_bytes());
+        prop.extend_from_slice(&[0; 4]); // record pads to 8
         file.extend_from_slice(&prop);
         let note_sz = (file.len() - note_off) as u64;
 

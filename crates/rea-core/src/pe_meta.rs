@@ -2425,8 +2425,8 @@ mod tests {
         let strings_at = file.len() as u32;
         file.extend_from_slice(&strings);
         let blob_at = file.len() as u32;
-        // Entry 1: length 3, property convention, count 1, int32.
-        file.extend_from_slice(&[0x00, 0x03, 0x08, 0x01, 0x08]);
+        // Entry 1: length 3, static property, count 0 index params, int32.
+        file.extend_from_slice(&[0x00, 0x03, 0x08, 0x00, 0x08]);
         let streams = vec![
             ClrStream {
                 name: "#~".into(),

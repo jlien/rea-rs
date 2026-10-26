@@ -389,20 +389,28 @@ fn immediate_value(text: &str, at: usize) -> Option<(Option<String>, usize)> {
     }
     if text[tag_at..].starts_with("<dict") || text[tag_at..].starts_with("<array") {
         let name_end = text[tag_at..].find(['>', ' '])?;
-        let name = &text[tag_at + 1..tag_at + name_end];
-        let next = skip_element(text, tag_at, name)?;
+        let mut name = text[tag_at + 1..tag_at + name_end].to_string();
+        if name.ends_with('/') {
+            name.pop();
+        }
+        let next = skip_element(text, tag_at, &name)?;
         return Some((None, next));
     }
     None
 }
 
-/// Offset past the element `<name ...>` that starts at `start`, nesting-aware. Self-closing tags pass through.
-/// An element that never closes stops the scan at the end of `text`.
+/// Offset past the element `<name ...>` that starts at `start`, nesting-aware.
+/// A self-closing opener (`<name ... />`) passes through without counting. An
+/// element that never closes stops the scan at the end of `text`.
 fn skip_element(text: &str, start: usize, name: &str) -> Option<usize> {
     let open = format!("<{name}");
     let close = format!("</{name}>");
-    let mut depth = 0usize;
-    let mut at = start;
+    let tag_end = text[start..].find('>')? + start + 1;
+    if text[..tag_end].ends_with("/>") {
+        return Some(tag_end);
+    }
+    let mut depth = 1usize; // the opener itself is a nesting level
+    let mut at = tag_end;
     loop {
         let open_at = text[at..].find(&open).map(|i| at + i);
         let close_at = text[at..].find(&close).map(|i| at + i);
@@ -410,17 +418,15 @@ fn skip_element(text: &str, start: usize, name: &str) -> Option<usize> {
             (None, None) => return Some(text.len()),
             (o, c) if o.is_some() && (c.is_none() || o < c) => {
                 let o = o?;
-                let tag_end = text[o..].find('>')? + o + 1;
-                if text[..tag_end].ends_with("/>") {
-                    at = tag_end;
-                } else {
+                let nested_end = text[o..].find('>')? + o + 1;
+                if !text[..nested_end].ends_with("/>") {
                     depth += 1;
-                    at = tag_end;
                 }
+                at = nested_end;
             }
             (_, c) => {
                 let c = c?;
-                depth -= 1;
+                depth -= 1; // depth starts at 1, so a close is always matched
                 at = c + close.len();
                 if depth == 0 {
                     return Some(at);
@@ -1064,6 +1070,29 @@ mod tests {
                 MachoEntitlement { key: "platform-application".into(), value: Some("yes".into()) },
             ]
         );
+    }
+
+    #[test]
+    fn self_closing_and_tight_self_closing_values_keep_later_keys() {
+        // Both self-closing spellings must skip cleanly and leave the
+        // following keys readable; neither may panic.
+        for sep in ["<dict />", "<dict/>", "<array />", "<array/>"] {
+            let xml = format!(
+                "<?xml version=\"1.0\"?><plist><dict>\
+                 <key>first</key>{sep}\
+                 <key>second</key><string>yes</string>\
+                 </dict></plist>"
+            );
+            let got = facts(&entitled_macho(xml.as_bytes(), None)).unwrap();
+            assert_eq!(
+                got.entitlements.expect("entitlements").entries,
+                vec![
+                    MachoEntitlement { key: "first".into(), value: None },
+                    MachoEntitlement { key: "second".into(), value: Some("yes".into()) },
+                ],
+                "sep: {sep}"
+            );
+        }
     }
 
     #[test]
