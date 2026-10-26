@@ -68,7 +68,7 @@ impl LePages {
         })?;
         let off = vaddr - u64::from(obj.base);
         let idx = (off / pagesize) as usize;
-        if idx >= obj.mapsize as usize {
+        if idx >= obj.mapsize as usize || obj.pagemap == 0 {
             return None;
         }
         let page = u64::from(*self.pages.get(obj.pagemap as usize - 1 + idx)?);
@@ -740,7 +740,8 @@ mod tests {
     fn an_object_with_a_zero_pagemap_does_not_panic_sections() {
         // mpages 0, one object with pagemap 0 and mapsize 1: the page map has
         // no slot to look up, so the object's file offset stays 0 instead of
-        // underflowing the index.
+        // underflowing the index — in sections() and in translate() (which
+        // vaddr_to_offset and disasm reach through the loaded image).
         let mut b = synthetic();
         b[0x40 + 0x14..0x40 + 0x18].copy_from_slice(&0u32.to_le_bytes()); // mpages 0
         let o = 0x40 + 0xC0;
@@ -749,6 +750,10 @@ mod tests {
         let secs = img.sections();
         assert_eq!(secs.len(), 1);
         assert_eq!(secs[0].file_offset, 0);
+        // The entry (0x400005) sits inside the pagemap-0 object: translate
+        // must return None, not underflow `pagemap - 1`.
+        assert_eq!(img.pages.translate(0x400005), None);
+        assert_eq!(img.pages.translate(0x400000), None);
     }
 
     #[test]

@@ -418,7 +418,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "rea_symbols",
-            "description": "List symbols; optionally filter by kind: imports, exports, or locals. Mach-O stab symbols are omitted. Itanium, Rust v0, and MSVC names are also returned demangled. The raw name stays. A clang __Z or __R name drops one ABI underscore first. Swift stays raw.",
+            "description": "List symbols; optionally filter by kind: imports, exports, or locals. Mach-O stab symbols are omitted. Itanium, Rust v0, and MSVC names are also returned demangled. The raw name stays. A clang __Z or __R name drops one ABI underscore first. A Swift _$s name drops it too and reads two length-prefixed identifiers as module.name; other Swift stays raw.",
             "inputSchema": schema(false, json!({
                 "kind": { "type": "string", "enum": ["all", "imports", "exports", "locals"] }
             }), &[]),
