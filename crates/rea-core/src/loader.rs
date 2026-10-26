@@ -25,6 +25,16 @@ pub fn load_arch(path: impl AsRef<Path>, arch: Option<&str>) -> Result<Target> {
         return load_le(bytes, path_str);
     }
 
+    // WASM must be checked before goblin too: peek does not know it. The
+    // four-byte magic plus a version word is the whole identity check; the
+    // deep parse stays on `wasm::inspect`.
+    if bytes.len() >= 8 && bytes[..4] == *b"\0asm" {
+        if arch.is_some() {
+            return Err(Error::Parse("arch selection is mach-o only".into()));
+        }
+        return load_wasm(bytes, path_str);
+    }
+
     match {
         let mut cursor = std::io::Cursor::new(&*bytes);
         goblin::peek(&mut cursor).map_err(|e| Error::Parse(format!("peek failed: {e}")))?
@@ -42,6 +52,24 @@ pub fn load_arch(path: impl AsRef<Path>, arch: Option<&str>) -> Result<Target> {
             "format hint {other:?} is not supported"
         ))),
     }
+}
+
+/// A WASM module loads as an identity target: no sections, no symbols, no
+/// entry, and no linear memory mapped in. `wasm::inspect` reads the module
+/// for the deep commands, which read the file themselves.
+fn load_wasm(bytes: Vec<u8>, path: String) -> Result<Target> {
+    Ok(Target {
+        path,
+        format: Format::Wasm,
+        arch: Arch::Unknown,
+        bits: 32,
+        little_endian: true,
+        entry: 0,
+        sections: Vec::new(),
+        symbols: Vec::new(),
+        bytes,
+        page_map: None,
+    })
 }
 
 fn load_le(bytes: Vec<u8>, path: String) -> Result<Target> {
@@ -675,6 +703,52 @@ mod tests {
         }
         let again = super::load(&path).unwrap();
         assert_eq!(again.sections[0].name, host_name);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Type, function, export, and code sections: one defined function `f`
+    /// with body `end`, exported as `f` func 0.
+    fn wasm_module() -> Vec<u8> {
+        let mut bytes = b"\0asm\x01\x00\x00\x00".to_vec();
+        bytes.extend_from_slice(&[1, 4, 1, 0x60, 0, 0]);
+        bytes.extend_from_slice(&[3, 2, 1, 0]);
+        bytes.extend_from_slice(&[7, 5, 1, 1, b'f', 0, 0]);
+        bytes.extend_from_slice(&[10, 4, 1, 2, 0, 0x0b]);
+        bytes
+    }
+
+    #[test]
+    fn wasm_loads_as_an_identity_target() {
+        let bytes = wasm_module();
+        let path = std::env::temp_dir().join(format!("rea-wasm-id-{}.wasm", std::process::id()));
+        std::fs::write(&path, &bytes).unwrap();
+        let target = super::load(&path).unwrap();
+        assert_eq!(target.format, crate::Format::Wasm);
+        assert_eq!(target.format.as_str(), "wasm");
+        assert_eq!(target.arch, crate::Arch::Unknown);
+        assert_eq!(target.bits, 32);
+        assert!(target.little_endian);
+        assert_eq!(target.entry, 0);
+        assert!(target.sections.is_empty());
+        assert!(target.symbols.is_empty());
+        // The deep command still reads the module out of the loaded bytes.
+        let module = crate::wasm::inspect(&target.bytes).unwrap();
+        assert_eq!(module.sections, vec![1, 3, 7, 10]);
+        assert_eq!(module.functions, 1);
+        assert_eq!(module.exports.len(), 1);
+        // Native-code commands reject the target, and so does `--arch`.
+        assert!(target.require_native().is_err());
+        let err = super::load_arch(&path, Some("arm64")).unwrap_err().to_string();
+        assert!(err.contains("mach-o only"), "{err}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn wasm_shorter_than_the_header_stays_unrecognized() {
+        let path = std::env::temp_dir().join(format!("rea-wasm-short-{}.wasm", std::process::id()));
+        std::fs::write(&path, b"\0asm\x01").unwrap();
+        let err = super::load(&path).unwrap_err().to_string();
+        assert!(err.contains("peek failed"), "{err}");
         let _ = std::fs::remove_file(&path);
     }
 

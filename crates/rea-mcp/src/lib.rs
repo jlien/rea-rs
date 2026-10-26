@@ -156,17 +156,37 @@ fn handle_tool_call(msg: &Value) -> Result<Value, String> {
         } else {
             loader::load(path).map_err(|e| e.to_string())?
         };
+        // Native-code commands do not read a WASM target; the deep view is
+        // `rea_wasm`.
+        if matches!(
+            name,
+            "rea_disasm" | "rea_funcs" | "rea_xrefs" | "rea_decompile"
+        ) {
+            target.require_native().map_err(|e| e.to_string())?;
+        }
         Ok(match name {
-            "rea_info" => json!({
-                "path": target.path,
-                "format": target.format.as_str(),
-                "arch": target.arch.as_str(),
-                "bits": target.bits,
-                "little_endian": target.little_endian,
-                "entry": target.entry,
-                "sections": target.sections.len(),
-                "symbols": target.symbols.len(),
-            }),
+            "rea_info" => {
+                let mut value = json!({
+                    "path": target.path,
+                    "format": target.format.as_str(),
+                    "arch": target.arch.as_str(),
+                    "bits": target.bits,
+                    "little_endian": target.little_endian,
+                    "entry": target.entry,
+                    "sections": target.sections.len(),
+                    "symbols": target.symbols.len(),
+                });
+                if target.format == rea_core::Format::Wasm {
+                    let module =
+                        rea_core::wasm::inspect(&target.bytes).map_err(|e| e.to_string())?;
+                    value["wasm"] = json!({
+                        "sections": module.sections.len(),
+                        "functions": module.functions,
+                        "exports": module.exports.len(),
+                    });
+                }
+                value
+            }
             "rea_sections" => json!(target.sections),
             "rea_symbols" => {
                 let filter = args.get("kind").and_then(Value::as_str).unwrap_or("all");
@@ -598,5 +618,61 @@ mod tests {
         let (lines, _) = exchange(r#"{"jsonrpc":"2.0","id":9,"method":"nope"}"#);
         let v: Value = serde_json::from_str(&lines[0]).unwrap();
         assert_eq!(v["error"]["code"], -32601);
+    }
+
+    /// Type, function, export, and code sections: one defined function with
+    /// body `end`, exported as `f` func 0.
+    fn wasm_module() -> Vec<u8> {
+        let mut bytes = b"\0asm\x01\x00\x00\x00".to_vec();
+        bytes.extend_from_slice(&[1, 4, 1, 0x60, 0, 0]);
+        bytes.extend_from_slice(&[3, 2, 1, 0]);
+        bytes.extend_from_slice(&[7, 5, 1, 1, b'f', 0, 0]);
+        bytes.extend_from_slice(&[10, 4, 1, 2, 0, 0x0b]);
+        bytes
+    }
+
+    #[test]
+    fn rea_info_reports_wasm_identity_counts() {
+        let path =
+            std::env::temp_dir().join(format!("rea-mcp-wasm-{}.wasm", std::process::id()));
+        std::fs::write(&path, wasm_module()).unwrap();
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "tools/call",
+            "params": {
+                "name": "rea_info",
+                "arguments": { "path": path.to_str().unwrap() }
+            }
+        });
+        let result = handle_tool_call(&msg).unwrap();
+        let v: Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(v["format"], "wasm");
+        assert_eq!(v["arch"], "unknown");
+        assert_eq!(v["wasm"]["sections"], 4);
+        assert_eq!(v["wasm"]["functions"], 1);
+        assert_eq!(v["wasm"]["exports"], 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rea_funcs_rejects_a_wasm_target() {
+        let path =
+            std::env::temp_dir().join(format!("rea-mcp-wasm-{}.wasm", std::process::id()));
+        std::fs::write(&path, wasm_module()).unwrap();
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": 12,
+            "method": "tools/call",
+            "params": {
+                "name": "rea_funcs",
+                "arguments": { "path": path.to_str().unwrap() }
+            }
+        });
+        let result = handle_tool_call(&msg).unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("no native code view"), "{text}");
+        let _ = std::fs::remove_file(&path);
     }
 }

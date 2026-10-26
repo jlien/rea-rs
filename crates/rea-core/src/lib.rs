@@ -32,6 +32,8 @@ pub enum Format {
     Pe,
     /// Watcom/DOS/4GW linear executable.
     Le,
+    /// WebAssembly binary module.
+    Wasm,
 }
 
 impl Format {
@@ -41,6 +43,7 @@ impl Format {
             Format::Elf => "elf",
             Format::Pe => "pe",
             Format::Le => "le",
+            Format::Wasm => "wasm",
         }
     }
 }
@@ -200,6 +203,17 @@ impl Target {
         let off = self.vaddr_to_offset(vaddr)? as usize;
         let end = off.checked_add(len as usize)?.min(self.bytes.len());
         self.bytes.get(off..end)
+    }
+
+    /// Reject a WASM target for the native-code commands (`disasm`, `funcs`,
+    /// `decompile`, `xrefs`); the deep view is `rea wasm`.
+    pub fn require_native(&self) -> Result<()> {
+        if self.format == Format::Wasm {
+            return Err(Error::Parse(
+                "wasm: no native code view; use the wasm commands".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
