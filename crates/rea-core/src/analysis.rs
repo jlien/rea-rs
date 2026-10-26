@@ -90,19 +90,43 @@ fn sweep_call_targets(target: &Target, sec: &crate::Section) -> Vec<u64> {
 /// Frame-pointer prologues in a code section.
 /// x86: `push ebp; mov ebp, esp`. x86_64: `push rbp; mov rbp, rsp`.
 /// arm64: `stp x29, x30, [sp, #imm]!` or `stp x29, x30, [sp, #imm]`,
-/// at 4-byte-aligned virtual addresses. Arm Thumb: `push {r7, lr}`
-/// (`80 b5`) at even virtual addresses. Unknown yields nothing.
-fn prologue_starts(target: &Target, sec: &crate::Section) -> Vec<u64> {
+/// at 4-byte-aligned virtual addresses. Arm: Thumb `push {r7, lr}`
+/// (`80 b5`) at even virtual addresses, and A32 `push {r11, lr}` /
+/// `stmfd sp!, {…, lr}` words at 4-byte-aligned virtual addresses.
+/// Unknown yields nothing. The bool pairs each address with its ISA mode:
+/// `true` is A32 (disassemble the body in ARM mode), `false` is Thumb
+/// (the mode everything else already uses).
+fn prologue_starts(target: &Target, sec: &crate::Section) -> Vec<(u64, bool)> {
     let start = sec.file_offset as usize;
     let end = start.saturating_add(sec.size as usize);
     if end > target.bytes.len() {
         return Vec::new();
     }
     match target.arch {
-        Arch::X86 => scan_prologue_bytes(target, sec, start, end, &[0x55, 0x8b, 0xec]),
-        Arch::X86_64 => scan_prologue_bytes(target, sec, start, end, &[0x55, 0x48, 0x89, 0xe5]),
-        Arch::Arm64 => scan_arm64_stp_prologues(target, sec, start, end),
-        Arch::Arm => scan_thumb_push_prologues(target, sec, start, end),
+        Arch::X86 => scan_prologue_bytes(target, sec, start, end, &[0x55, 0x8b, 0xec])
+            .into_iter()
+            .map(|a| (a, false))
+            .collect(),
+        Arch::X86_64 => scan_prologue_bytes(target, sec, start, end, &[0x55, 0x48, 0x89, 0xe5])
+            .into_iter()
+            .map(|a| (a, false))
+            .collect(),
+        Arch::Arm64 => scan_arm64_stp_prologues(target, sec, start, end)
+            .into_iter()
+            .map(|a| (a, false))
+            .collect(),
+        Arch::Arm => {
+            let mut out: Vec<(u64, bool)> = scan_thumb_push_prologues(target, sec, start, end)
+                .into_iter()
+                .map(|a| (a, false))
+                .collect();
+            out.extend(
+                scan_a32_push_prologues(target, sec, start, end)
+                    .into_iter()
+                    .map(|a| (a, true)),
+            );
+            out
+        }
         Arch::Unknown => Vec::new(),
     }
 }
@@ -173,12 +197,57 @@ fn scan_thumb_push_prologues(
     out
 }
 
+/// A32 frame-pointer push at 4-byte-aligned virtual addresses. A word is
+/// `push {…, lr}` / `stmfd sp!, {…, lr}` when it is an STMDB (P=1, U=0,
+/// S=0, W=1, L=0) with Rn = sp (r13) and the LR bit set in the register
+/// list, under condition `al` (0xE). `push {r11, lr}` (`e9 2d 4b 00`) is
+/// the minimal such word.
+fn is_a32_push_lr_word(word: u32) -> bool {
+    word >> 28 == 0xE
+        && (word & 0x0FE0_0000) == 0x0920_0000
+        && (word & 0x000F_0000) == 0x000D_0000
+        && word & 0x0000_4000 != 0
+}
+
+fn scan_a32_push_prologues(
+    target: &Target,
+    sec: &crate::Section,
+    start: usize,
+    end: usize,
+) -> Vec<u64> {
+    let mut out = Vec::new();
+    // Instructions are 4-byte aligned. Skip a leading unaligned byte or two
+    // so the first word sits on an aligned virtual address.
+    let misalign = (sec.addr as usize) % 4;
+    let mut i = start + if misalign == 0 { 0 } else { 4 - misalign };
+    while i + 4 <= end {
+        let word = u32::from_le_bytes([
+            target.bytes[i],
+            target.bytes[i + 1],
+            target.bytes[i + 2],
+            target.bytes[i + 3],
+        ]);
+        if is_a32_push_lr_word(word) {
+            out.push(sec.addr.saturating_add((i - start) as u64));
+        }
+        i += 4;
+    }
+    out
+}
+
 /// Follow control flow from `start`, returning (body extent, call targets).
 /// Unlike a plain linear run this handles forward unconditional jumps
 /// (`jmp`, `b`), stops at `ret`, indirect jumps (`br` / register `jmp`),
 /// and invalid bytes — so functions no longer bleed into padding or the
 /// next function. Conditional branches fall through.
 pub(crate) fn function_body(target: &Target, start: u64, max: u64) -> (u64, Vec<u64>) {
+    function_body_in(target, start, max, false)
+}
+
+/// Same walk with an explicit Arm ISA mode: `a32` disassembles Arm targets
+/// in ARM mode (bodies end at `bx lr`) instead of the default Thumb. The
+/// mode is fixed per seed — a body never switches ISA mid-section.
+pub(crate) fn function_body_in(target: &Target, start: u64, max: u64, a32: bool) -> (u64, Vec<u64>) {
     let mut visited: BTreeSet<u64> = BTreeSet::new();
     let mut calls: Vec<u64> = Vec::new();
     let mut work = vec![start];
@@ -187,7 +256,8 @@ pub(crate) fn function_body(target: &Target, start: u64, max: u64) -> (u64, Vec<
         if addr < start || addr >= start.saturating_add(max) || !visited.insert(addr) {
             continue;
         }
-        let Ok(insns) = disasm::disassemble(target, addr, 64) else {
+        let arm_mode = target.arch == Arch::Arm && a32;
+        let Ok(insns) = disasm::disassemble_in(target, addr, 64, Some(!arm_mode)) else {
             continue;
         };
         if insns.is_empty() {
@@ -287,13 +357,19 @@ fn symbol_seeds(target: &Target) -> Vec<u64> {
 /// sorted by address.
 pub fn discover_functions(target: &Target) -> Vec<Function> {
     let mut seeds: BTreeSet<u64> = BTreeSet::new();
+    // A32 prologue seeds are disassembled in ARM mode; every other seed
+    // keeps the architecture's default mode (Thumb for Arm).
+    let mut a32_seeds: BTreeSet<u64> = BTreeSet::new();
     seeds.insert(target.entry);
     for addr in symbol_seeds(target) {
         seeds.insert(addr);
     }
     for sec in code_sections(target) {
-        for s in prologue_starts(target, sec) {
+        for (s, is_a32) in prologue_starts(target, sec) {
             seeds.insert(s);
+            if is_a32 {
+                a32_seeds.insert(s);
+            }
         }
         for t in sweep_call_targets(target, sec) {
             seeds.insert(t);
@@ -306,7 +382,7 @@ pub fn discover_functions(target: &Target) -> Vec<Function> {
         if funcs.contains_key(&addr) {
             continue;
         }
-        let (size, calls) = function_body(target, addr, 0x20000);
+        let (size, calls) = function_body_in(target, addr, 0x20000, a32_seeds.contains(&addr));
         if size == 0 {
             continue;
         }
@@ -1015,6 +1091,29 @@ mod tests {
         let entry = funcs.iter().find(|f| f.addr == 0x1000).expect("entry");
         assert_eq!(entry.calls, vec![0x100f]);
         assert!(funcs.iter().any(|f| f.addr == 0x100f));
+    }
+
+    #[test]
+    fn a32_push_lr_is_seeded_and_ends_at_bx_lr() {
+        // push {r11, lr} (e92d4b00); mov r0, #0 (e3a00000); bx lr (e12fff1e).
+        // The body must decode in ARM mode and stop at `bx lr`, 12 bytes.
+        let code = [
+            0x00, 0x4b, 0x2d, 0xe9, 0x00, 0x00, 0xa0, 0xe3, 0x1e, 0xff, 0x2f, 0xe1,
+        ];
+        let funcs = discover_functions(&synthetic_code(Arch::Arm, 32, &code));
+        let entry = funcs.iter().find(|f| f.addr == 0x1000).expect("a32 entry");
+        assert_eq!(entry.size, 12, "size {} (bx lr should stop the body)", entry.size);
+    }
+
+    #[test]
+    fn a32_stmfd_with_wider_reglist_is_a_seed() {
+        // stmfd sp!, {r4, r11, lr} (e92d4c90); bx lr. 8 bytes, ARM mode.
+        let code = [
+            0x90, 0x4c, 0x2d, 0xe9, 0x1e, 0xff, 0x2f, 0xe1,
+        ];
+        let funcs = discover_functions(&synthetic_code(Arch::Arm, 32, &code));
+        let entry = funcs.iter().find(|f| f.addr == 0x1000).expect("a32 entry");
+        assert_eq!(entry.size, 8, "size {} (bx lr should stop the body)", entry.size);
     }
 
     #[test]

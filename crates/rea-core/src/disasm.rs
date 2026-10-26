@@ -22,7 +22,19 @@ type Result<T> = std::result::Result<T, DisasmError>;
 
 /// Disassemble up to `count` instructions starting at virtual address `vaddr`.
 pub fn disassemble(target: &Target, vaddr: u64, count: usize) -> Result<Vec<Instruction>> {
-    let cs = build_capstone(target.arch)?;
+    disassemble_in(target, vaddr, count, None)
+}
+
+/// Like [`disassemble`], but forces an Arm ISA mode: `Some(true)` is Thumb,
+/// `Some(false)` is A32. The override is ignored on non-Arm targets, so an
+/// x86_64 caller passes `None` either way.
+pub fn disassemble_in(
+    target: &Target,
+    vaddr: u64,
+    count: usize,
+    arm_thumb: Option<bool>,
+) -> Result<Vec<Instruction>> {
+    let cs = build_capstone_in(target.arch, arm_thumb)?;
 
     let code = target
         .read_at_vaddr(vaddr, 4096)
@@ -44,6 +56,12 @@ pub fn disassemble(target: &Target, vaddr: u64, count: usize) -> Result<Vec<Inst
 }
 
 pub(crate) fn build_capstone(arch: Arch) -> Result<capstone::Capstone> {
+    build_capstone_in(arch, None)
+}
+
+/// Build a Capstone handle. `arm_thumb` forces the Arm ISA mode (`Some(true)`
+/// is Thumb, `Some(false)` is A32) and is ignored for other architectures.
+pub(crate) fn build_capstone_in(arch: Arch, arm_thumb: Option<bool>) -> Result<capstone::Capstone> {
     use capstone::arch::*;
     use capstone::prelude::*;
 
@@ -58,7 +76,10 @@ pub(crate) fn build_capstone(arch: Arch) -> Result<capstone::Capstone> {
             .build(),
         Arch::Arm => Capstone::new()
             .arm()
-            .mode(arch::arm::ArchMode::Thumb)
+            .mode(match arm_thumb {
+                Some(false) => arch::arm::ArchMode::Arm,
+                _ => arch::arm::ArchMode::Thumb,
+            })
             .build(),
         Arch::Arm64 => Capstone::new()
             .arm64()
