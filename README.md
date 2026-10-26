@@ -81,7 +81,7 @@ rea strings /bin/ls | jq '.count'
 - `rea_info` — format, architecture, entry point, section/symbol counts
 - `rea_sections` — section names, virtual addresses, sizes, file offsets, and `rwx` permissions. ELF sections also carry the `sh_type` name (`PROGBITS`, `NOBITS`, `DYNAMIC`, ...) and `SHF_` flags beyond the `rwx` bits. Optional `arch` selects a Mach-O slice. The default is the host slice.
 - `rea_symbols` — imports, exports, and locals, filterable by kind. Mach-O stab symbols are omitted. An Itanium, Rust v0, or MSVC name is also returned demangled. The raw name stays. A clang `__Z` or `__R` name drops one ABI underscore first. Swift stays raw.
-- `rea_strings` — printable strings with file offsets; optional `xrefs` annotates code references
+- `rea_strings` — printable ASCII strings with file offsets, plus UTF-16LE and UTF-16BE runs (an `encoding` field names those; runs are deduped across endianness); optional `xrefs` annotates code references
 - `rea_disasm` — instruction-level disassembly at any virtual address. Optional `arch` selects a Mach-O slice. The default is the host slice.
 - `rea_funcs` — function boundaries from the entry point, direct calls, and prologues
 - `rea_xrefs` — code locations referencing an address (pointer-width absolutes, plus arm64 ADRP, x86_64 RIP-relative, 32-bit x86, and ARM/Thumb PC-relative loads)
