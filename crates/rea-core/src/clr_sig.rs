@@ -97,7 +97,6 @@ pub fn il_ops(bytes: &[u8]) -> Vec<String> {
                 0x05 => "clt.un",
                 0x0f => "localloc",
                 0x11 => "endfilter",
-                0x1e => "ckfinite",
                 _ => {
                     out.push(format!("op-fe-{second:02x}"));
                     break;
@@ -190,6 +189,8 @@ fn opcode(op: u8) -> Option<&'static str> {
         0x5f => "and",
         0x60 => "or",
         0x61 => "xor",
+        // ECMA-335: ckfinite is the one-byte opcode 0xC3, not a 0xFE prefix.
+        0xc3 => "ckfinite",
         _ => return None,
     })
 }
@@ -293,7 +294,6 @@ mod tests {
             (0x05, "clt.un"),
             (0x0f, "localloc"),
             (0x11, "endfilter"),
-            (0x1e, "ckfinite"),
         ] {
             // codesize 2: the prefix opcode alone.
             assert_eq!(il_ops(&[0x0a, 0xfe, second]), vec![name.to_string()]);
@@ -301,6 +301,11 @@ mod tests {
         // A second byte outside the set — `ldftn` (0x06), whose token operand
         // stays unread — stops the listing at the marker.
         assert_eq!(il_ops(&[0x0a, 0xfe, 0x06]), vec!["op-fe-06".to_string()]);
+        // `readonly.` is 0xFE 0x1E, not ckfinite; it stays an unknown marker.
+        assert_eq!(il_ops(&[0x0a, 0xfe, 0x1e]), vec!["op-fe-1e".to_string()]);
+        // ckfinite is the one-byte opcode 0xC3 (ECMA-335); header 0x06 is a
+        // tiny body of one byte.
+        assert_eq!(il_ops(&[0x06, 0xc3]), vec!["ckfinite".to_string()]);
         // A truncated prefix stops silently.
         assert!(il_ops(&[0x0a, 0xfe]).is_empty());
     }

@@ -497,8 +497,9 @@ fn cms_digest_present(directory: &[u8], cms: &[u8]) -> Option<bool> {
 }
 
 /// Hash types 3 and 4 compare only the leading `hashSize` bytes of the digest.
-/// A zero size compares nothing, and a size past the digest length cannot
-/// truncate, so both leave `cms_verified` empty.
+/// The size clamps to the digest length, so a size past the digest compares
+/// the whole digest; a zero size compares nothing and leaves `cms_verified`
+/// empty.
 fn truncated_digest(digest: &[u8], hash_size: usize) -> Option<Vec<u8>> {
     let size = hash_size.min(digest.len());
     (size > 0).then(|| digest[..size].to_vec())
