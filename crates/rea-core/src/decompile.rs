@@ -407,8 +407,16 @@ fn carry_types<'a>(
     arch: Arch,
 ) -> (Vec<(&'a TypedReg, usize)>, Vec<(usize, String)>) {
     let kill = register_deaths(typed, gaps, joins, arch);
-    let declared: Vec<(&TypedReg, usize)> =
-        typed.iter().enumerate().map(|(n, r)| (r, n + 1)).collect();
+    // Slot loads push their destination after later instructions were
+    // already typed; activation walks `declared` in order, so sort by the
+    // typing index.
+    let mut numbered: Vec<(usize, &TypedReg)> =
+        typed.iter().enumerate().map(|(n, r)| (n, r)).collect();
+    numbered.sort_by_key(|(n, r)| (r.first, *n));
+    let declared: Vec<(&TypedReg, usize)> = numbered
+        .into_iter()
+        .map(|(n, r)| (r, n + 1))
+        .collect();
     let mut kills: Vec<(usize, String)> = typed
         .iter()
         .filter_map(|r| {
@@ -885,6 +893,11 @@ fn slot_key_of(mem: &str, arch: Arch) -> Option<SlotKey> {
             }
         }
         Arch::Arm64 => {
+            // Capstone prints pre-indexed forms with the writeback marker
+            // outside the brackets ("[sp, #-0x10]!"); strip it so the
+            // displacement parses. Post-index ("[sp], #8") has no comma
+            // inside the brackets and still fails the slot check below.
+            let inner = inner.strip_suffix('!').unwrap_or(inner);
             let mut parts = inner.splitn(2, ',');
             if parts.next()?.trim() != "sp" {
                 return None;
@@ -911,7 +924,7 @@ fn slot_store_key(insn: &disasm::Instruction, arch: Arch) -> Option<SlotKey> {
             let (dst, _) = split_first(ops)?;
             slot_key_of(dst, arch)
         }
-        Arch::Arm64 if m == "str" => {
+        Arch::Arm64 if matches!(m, "str" | "strb" | "strh") => {
             let (_, src) = split_first(ops)?;
             slot_key_of(src, arch)
         }
@@ -928,7 +941,7 @@ fn slot_store_source(insn: &disasm::Instruction, arch: Arch) -> Option<String> {
             let (_, src) = split_first(ops)?;
             canonical_of(arch, src)
         }
-        Arch::Arm64 if m == "str" => {
+        Arch::Arm64 if matches!(m, "str" | "strb" | "strh") => {
             let (dst, _) = split_first(ops)?;
             canonical_of(arch, dst)
         }
@@ -949,7 +962,13 @@ fn slot_load_key(insn: &disasm::Instruction, arch: Arch) -> Option<SlotKey> {
             }
             slot_key_of(src, arch)
         }
-        Arch::Arm64 if m == "ldr" || m == "ldur" => {
+        Arch::Arm64
+            if matches!(
+                m,
+                "ldr" | "ldur" | "ldrb" | "ldurh" | "ldrh" | "ldurb" | "ldursb" | "ldursh"
+                    | "ldursw" | "ldrsw" | "ldrsh" | "ldrsb"
+            ) =>
+        {
             let (_, src) = split_first(ops)?;
             slot_key_of(src, arch)
         }
@@ -1131,6 +1150,8 @@ fn canonical_of(arch: Arch, reg: &str) -> Option<String> {
 #[cfg(all(test, feature = "disasm"))]
 mod tests {
     use super::decompile;
+    use crate::disasm;
+    use super::{slot_load_key, slot_store_key};
     use crate::{Arch, Format, Section, Target};
 
     fn target(arch: Arch, bits: u8, code: &[u8]) -> Target {
@@ -1712,6 +1733,54 @@ mod tests {
         // rbx reuses the slot's int local instead of staying raw; the
         // load line is spelled with Capstone's hex displacement.
         assert!(text.contains("v2 = qword ptr [rbp - 0x10]"), "{text}");
+    }
+
+    #[test]
+    fn arm64_a_preindexed_hex_slot_and_strb_reuse_types() {
+        // adrp x0; add x0, x0, #0 (void*); str x0, [sp, #-0x10]! (pre-index,
+        // Capstone prints the displacement in hex with '!' outside the
+        // brackets); ldr x2, [sp, #-0x10]! reuses the slot's type; then
+        // strb w5, [sp, #0xc]! (byte store, unknown data) poisons the slot
+        // and ldurb w6 cannot re-type it.
+        let code = [
+            0x60, 0x00, 0x00, 0x90, // adrp x0, 0
+            0x00, 0x00, 0x00, 0x91, // add x0, x0, #0
+            0xe0, 0x0f, 0x1f, 0xf8, // str x0, [sp, #-0x10]!
+            0xe2, 0x0f, 0x5f, 0xf8, // ldr x2, [sp, #-0x10]!
+            0xe5, 0xcf, 0x00, 0x38, // strb w5, [sp, #0xc]!
+            0xe6, 0xc3, 0x40, 0x38, // ldurb w6, [sp, #0xc]
+            0xc0, 0x03, 0x5f, 0xd6, // ret
+        ];
+        let text = decompile(&target(Arch::Arm64, 64, &code), 0x1000, 64).unwrap();
+        assert!(text.contains("void* v1;"), "{text}");
+        assert!(text.contains("v1 = &0xd000"), "{text}");
+        // The pre-index load reuses the slot's type — one local, no v2.
+        assert!(text.contains("v3 = [sp, #-0x10]!"), "{text}");
+        assert!(text.contains("void* v3;"), "{text}");
+        assert!(!text.contains("v3 = qword ptr [sp"), "{text}");
+        // The byte and halfword store mnemonics name slots too, with or
+        // without the writeback marker; ldurb is a slot load.
+        let strb = disasm::Instruction {
+            addr: 0,
+            size: 4,
+            mnemonic: "strb".into(),
+            operands: "w5, [sp, #0xc]!".into(),
+        };
+        assert_eq!(slot_store_key(&strb, Arch::Arm64), Some((2, 12)));
+        let strh = disasm::Instruction {
+            addr: 0,
+            size: 4,
+            mnemonic: "strh".into(),
+            operands: "w5, [sp]".into(),
+        };
+        assert_eq!(slot_store_key(&strh, Arch::Arm64), Some((2, 0)));
+        let ldurb = disasm::Instruction {
+            addr: 0,
+            size: 4,
+            mnemonic: "ldurb".into(),
+            operands: "w6, [sp, #0xc]".into(),
+        };
+        assert_eq!(slot_load_key(&ldurb, Arch::Arm64), Some((2, 12)));
     }
 
     #[test]
