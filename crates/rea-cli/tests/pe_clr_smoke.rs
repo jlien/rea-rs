@@ -87,8 +87,7 @@ fn bsjb() -> Vec<u8> {
 
 /// Minimal PE32+ with one section holding a 24-byte COR20 header at RVA
 /// 0x1000 and the metadata at RVA 0x1100, reached through data directory 14.
-fn pe_file() -> Vec<u8> {
-    let metadata = bsjb();
+fn pe_file_with(metadata: Vec<u8>) -> Vec<u8> {
     let mut pe: Vec<u8> = vec![0; 0x80];
     pe[0] = b'M';
     pe[1] = b'Z';
@@ -141,6 +140,10 @@ fn pe_file() -> Vec<u8> {
     pe
 }
 
+fn pe_file() -> Vec<u8> {
+    pe_file_with(bsjb())
+}
+
 #[test]
 fn rea_pe_reports_the_assembly_row_of_a_synthetic_dotnet_pe() {
     let path = std::env::temp_dir().join("rea-pe-clr-smoke.exe");
@@ -156,3 +159,86 @@ fn rea_pe_reports_the_assembly_row_of_a_synthetic_dotnet_pe() {
     assert!(stdout.contains("en-US"), "culture missing: {stdout}");
     assert!(stdout.contains("deadbeef"), "public key missing: {stdout}");
 }
+
+/// `#~` stream with TypeRef 1, TypeDef 1, and MemberRef 3. The member refs
+/// point at the TypeDef, the TypeRef, and a ModuleRef in turn.
+fn memberref_tilde() -> Vec<u8> {
+    let mut tilde = vec![0u8; 24];
+    tilde[4] = 2;
+    tilde[7] = 1;
+    let valid: u64 = (1 << 1) | (1 << 2) | (1 << 10);
+    tilde[8..16].copy_from_slice(&valid.to_le_bytes());
+    for rows in [1u32, 1, 3] {
+        tilde.extend_from_slice(&rows.to_le_bytes());
+    }
+    // TypeRef: scope, name (IFace), namespace (Ns).
+    tilde.extend_from_slice(&0u16.to_le_bytes());
+    tilde.extend_from_slice(&4u16.to_le_bytes());
+    tilde.extend_from_slice(&1u16.to_le_bytes());
+    // TypeDef: flags, name (App), namespace, extends, field list, method list.
+    tilde.extend_from_slice(&0u32.to_le_bytes());
+    tilde.extend_from_slice(&10u16.to_le_bytes());
+    tilde.extend_from_slice(&0u16.to_le_bytes());
+    tilde.extend_from_slice(&0u16.to_le_bytes());
+    tilde.extend_from_slice(&1u16.to_le_bytes());
+    tilde.extend_from_slice(&1u16.to_le_bytes());
+    // MemberRef rows: coded parent, name, blob index 0.
+    for (coded, name) in [(8u16, 14u16), (9, 20), (10, 25)] {
+        tilde.extend_from_slice(&coded.to_le_bytes());
+        tilde.extend_from_slice(&name.to_le_bytes());
+        tilde.extend_from_slice(&0u16.to_le_bytes());
+    }
+    tilde
+}
+
+#[test]
+fn rea_pe_resolves_memberref_parents_of_a_synthetic_dotnet_pe() {
+    let version = b"v4.0.30319\0\0";
+    let mut meta = Vec::new();
+    meta.extend_from_slice(&0x424A_5342u32.to_le_bytes());
+    meta.extend_from_slice(&1u16.to_le_bytes());
+    meta.extend_from_slice(&1u16.to_le_bytes());
+    meta.extend_from_slice(&0u32.to_le_bytes());
+    meta.extend_from_slice(&(version.len() as u32).to_le_bytes());
+    meta.extend_from_slice(version);
+    meta.extend_from_slice(&0u16.to_le_bytes());
+    meta.extend_from_slice(&2u16.to_le_bytes());
+    let tilde = memberref_tilde();
+    let strings = b"\0Ns\0IFace\0App\0alpha\0beta\0gamma\0".to_vec();
+    let names = ["#~", "#Strings"];
+    let data_at = meta.len() as u32
+        + names
+            .iter()
+            .map(|n| (8 + n.len() as u32 + 1).div_ceil(4) * 4)
+            .sum::<u32>();
+    let mut at = data_at;
+    for (name, data) in [("#~", tilde.as_slice()), ("#Strings", strings.as_slice())] {
+        meta.extend_from_slice(&at.to_le_bytes());
+        meta.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        meta.extend_from_slice(name.as_bytes());
+        meta.push(0);
+        while meta.len() % 4 != 0 {
+            meta.push(0);
+        }
+        at += data.len() as u32;
+    }
+    meta.extend_from_slice(&tilde);
+    meta.extend_from_slice(&strings);
+    let file = pe_file_with(meta);
+    let path = std::env::temp_dir().join("rea-pe-memberref-smoke.exe");
+    std::fs::write(&path, &file).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_rea"))
+        .args(["pe", path.to_str().unwrap()])
+        .output()
+        .expect("rea binary runs");
+    let _ = std::fs::remove_file(&path);
+    assert!(out.status.success(), "exit {:?}", out.status);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("member_ref_parents"),
+        "parent list missing: {stdout}"
+    );
+    assert!(stdout.contains("Ns.IFace"), "typeref parent missing: {stdout}");
+    assert!(stdout.contains("ModuleRef#1"), "moduleref parent missing: {stdout}");
+}
+
