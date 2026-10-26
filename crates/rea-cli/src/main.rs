@@ -76,7 +76,7 @@ enum Command {
     },
     /// Direct call graph over discovered functions.
     Callgraph { path: String },
-    /// Straight-line pseudo-C at a virtual address. Assignments, calls, gotos, and returns. Not a type-recovering decompiler. `--arch` selects a Mach-O slice.
+    /// Straight-line pseudo-C at a virtual address. Assignments, calls, gotos, and returns. Width-based types on x86_64 and arm64: typed synthetic locals, casts at call arguments and returns. `--arch` selects a Mach-O slice.
     Decompile {
         path: String,
         /// Virtual address, hex (0x…) or decimal. Defaults to the entry point.

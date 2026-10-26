@@ -459,7 +459,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "rea_decompile",
-            "description": "Bounded pseudo-C at a virtual address: assignments, calls, gotos, and returns. Not a type-recovering decompiler. Optional arch selects a Mach-O slice.",
+            "description": "Bounded pseudo-C at a virtual address: assignments, calls, gotos, and returns. Width-based types on x86_64 and arm64: typed synthetic locals, casts at call arguments and returns. No dataflow across basic blocks. Optional arch selects a Mach-O slice.",
             "inputSchema": schema(false, json!({
                 "address": { "type": "integer", "description": "Virtual address. Default is the entry point." },
                 "count": { "type": "integer", "description": "Maximum instructions (default 32, cap 64)." },
