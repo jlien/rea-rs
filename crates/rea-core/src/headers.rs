@@ -1,7 +1,8 @@
 //! C header text for names already recovered on a [`Target`](crate::Target).
 //!
 //! An Itanium or MSVC demangle becomes a declaration. A demangled path with
-//! `::` but no parameter list becomes a comment. Any other local or
+//! `::` but no parameter list becomes a comment, as does a Swift demangle
+//! (`module.name`). Any other local or
 //! export with a C identifier is `extern void name();`. Imports are omitted.
 
 use crate::{SymbolKind, Target};
@@ -14,6 +15,15 @@ pub fn emit(target: &Target) -> String {
         }
         if let Some(demangled) = &sym.demangled {
             if !demangled.contains('(') {
+                // A Swift demangle (`module.name`) is a path with `.`, which
+                // is not callable C syntax, so it is a comment only. No
+                // parameter list is invented and no declaration is emitted
+                // for a path containing `.`.
+                if crate::demangle::swift(&sym.name).is_some() {
+                    out.push_str("/* ");
+                    out.push_str(demangled);
+                    out.push_str(" */\n");
+                }
                 // A demangled path with no parameter list (a Rust path, for
                 // example) is not callable syntax, so it is a comment only.
                 if demangled.contains("::") {
@@ -138,5 +148,21 @@ mod tests {
         assert!(header.contains("extern void _RNvC3_foo3_bar();"), "{header}");
         assert!(!header.contains("foo::bar("), "{header}");
         assert!(!header.contains("?foo@@YA"), "{header}");
+    }
+
+    #[test]
+    fn a_swift_demangle_becomes_a_comment_but_not_a_declaration() {
+        let header = emit(&target_with(vec![
+            Symbol::new(0x1600, 0, "$s4main3fooyyF", SymbolKind::Local),
+            Symbol::new(0x1700, 0, "$s4main9", SymbolKind::Export),
+        ]));
+        // `main.foo` is a path with `.`, so it is a comment in the 4.2 form,
+        // never a declaration; the failed demangle stays absent and the raw
+        // `$s` names are not C identifiers, so no fallback line appears.
+        assert!(header.contains("/* main.foo */"), "{header}");
+        assert!(!header.contains("main.foo("), "{header}");
+        assert!(!header.contains("extern void main"), "{header}");
+        assert!(!header.contains("$s4main9"), "{header}");
+        assert!(!header.contains("/* main. */"), "{header}");
     }
 }

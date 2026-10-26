@@ -689,9 +689,12 @@ mod tests {
             .find(|s| s.name == "$s4main9")
             .expect("broken");
         assert_eq!(broken.demangled, None);
-        // Headers still omit Swift names until task 6.1.
+        // Headers print a Swift demangle as a comment (`/* main.foo */`),
+        // never a declaration; the failed demangle stays absent.
         let header = crate::headers::emit(&target);
-        assert!(!header.contains("main.foo"), "{header}");
+        assert!(header.contains("/* main.foo */"), "{header}");
+        assert!(!header.contains("extern void $s4main3fooyyF"), "{header}");
+        assert!(!header.contains("$s4main9"), "{header}");
     }
 
     fn macho_with_clang_itanium() -> Vec<u8> {

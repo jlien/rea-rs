@@ -496,7 +496,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "rea_headers",
-            "description": "A C header of recovered local and export names. An Itanium or MSVC demangle becomes a declaration, keeping its return type. A demangled path with :: but no parameter list (a Rust path) becomes a comment line, never a declaration. Imports are omitted, as are Swift names.",
+            "description": "A C header of recovered local and export names. An Itanium or MSVC demangle becomes a declaration, keeping its return type. A demangled path with :: but no parameter list (a Rust path) becomes a comment line, never a declaration. A Swift demangle (module.name) becomes the same comment form. Imports are omitted.",
             "inputSchema": schema(true, json!({}), &[]),
         }),
         json!({
