@@ -108,8 +108,8 @@ pub struct ClrType {
     pub table: String,
     pub namespace: String,
     pub name: String,
-    /// `Field` names owned by a `TypeDef`, in table order. Empty for `Module` and `TypeRef`.
-    pub fields: Vec<String>,
+    /// `Field` rows owned by a `TypeDef`, in table order. Empty for `Module` and `TypeRef`.
+    pub fields: Vec<ClrField>,
     /// `MethodDef` rows owned by a `TypeDef`, in table order. Empty for `Module` and `TypeRef`.
     pub methods: Vec<ClrMethod>,
     /// `Property` names owned by a `TypeDef`. Empty when `PropertyMap` is absent.
@@ -118,12 +118,21 @@ pub struct ClrType {
     pub events: Vec<String>,
 }
 
-/// A method name and the `Param` names it owns.
+/// A field name and its decoded signature.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ClrField {
+    pub name: String,
+    /// Field signature such as `field int32`. `None` when the blob index is 0 or the blob does not fit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+}
+
+/// A method name and the `Param` rows it owns.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ClrMethod {
     pub name: String,
-    /// `Param` names in table order. Sequence numbers are not read.
-    pub params: Vec<String>,
+    /// `Param` names in table order, each with its sequence number.
+    pub params: Vec<ClrParam>,
     /// Method signature such as `void(int32)`. `None` when the blob index is 0 or the blob does not fit.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
@@ -132,6 +141,13 @@ pub struct ClrMethod {
     pub il: Vec<String>,
     /// Method RVA. Zero when the row has no body.
     pub rva: u32,
+}
+
+/// A parameter name and its `Param` sequence number. Zero is the return value.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ClrParam {
+    pub name: String,
+    pub sequence: u16,
 }
 
 /// One metadata table named in the `#~` / `#-` header, with its row count.
@@ -635,7 +651,7 @@ impl MetaRead {
 
 /// `Module`, `TypeRef`, and `TypeDef` names, plus `Field` and `MethodDef` names on each `TypeDef`, `Param` names on each method, and `MemberRef` names.
 ///
-/// `FieldPtr`, `MethodPtr`, `ParamPtr`, and `InterfaceImpl` are skipped by row size. The pointer tables are not applied. String, blob, and coded-index widths follow the `#~` heap-size byte and the row counts. A row that does not fit ends the list and keeps the names already read. Signatures, RVAs, parameter sequence numbers, and IL are not read.
+/// `FieldPtr`, `MethodPtr`, `ParamPtr`, and `InterfaceImpl` are skipped by row size. The pointer tables are not applied. String, blob, and coded-index widths follow the `#~` heap-size byte and the row counts. A row that does not fit ends the list and keeps the names already read. Signatures, RVAs, and IL are not read.
 fn read_metadata_names(
     file: &[u8],
     metadata_off: Option<usize>,
@@ -813,7 +829,7 @@ fn read_metadata_names(
                 }
             }
             8 => {
-                let mut names = Vec::new();
+                let mut names: Vec<(u16, String)> = Vec::new();
                 for _ in 0..param_rows {
                     let Some(end) = cursor.checked_add(param_size) else {
                         attach_methods(&mut out, &typedefs, &method_recs, &names);
@@ -824,7 +840,10 @@ fn read_metadata_names(
                         return MetaRead::partial(out, member_refs);
                     }
                     let row = &blob[cursor..end];
-                    names.push(heap_string(strings, read_index(row, 4, str_w)));
+                    names.push((
+                        u16::from_le_bytes([row[0], row[1]]),
+                        heap_string(strings, read_index(row, 4, str_w)),
+                    ));
                     cursor = end;
                 }
                 attach_methods(&mut out, &typedefs, &method_recs, &names);
@@ -879,7 +898,7 @@ fn read_metadata_names(
     }
 }
 
-/// Signatures, assembly names, properties, and events. A row that does not fit keeps what was already read.
+/// Field and method signatures, assembly names, properties, and events. A row that does not fit keeps what was already read.
 fn enrich_metadata(
     types: &mut [ClrType],
     member_refs: &[String],
@@ -1006,6 +1025,7 @@ fn enrich_metadata(
 
     let mut cursor = header_end;
     let mut method_recs = Vec::new();
+    let mut field_sigs = Vec::new();
     let mut member_sigs = Vec::new();
     let mut assemblies = Vec::new();
     let mut assembly_refs = Vec::new();
@@ -1013,6 +1033,7 @@ fn enrich_metadata(
     let mut property_maps = Vec::new();
     let mut event_names = Vec::new();
     let mut property_names = Vec::new();
+    let mut fields_done = false;
     let mut methods_done = false;
     let mut members_done = false;
     for bit in 0..45u32 {
@@ -1034,6 +1055,12 @@ fn enrich_metadata(
             }
             let row = &tilde[cursor..end];
             match bit {
+                4 => {
+                    let sig = blobs.and_then(|heap| {
+                        crate::clr_sig::method_sig(heap, read_index(row, 2 + str_w, blob_w))
+                    });
+                    field_sigs.push(sig);
+                }
                 6 => {
                     let rva = u32::from_le_bytes([row[0], row[1], row[2], row[3]]);
                     let sig = blobs.and_then(|heap| {
@@ -1071,11 +1098,26 @@ fn enrich_metadata(
         if !fit {
             break;
         }
+        if bit == 4 {
+            fields_done = true;
+        }
         if bit == 6 {
             methods_done = true;
         }
         if bit == 10 {
             members_done = true;
+        }
+    }
+    if fields_done {
+        let count: usize = types.iter().map(|ty| ty.fields.len()).sum();
+        if count == field_sigs.len() {
+            let mut index = 0;
+            for ty in types.iter_mut() {
+                for field in &mut ty.fields {
+                    field.signature = field_sigs[index].clone();
+                    index += 1;
+                }
+            }
         }
     }
     if methods_done {
@@ -1134,7 +1176,13 @@ fn attach_field_names(out: &mut [ClrType], typedefs: &[(usize, u32, u32)], names
     let lists: Vec<u32> = typedefs.iter().map(|row| row.1).collect();
     for (index, &(at, _, _)) in typedefs.iter().enumerate() {
         let (start, end) = list_span(&lists, index, names.len());
-        out[at].fields = names[start..end].to_vec();
+        out[at].fields = names[start..end]
+            .iter()
+            .map(|name| ClrField {
+                name: name.clone(),
+                signature: None,
+            })
+            .collect();
     }
 }
 
@@ -1143,17 +1191,23 @@ fn attach_methods(
     out: &mut [ClrType],
     typedefs: &[(usize, u32, u32)],
     recs: &[(String, u32)],
-    param_names: &[String],
+    params: &[(u16, String)],
 ) {
     let param_lists: Vec<u32> = recs.iter().map(|rec| rec.1).collect();
     let methods: Vec<ClrMethod> = recs
         .iter()
         .enumerate()
         .map(|(index, (name, _))| {
-            let (start, end) = list_span(&param_lists, index, param_names.len());
+            let (start, end) = list_span(&param_lists, index, params.len());
             ClrMethod {
                 name: name.clone(),
-                params: param_names[start..end].to_vec(),
+                params: params[start..end]
+                    .iter()
+                    .map(|(sequence, name)| ClrParam {
+                        name: name.clone(),
+                        sequence: *sequence,
+                    })
+                    .collect(),
                 signature: None,
                 il: Vec::new(),
                 rva: 0,
@@ -1989,7 +2043,7 @@ mod tests {
         assert_eq!(types[1].name, "Other");
         assert_eq!(types[1].namespace, "");
         assert_eq!(types[1].methods, vec![clr_method("Done", &[])]);
-        assert_eq!(types[1].fields, vec!["Fld".to_string()]);
+        assert_eq!(types[1].fields, vec![clr_field("Fld")]);
     }
 
     #[test]
@@ -2026,10 +2080,10 @@ mod tests {
         let types = read_metadata_names(&file, Some(0), &streams).types;
         assert_eq!(types[0].name, "App");
         assert_eq!(types[0].namespace, "Ns");
-        assert_eq!(types[0].fields, vec!["Fld".to_string()]);
+        assert_eq!(types[0].fields, vec![clr_field("Fld")]);
         assert_eq!(types[0].methods, vec![clr_method("Run", &[])]);
         assert_eq!(types[1].name, "Other");
-        assert_eq!(types[1].fields, vec!["More".to_string()]);
+        assert_eq!(types[1].fields, vec![clr_field("More")]);
         assert_eq!(types[1].methods, vec![clr_method("Done", &[])]);
     }
 
@@ -2052,8 +2106,8 @@ mod tests {
             tilde.extend_from_slice(&params.to_le_bytes());
         }
         tilde.extend_from_slice(&1u16.to_le_bytes());
-        for name in [17u16, 19u16, 21u16] {
-            tilde.extend_from_slice(&0u16.to_le_bytes());
+        for (seq, name) in [(1u16, 17u16), (2u16, 19u16), (1u16, 21u16)] {
+            tilde.extend_from_slice(&seq.to_le_bytes());
             tilde.extend_from_slice(&0u16.to_le_bytes());
             tilde.extend_from_slice(&name.to_le_bytes());
         }
@@ -2066,8 +2120,8 @@ mod tests {
         assert_eq!(
             types[0].methods,
             vec![
-                clr_method("Run", &["a", "b"]),
-                clr_method("Stop", &["c"])
+                clr_method("Run", &[("a", 1), ("b", 2)]),
+                clr_method("Stop", &[("c", 1)])
             ]
         );
     }
@@ -2091,14 +2145,85 @@ mod tests {
         assert_eq!(meta.member_refs, vec!["Write".to_string(), "Read".to_string()]);
     }
 
-    fn clr_method(name: &str, params: &[&str]) -> ClrMethod {
+    fn clr_method(name: &str, params: &[(&str, u16)]) -> ClrMethod {
         ClrMethod {
             name: name.to_string(),
-            params: params.iter().map(|param| (*param).to_string()).collect(),
+            params: params
+                .iter()
+                .map(|(param, sequence)| ClrParam {
+                    name: (*param).to_string(),
+                    sequence: *sequence,
+                })
+                .collect(),
             signature: None,
             il: Vec::new(),
             rva: 0,
         }
+    }
+
+    fn clr_field(name: &str) -> ClrField {
+        ClrField {
+            name: name.to_string(),
+            signature: None,
+        }
+    }
+
+    #[test]
+    fn clr_field_signature_from_the_blob() {
+        // Field rows: flags, name, signature blob index. Blob index 0 stays empty.
+        let mut tilde = tilde_header((1 << 2) | (1 << 4), &[1, 2]);
+        tilde.extend_from_slice(&0u32.to_le_bytes());
+        tilde.extend_from_slice(&1u16.to_le_bytes());
+        tilde.extend_from_slice(&0u16.to_le_bytes());
+        tilde.extend_from_slice(&0u16.to_le_bytes());
+        tilde.extend_from_slice(&1u16.to_le_bytes());
+        tilde.extend_from_slice(&1u16.to_le_bytes());
+        tilde.extend_from_slice(&0u16.to_le_bytes());
+        tilde.extend_from_slice(&5u16.to_le_bytes());
+        tilde.extend_from_slice(&1u16.to_le_bytes());
+        tilde.extend_from_slice(&0u16.to_le_bytes());
+        tilde.extend_from_slice(&9u16.to_le_bytes());
+        tilde.extend_from_slice(&0u16.to_le_bytes());
+        let mut strings = vec![0u8];
+        strings.extend_from_slice(b"App\0Fld\0Blank\0");
+        let mut file = tilde.clone();
+        let strings_at = file.len() as u32;
+        file.extend_from_slice(&strings);
+        let blob_at = file.len() as u32;
+        // Entry 1: length 2, field calling convention, int32.
+        file.extend_from_slice(&[0x00, 0x02, 0x06, 0x08]);
+        let streams = vec![
+            ClrStream {
+                name: "#~".into(),
+                offset: 0,
+                size: strings_at,
+            },
+            ClrStream {
+                name: "#Strings".into(),
+                offset: strings_at,
+                size: strings.len() as u32,
+            },
+            ClrStream {
+                name: "#Blob".into(),
+                offset: blob_at,
+                size: 4,
+            },
+        ];
+        let types = read_metadata_names(&file, Some(0), &streams).types;
+        assert_eq!(types[0].name, "App");
+        assert_eq!(
+            types[0].fields,
+            vec![
+                ClrField {
+                    name: "Fld".into(),
+                    signature: Some("field int32".into()),
+                },
+                ClrField {
+                    name: "Blank".into(),
+                    signature: None,
+                },
+            ]
+        );
     }
 
     #[test]
