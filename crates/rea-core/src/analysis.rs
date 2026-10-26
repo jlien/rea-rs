@@ -652,6 +652,9 @@ pub fn data_xrefs(target: &Target, addr: u64) -> Vec<XRef> {
     for sec in code_sections(target) {
         let start = sec.file_offset as usize;
         let end = start.saturating_add(sec.size as usize).min(target.bytes.len());
+        if start >= end {
+            continue;
+        }
         let mut i = start;
         while i + width <= end {
             if &target.bytes[i..i + width] == needle {
@@ -900,6 +903,35 @@ mod tests {
         let refs = data_xrefs(&target, 0x1000);
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].from, 0x1002);
+    }
+
+    #[test]
+    fn data_xrefs_survive_a_hostile_section_file_offset() {
+        // A section whose file_offset is u64::MAX: start saturates to
+        // usize::MAX, end clamps to the file length, and the old loop
+        // condition `i + width <= end` overflowed before comparing.
+        let bytes = vec![0x90u8; 8];
+        let target = Target {
+            path: "synthetic".into(),
+            format: crate::Format::Elf,
+            arch: Arch::X86,
+            bits: 32,
+            little_endian: true,
+            entry: 0,
+            sections: vec![crate::Section {
+                name: "hostile".into(),
+                addr: 0x1000,
+                size: 1,
+                file_offset: u64::MAX,
+                perms: "---".into(),
+                sh_type: None,
+                sh_flags: None,
+            }],
+            symbols: vec![],
+            bytes,
+            page_map: None,
+        };
+        assert!(data_xrefs(&target, 0x1000).is_empty());
     }
 
     #[test]
