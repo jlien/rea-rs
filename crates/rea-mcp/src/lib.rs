@@ -374,7 +374,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "rea_sections",
-            "description": "List sections of a binary with names, virtual addresses, sizes, file offsets, and rwx permissions. Optional arch selects a Mach-O slice (arm64, x86_64, arm, x86). The default is the host slice.",
+            "description": "List sections of a binary with names, virtual addresses, sizes, file offsets, and rwx permissions. ELF sections also carry the sh_type name (PROGBITS, NOBITS, ...) and SHF_ flags beyond the rwx bits. Optional arch selects a Mach-O slice (arm64, x86_64, arm, x86). The default is the host slice.",
             "inputSchema": schema(false, json!({
                 "arch": { "type": "string", "description": "Mach-O slice. Default is the host slice." }
             }), &[]),
@@ -454,7 +454,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "rea_elf",
-            "description": "ELF file type, machine, interpreter, needed libraries, soname, rpath, runpath, GNU build-id, and rpath or runpath file hits.",
+            "description": "ELF file type, machine, interpreter, needed libraries, soname, rpath, runpath, GNU build-id, notes from PT_NOTE segments and SHT_NOTE sections, decoded GNU property bits, and rpath or runpath file hits.",
             "inputSchema": schema(true, json!({}), &[]),
         }),
         json!({

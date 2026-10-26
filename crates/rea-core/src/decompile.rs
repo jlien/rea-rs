@@ -677,6 +677,8 @@ mod tests {
                 size: bytes.len() as u64,
                 file_offset: 0,
                 perms: "r-x".into(),
+                sh_type: None,
+                sh_flags: None,
             }],
             symbols: Vec::new(),
             bytes,

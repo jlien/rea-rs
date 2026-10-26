@@ -81,6 +81,14 @@ pub struct Section {
     /// `SHF_ALLOC` is reported as readable. PE uses the section memory bits.
     /// LE uses object flags 0x1, 0x2, and 0x4.
     pub perms: String,
+    /// ELF only: `sh_type` name (`PROGBITS`, `NOBITS`, `DYNAMIC`, ...), `0x…` for
+    /// unknown ids. `None` for other formats.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sh_type: Option<String>,
+    /// ELF only: `SHF_` flag names not already visible in `perms` (WRITE, ALLOC,
+    /// and EXECINSTR are excluded). `None` for other formats.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sh_flags: Option<Vec<String>>,
 }
 
 /// Format read, write, and execute as `rwx`, with `-` for a missing bit.
