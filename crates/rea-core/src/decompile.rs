@@ -127,7 +127,7 @@ fn walk(
                     && remaining > 0);
                 match t {
                     Some(t) if followable => {
-                        let gap_end = insn.addr + insn.size as u64;
+                        let gap_end = insn.addr.saturating_add(insn.size as u64);
                         let gap = if t > gap_end {
                             scan_gap(target, gap_end, t)
                         } else {
@@ -162,7 +162,7 @@ fn walk(
             break;
         }
         let last = chunk.last().unwrap();
-        cur = last.addr + last.size as u64;
+        cur = last.addr.saturating_add(last.size as u64);
     }
     Ok((out, skipped, gaps))
 }
@@ -173,7 +173,7 @@ fn walk(
 fn scan_gap(target: &Target, from: u64, to: u64) -> Option<Vec<disasm::Instruction>> {
     let insns = disasm::disassemble(target, from, MAX_GAP).ok()?;
     let last = insns.last()?;
-    if last.addr + (last.size as u64) < to {
+    if last.addr.saturating_add(last.size as u64) < to {
         return None;
     }
     Some(insns.into_iter().take_while(|i| i.addr < to).collect())
@@ -185,11 +185,14 @@ fn scan_gap(target: &Target, from: u64, to: u64) -> Option<Vec<disasm::Instructi
 fn function_bounds(target: &Target, addr: u64) -> (u64, u64) {
     let covered = analysis::discover_functions(target)
         .iter()
-        .find(|f| f.addr <= addr && addr < f.addr + f.size)
-        .map(|f| (f.addr, f.addr + f.size));
+        .find(|f| f.addr <= addr && addr - f.addr < f.size)
+        .map(|f| {
+            let size = f.size;
+            (f.addr, f.addr.saturating_add(size))
+        });
     covered.unwrap_or_else(|| {
         let (size, _) = analysis::function_body(target, addr, 0x20000);
-        (addr, addr + size)
+        (addr, addr.saturating_add(size))
     })
 }
 
@@ -859,6 +862,64 @@ mod tests {
         assert!(text.contains("v1 = dword ptr [rip"), "{text}");
         assert!(text.contains("  return;\n"), "{text}");
         assert!(!text.contains("return (int)"), "{text}");
+    }
+
+    #[test]
+    fn decompiling_a_body_whose_section_reaches_u64_max_does_not_panic() {
+        // Regression: `ins.addr + ins.size` overflowed for an instruction at
+        // u64::MAX - 1, and `s.addr + s.size` overflowed in vaddr_to_offset.
+        // A 2-byte insn at 0xffff_ffff_ffff_fffe reaches both.
+        let mut bytes = vec![0u8; 16];
+        bytes[..2].copy_from_slice(&[0x66, 0x90]); // xchg ax, ax: 2 bytes
+        let high = 0xffff_ffff_ffff_fffeu64;
+        let t = Target {
+            path: "fixture".into(),
+            format: Format::Elf,
+            arch: Arch::X86_64,
+            bits: 64,
+            little_endian: true,
+            entry: high,
+            sections: vec![Section {
+                name: ".text".into(),
+                addr: high,
+                size: 8,
+                file_offset: 0,
+                perms: "r-x".into(),
+                sh_type: None,
+                sh_flags: None,
+            }],
+            symbols: Vec::new(),
+            page_map: None,
+            bytes,
+        };
+        let _ = decompile(&t, high, 4); // must simply not panic
+    }
+
+    #[test]
+    fn decompiling_a_section_with_a_hostile_file_offset_does_not_panic() {
+        // Regression: prologue_starts computed `file_offset + size` before
+        // the length check, overflowing for file_offset near usize::MAX.
+        let t = Target {
+            path: "fixture".into(),
+            format: Format::Elf,
+            arch: Arch::X86_64,
+            bits: 64,
+            little_endian: true,
+            entry: 0x1000,
+            sections: vec![Section {
+                name: ".text".into(),
+                addr: 0x1000,
+                size: 8,
+                file_offset: 0xffff_ffff_ffff_fff0,
+                perms: "r-x".into(),
+                sh_type: None,
+                sh_flags: None,
+            }],
+            symbols: Vec::new(),
+            page_map: None,
+            bytes: vec![0x90; 16],
+        };
+        let _ = decompile(&t, 0x1000, 4); // must simply not panic
     }
 
     #[test]

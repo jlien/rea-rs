@@ -186,8 +186,11 @@ impl Target {
             return pm.translate(vaddr);
         }
         self.sections.iter().find_map(|s| {
-            (vaddr >= s.addr && vaddr < s.addr + s.size)
-                .then(|| s.file_offset + (vaddr - s.addr))
+            if vaddr < s.addr {
+                return None;
+            }
+            let off = vaddr - s.addr;
+            (off < s.size).then(|| s.file_offset.wrapping_add(off))
         })
     }
 

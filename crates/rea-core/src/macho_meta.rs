@@ -614,11 +614,21 @@ fn hash_slots(cd: &[u8], cd_len: usize) -> Vec<MachoHashSlot> {
         let Some(special_at) = hash_off.checked_sub(span) else {
             return out;
         };
-        for i in 0..n_special {
-            let index = -((n_special - i) as i32);
-            let at = special_at + i * hash_size;
-            if let Some(digest) = digest_at(cd, cd_len, at, hash_size) {
-                out.push(MachoHashSlot { index, digest });
+        // Slots ascend from special_at; only those inside the directory
+        // carry a digest, so stop at the first one past the end instead of
+        // walking a hostile count.
+        if special_at < cd_len {
+            for i in 0..n_special {
+                // nSpecialSlots can be any u32; the index is -(n - i) and
+                // must not negate through i32::MIN.
+                let index = -(i64::from(n_special as u32) - i as i64) as i32;
+                let at = special_at + i * hash_size;
+                if at >= cd_len {
+                    break;
+                }
+                if let Some(digest) = digest_at(cd, cd_len, at, hash_size) {
+                    out.push(MachoHashSlot { index, digest });
+                }
             }
         }
     }
@@ -1207,6 +1217,57 @@ mod tests {
                 MachoHashSlot { index: 0, digest: "ccdd".into() },
             ]
         );
+    }
+
+    #[test]
+    fn a_hostile_special_slot_count_does_not_panic() {
+        // nSpecialSlots = 0x80000000 truncates to i32::MIN; the negation
+        // used to abort. hashOffset 0x80000000 puts every special slot past
+        // the 48-byte directory, so none is readable.
+        let mut cd = vec![0u8; 48];
+        write_be(&mut cd, 0, 0xfade_0c02);
+        write_be(&mut cd, 4, 48);
+        write_be(&mut cd, 8, 0x2_0000);
+        write_be(&mut cd, 16, 0x8000_0000); // hashOffset
+        write_be(&mut cd, 20, 44);
+        write_be(&mut cd, 24, 0x8000_0000); // nSpecialSlots
+        write_be(&mut cd, 28, 0); // nCodeSlots
+        cd[36] = 1; // hashSize
+        cd[37] = 2; // sha256
+        cd[44..46].copy_from_slice(b"i\0");
+
+        let blob_len = (20 + cd.len()) as u32;
+        let mut blob = vec![0u8; blob_len as usize];
+        write_be(&mut blob, 0, 0xfade_0cc0);
+        write_be(&mut blob, 4, blob_len);
+        write_be(&mut blob, 8, 1);
+        write_be(&mut blob, 12, 0);
+        write_be(&mut blob, 16, 20);
+        blob[20..].copy_from_slice(&cd);
+
+        let mut file = Vec::new();
+        let mut push = |v: u32| file.extend_from_slice(&v.to_le_bytes());
+        push(0xfeed_facf);
+        push(0x0100_000c);
+        push(0);
+        push(1);
+        push(1);
+        push(16);
+        push(0);
+        push(0);
+        push(0x1d);
+        push(16);
+        push(48);
+        push(blob.len() as u32);
+        file.extend_from_slice(&blob);
+
+        let got = facts(&file).unwrap();
+        let sig = got.signature.expect("signature");
+        assert_eq!(sig.special_slots, 0x8000_0000);
+        // The walk stops at the directory end: 48 single-byte slots read.
+        assert_eq!(sig.hashes.len(), 48);
+        // The first index is i32::MIN, computed without negation overflow.
+        assert_eq!(sig.hashes[0].index, i32::MIN);
     }
 
     #[test]

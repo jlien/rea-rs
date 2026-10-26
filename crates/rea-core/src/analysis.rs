@@ -58,7 +58,7 @@ fn sweep_call_targets(target: &Target, sec: &crate::Section) -> Vec<u64> {
     let _ = cs.set_skipdata(true); // treat unknown bytes as data, keep going
 
     let start = sec.file_offset as usize;
-    let end = (start + sec.size as usize).min(target.bytes.len());
+    let end = start.saturating_add(sec.size as usize).min(target.bytes.len());
     if start >= end {
         return Vec::new();
     }
@@ -68,7 +68,7 @@ fn sweep_call_targets(target: &Target, sec: &crate::Section) -> Vec<u64> {
     let mut targets = Vec::new();
     let mut pos = 0usize;
     while pos < code.len() {
-        match cs.disasm_count(&code[pos..], base + pos as u64, 64) {
+        match cs.disasm_count(&code[pos..], base.saturating_add(pos as u64), 64) {
             Ok(insns) if !insns.is_empty() => {
                 let mut consumed = 0usize;
                 for ins in insns.iter() {
@@ -94,7 +94,7 @@ fn sweep_call_targets(target: &Target, sec: &crate::Section) -> Vec<u64> {
 /// (`80 b5`) at even virtual addresses. Unknown yields nothing.
 fn prologue_starts(target: &Target, sec: &crate::Section) -> Vec<u64> {
     let start = sec.file_offset as usize;
-    let end = start + sec.size as usize;
+    let end = start.saturating_add(sec.size as usize);
     if end > target.bytes.len() {
         return Vec::new();
     }
@@ -118,7 +118,7 @@ fn scan_prologue_bytes(
     let mut i = start;
     while i + needle.len() <= end {
         if &target.bytes[i..i + needle.len()] == needle {
-            out.push(sec.addr + (i - start) as u64);
+            out.push(sec.addr.saturating_add((i - start) as u64));
         }
         i += 1;
     }
@@ -146,7 +146,7 @@ fn scan_arm64_stp_prologues(
         let masked = word & 0xFFC0_7FFF;
         // pre-index `stp x29, x30, [sp, #imm]!` or signed-offset form.
         if masked == 0xA980_7BFD || masked == 0xA900_7BFD {
-            out.push(sec.addr + (i - start) as u64);
+            out.push(sec.addr.saturating_add((i - start) as u64));
         }
         i += 4;
     }
@@ -166,7 +166,7 @@ fn scan_thumb_push_prologues(
     let mut i = start + misalign;
     while i + 2 <= end {
         if target.bytes[i] == 0x80 && target.bytes[i + 1] == 0xb5 {
-            out.push(sec.addr + (i - start) as u64);
+            out.push(sec.addr.saturating_add((i - start) as u64));
         }
         i += 2;
     }
@@ -196,7 +196,7 @@ pub(crate) fn function_body(target: &Target, start: u64, max: u64) -> (u64, Vec<
         let mut jumped = false;
         for ins in &insns {
             visited.insert(ins.addr);
-            end = end.max(ins.addr + ins.size as u64);
+            end = end.max(ins.addr.saturating_add(ins.size as u64));
             match ins.mnemonic.as_str() {
                 // Exact mnemonics: `b` must not swallow `bl` or `b.ne`,
                 // and `bl` must not swallow `blr`. Thumb `blx` is a call.
@@ -236,7 +236,7 @@ pub(crate) fn function_body(target: &Target, start: u64, max: u64) -> (u64, Vec<
         if !jumped {
             // chunk ran out without a terminator: keep going linearly
             if let Some(last) = insns.last() {
-                let next = last.addr + last.size as u64;
+                let next = last.addr.saturating_add(last.size as u64);
                 if next < start.saturating_add(max) {
                     work.push(next);
                 }
@@ -393,7 +393,7 @@ fn pc_relative_index(target: &Target) -> BTreeMap<u64, Vec<u64>> {
         .filter(|sec| sec.size > 0 && matches!(sec.name.as_str(), "__text" | ".text"))
     {
         let start = sec.file_offset as usize;
-        let end = (start + sec.size as usize).min(target.bytes.len());
+        let end = start.saturating_add(sec.size as usize).min(target.bytes.len());
         if start >= end {
             continue;
         }
@@ -651,12 +651,12 @@ pub fn data_xrefs(target: &Target, addr: u64) -> Vec<XRef> {
     let mut out = Vec::new();
     for sec in code_sections(target) {
         let start = sec.file_offset as usize;
-        let end = (start + sec.size as usize).min(target.bytes.len());
+        let end = start.saturating_add(sec.size as usize).min(target.bytes.len());
         let mut i = start;
         while i + width <= end {
             if &target.bytes[i..i + width] == needle {
                 out.push(XRef {
-                    from: sec.addr + (i - start) as u64,
+                    from: sec.addr.saturating_add((i - start) as u64),
                     to: addr,
                 });
             }
@@ -682,7 +682,7 @@ fn code_pointer_index(target: &Target) -> BTreeMap<u64, Vec<u64>> {
     let mut index: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
     for sec in code_sections(target) {
         let start = sec.file_offset as usize;
-        let end = (start + sec.size as usize).min(target.bytes.len());
+        let end = start.saturating_add(sec.size as usize).min(target.bytes.len());
         if start >= end {
             continue;
         }
@@ -710,7 +710,7 @@ fn code_pointer_index(target: &Target) -> BTreeMap<u64, Vec<u64>> {
             index
                 .entry(key)
                 .or_default()
-                .push(sec.addr + (i - start) as u64);
+                .push(sec.addr.saturating_add((i - start) as u64));
         }
     }
     index
