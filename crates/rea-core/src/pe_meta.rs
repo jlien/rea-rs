@@ -74,7 +74,7 @@ pub struct PePdb {
     pub age: u32,
 }
 
-/// Leading `IMAGE_COR20_HEADER` fields, the BSJB version string, metadata stream headers, table row counts, and type, field, method, parameter, member-ref, and module-ref names.
+/// Leading `IMAGE_COR20_HEADER` fields, the BSJB version string, metadata stream headers, table row counts, and type, field, method, parameter, member-ref, module-ref, and assembly names.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ClrHeader {
     pub major_runtime: u16,
@@ -95,12 +95,39 @@ pub struct ClrHeader {
     pub member_refs: Vec<String>,
     /// Method or field signature for each `member_refs` entry. `None` when the blob is missing or does not fit.
     pub member_ref_signatures: Vec<Option<String>>,
-    /// `Assembly` names, in table order.
-    pub assemblies: Vec<String>,
-    /// `AssemblyRef` names, in table order.
-    pub assembly_refs: Vec<String>,
+    /// One `ClrAssembly` per `Assembly` row, in table order.
+    pub assemblies: Vec<ClrAssembly>,
+    /// One `ClrAssembly` per `AssemblyRef` row, in table order.
+    pub assembly_refs: Vec<ClrAssembly>,
     /// `ModuleRef` names, in table order.
     pub module_refs: Vec<String>,
+}
+
+/// A metadata blob: its byte length plus hex of at most the first 32 bytes.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ClrBlob {
+    /// Full byte length of the blob.
+    pub len: usize,
+    /// Lowercase hex of the first 32 bytes.
+    pub hex: String,
+}
+
+/// Version numbers, name, culture, and public-key blob from one `Assembly` or `AssemblyRef` row.
+///
+/// On `Assembly` the blob is the public key; on `AssemblyRef` it is the public-key-or-token. The hash-algorithm id and the flags word are not reported, and no strong-name check runs.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ClrAssembly {
+    pub major_version: u16,
+    pub minor_version: u16,
+    pub build_number: u16,
+    pub revision_number: u16,
+    /// Assembly name.
+    pub name: String,
+    /// Culture string. Empty when absent.
+    pub culture: String,
+    /// Blob length plus hex of at most the first 32 bytes. `None` when the blob index is 0 or the blob does not fit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<ClrBlob>,
 }
 
 /// A type or module name from the metadata tables.
@@ -656,8 +683,8 @@ struct MetaRead {
     types: Vec<ClrType>,
     member_refs: Vec<String>,
     member_ref_signatures: Vec<Option<String>>,
-    assemblies: Vec<String>,
-    assembly_refs: Vec<String>,
+    assemblies: Vec<ClrAssembly>,
+    assembly_refs: Vec<ClrAssembly>,
     module_refs: Vec<String>,
 }
 
@@ -676,7 +703,7 @@ impl MetaRead {
 
 /// `Module`, `TypeRef`, and `TypeDef` names, plus `Field` and `MethodDef` names on each `TypeDef`, `Param` names on each method, `MemberRef` names, and `InterfaceImpl` names on each `TypeDef`.
 ///
-/// `FieldPtr`, `MethodPtr`, and `ParamPtr` are skipped by row size; `InterfaceImpl` rows are read, which keeps later tables aligned the same way a skip does. The pointer tables are not applied. String, blob, and coded-index widths follow the `#~` heap-size byte and the row counts. A row that does not fit ends the list and keeps the names already read. Signatures, RVAs, and IL are not read.
+/// `FieldPtr`, `MethodPtr`, and `ParamPtr` are skipped by row size; `InterfaceImpl` rows are read, which keeps later tables aligned the same way a skip does. The pointer tables are not applied. String, blob, and coded-index widths follow the `#~` heap-size byte and the row counts. A row that does not fit ends the list and keeps the names already read. `Assembly` and `AssemblyRef` rows carry their version numbers, culture, and public-key blob through `enrich_metadata`. Signatures, RVAs, and IL are not read.
 fn read_metadata_names(
     file: &[u8],
     metadata_off: Option<usize>,
@@ -974,14 +1001,19 @@ fn read_metadata_names(
     }
 }
 
-/// Field and method signatures, assembly, assembly-ref, and module-ref names, properties, and events. A row that does not fit keeps what was already read.
+/// Field and method signatures, assembly, assembly-ref, and module-ref rows, properties, and events. A row that does not fit keeps what was already read.
 fn enrich_metadata(
     types: &mut [ClrType],
     member_refs: &[String],
     blobs: Option<&[u8]>,
     tilde: &[u8],
     strings: &[u8],
-) -> (Vec<Option<String>>, Vec<String>, Vec<String>, Vec<String>) {
+) -> (
+    Vec<Option<String>>,
+    Vec<ClrAssembly>,
+    Vec<ClrAssembly>,
+    Vec<String>,
+) {
     let none_sigs = vec![None; member_refs.len()];
     if tilde.len() < 24 {
         return (none_sigs, Vec::new(), Vec::new(), Vec::new());
@@ -1205,8 +1237,34 @@ fn enrich_metadata(
                     ));
                 }
                 26 => module_refs.push(heap_string(strings, read_index(row, 0, str_w))),
-                32 => assemblies.push(heap_string(strings, read_index(row, 16 + blob_w, str_w))),
-                35 => assembly_refs.push(heap_string(strings, read_index(row, 12 + blob_w, str_w))),
+                32 => {
+                    let public_key = blobs
+                        .and_then(|heap| heap_blob(heap, read_index(row, 16, blob_w)))
+                        .map(render_blob);
+                    assemblies.push(ClrAssembly {
+                        major_version: u16::from_le_bytes([row[4], row[5]]),
+                        minor_version: u16::from_le_bytes([row[6], row[7]]),
+                        build_number: u16::from_le_bytes([row[8], row[9]]),
+                        revision_number: u16::from_le_bytes([row[10], row[11]]),
+                        name: heap_string(strings, read_index(row, 16 + blob_w, str_w)),
+                        culture: heap_string(strings, read_index(row, 16 + blob_w + str_w, str_w)),
+                        public_key,
+                    });
+                }
+                35 => {
+                    let public_key = blobs
+                        .and_then(|heap| heap_blob(heap, read_index(row, 12, blob_w)))
+                        .map(render_blob);
+                    assembly_refs.push(ClrAssembly {
+                        major_version: u16::from_le_bytes([row[0], row[1]]),
+                        minor_version: u16::from_le_bytes([row[2], row[3]]),
+                        build_number: u16::from_le_bytes([row[4], row[5]]),
+                        revision_number: u16::from_le_bytes([row[6], row[7]]),
+                        name: heap_string(strings, read_index(row, 12 + blob_w, str_w)),
+                        culture: heap_string(strings, read_index(row, 12 + blob_w + str_w, str_w)),
+                        public_key,
+                    });
+                }
                 _ => {}
             }
             cursor = end;
@@ -1457,6 +1515,47 @@ fn heap_string(strings: &[u8], index: u32) -> String {
     let rest = &strings[start..];
     let end = rest.iter().position(|byte| *byte == 0).unwrap_or(rest.len());
     String::from_utf8_lossy(&rest[..end.min(512)]).into_owned()
+}
+
+/// Blob-heap bytes at `index`. `None` for index 0, a length prefix that does not fit, or a blob past the heap.
+fn heap_blob(blobs: &[u8], index: u32) -> Option<&[u8]> {
+    let mut at = index as usize;
+    if at == 0 || at >= blobs.len() {
+        return None;
+    }
+    let first = blobs[at];
+    at += 1;
+    let len = if first < 0x80 {
+        usize::from(first)
+    } else if first < 0xC0 {
+        let second = *blobs.get(at)?;
+        at += 1;
+        (usize::from(first & 0x3f) << 8) | usize::from(second)
+    } else {
+        // Four bytes total from the first byte, masked to 29 bits
+        // (ECMA-335 II.24.2.4). The first byte counts as data, so nothing
+        // is skipped.
+        let raw: [u8; 4] = blobs.get(at - 1..at + 3)?.try_into().ok()?;
+        at += 3;
+        (u32::from_be_bytes(raw) & 0x1fff_ffff) as usize
+    };
+    let end = at.checked_add(len)?;
+    if end > blobs.len() {
+        return None;
+    }
+    Some(&blobs[at..end])
+}
+
+/// Blob length plus hex of at most the first 32 bytes.
+fn render_blob(bytes: &[u8]) -> ClrBlob {
+    ClrBlob {
+        len: bytes.len(),
+        hex: bytes
+            .iter()
+            .take(32)
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    }
 }
 
 pub fn facts(bytes: &[u8]) -> Result<PeFacts> {
@@ -2098,6 +2197,19 @@ mod tests {
         (file, streams)
     }
 
+    /// `with_strings` plus a `#Blob` heap appended after the strings.
+    fn with_blobs(tilde: &[u8], strings: &[u8], blobs: &[u8]) -> (Vec<u8>, Vec<ClrStream>) {
+        let (mut file, mut streams) = with_strings(tilde, strings);
+        let blob_at = file.len() as u32;
+        file.extend_from_slice(blobs);
+        streams.push(ClrStream {
+            name: "#Blob".into(),
+            offset: blob_at,
+            size: blobs.len() as u32,
+        });
+        (file, streams)
+    }
+
     #[test]
     fn clr_type_names_from_module_and_typedef() {
         let mut tilde = tilde_header(1 | (1 << 2), &[1, 1]);
@@ -2590,7 +2702,18 @@ mod tests {
         names.extend_from_slice(b"Demo\0");
         let (file, streams) = with_strings(&assembly, &names);
         let meta = read_metadata_names(&file, Some(0), &streams);
-        assert_eq!(meta.assemblies, vec!["Demo".to_string()]);
+        assert_eq!(
+            meta.assemblies,
+            vec![ClrAssembly {
+                major_version: 0,
+                minor_version: 0,
+                build_number: 0,
+                revision_number: 0,
+                name: "Demo".into(),
+                culture: String::new(),
+                public_key: None,
+            }]
+        );
 
         let mut assembly_ref = tilde_header(1u64 << 35, &[1]);
         assembly_ref.extend_from_slice(&[0u8; 12]);
@@ -2600,7 +2723,18 @@ mod tests {
         assembly_ref.extend_from_slice(&0u16.to_le_bytes());
         let (file, streams) = with_strings(&assembly_ref, &names);
         let meta = read_metadata_names(&file, Some(0), &streams);
-        assert_eq!(meta.assembly_refs, vec!["Demo".to_string()]);
+        assert_eq!(
+            meta.assembly_refs,
+            vec![ClrAssembly {
+                major_version: 0,
+                minor_version: 0,
+                build_number: 0,
+                revision_number: 0,
+                name: "Demo".into(),
+                culture: String::new(),
+                public_key: None,
+            }]
+        );
 
         let mut props = tilde_header((1 << 2) | (1 << 21) | (1 << 23), &[1, 1, 1]);
         props.extend_from_slice(&0u32.to_le_bytes());
@@ -2896,5 +3030,166 @@ mod tests {
         over[16..].fill(b'a');
         let big = cor20_header(2, 5, 0x2000, 16 + 257, 1, 1);
         assert!(parse_clr(&big, &over, Some(0)).unwrap().version.is_none());
+    }
+
+    #[test]
+    fn clr_assembly_row_carries_version_culture_and_public_key() {
+        // Hash-algorithm id, 1.2.3.4, flags, public-key blob index 1, name, culture.
+        let mut assembly = tilde_header(1u64 << 32, &[1]);
+        assembly.extend_from_slice(&0u32.to_le_bytes());
+        assembly.extend_from_slice(&1u16.to_le_bytes());
+        assembly.extend_from_slice(&2u16.to_le_bytes());
+        assembly.extend_from_slice(&3u16.to_le_bytes());
+        assembly.extend_from_slice(&4u16.to_le_bytes());
+        assembly.extend_from_slice(&0u32.to_le_bytes());
+        assembly.extend_from_slice(&1u16.to_le_bytes());
+        assembly.extend_from_slice(&1u16.to_le_bytes());
+        assembly.extend_from_slice(&6u16.to_le_bytes());
+        let mut names = vec![0u8];
+        names.extend_from_slice(b"Demo\0en-US\0");
+        let mut blobs = vec![0u8];
+        blobs.extend_from_slice(&[4, 0xde, 0xad, 0xbe, 0xef]);
+        let (file, streams) = with_blobs(&assembly, &names, &blobs);
+        let meta = read_metadata_names(&file, Some(0), &streams);
+        assert_eq!(
+            meta.assemblies,
+            vec![ClrAssembly {
+                major_version: 1,
+                minor_version: 2,
+                build_number: 3,
+                revision_number: 4,
+                name: "Demo".into(),
+                culture: "en-US".into(),
+                public_key: Some(ClrBlob {
+                    len: 4,
+                    hex: "deadbeef".into(),
+                }),
+            }]
+        );
+    }
+
+    #[test]
+    fn clr_assembly_ref_row_carries_token_and_versions() {
+        let mut assembly_ref = tilde_header(1u64 << 35, &[1]);
+        assembly_ref.extend_from_slice(&5u16.to_le_bytes());
+        assembly_ref.extend_from_slice(&6u16.to_le_bytes());
+        assembly_ref.extend_from_slice(&7u16.to_le_bytes());
+        assembly_ref.extend_from_slice(&8u16.to_le_bytes());
+        assembly_ref.extend_from_slice(&0u32.to_le_bytes());
+        assembly_ref.extend_from_slice(&1u16.to_le_bytes());
+        assembly_ref.extend_from_slice(&1u16.to_le_bytes());
+        assembly_ref.extend_from_slice(&0u16.to_le_bytes());
+        assembly_ref.extend_from_slice(&0u16.to_le_bytes());
+        let mut names = vec![0u8];
+        names.extend_from_slice(b"Demo\0");
+        // 40-byte blob under the two-byte length form; hex caps at 32 bytes.
+        let mut blobs = vec![0u8];
+        blobs.push(0x80);
+        blobs.push(40);
+        blobs.extend(0u8..40);
+        let (file, streams) = with_blobs(&assembly_ref, &names, &blobs);
+        let meta = read_metadata_names(&file, Some(0), &streams);
+        let reference = &meta.assembly_refs[0];
+        assert_eq!(
+            (
+                reference.major_version,
+                reference.minor_version,
+                reference.build_number,
+                reference.revision_number
+            ),
+            (5, 6, 7, 8)
+        );
+        assert_eq!(reference.name, "Demo");
+        assert_eq!(reference.culture, "");
+        let key = reference.public_key.as_ref().unwrap();
+        assert_eq!(key.len, 40);
+        assert_eq!(key.hex.len(), 64);
+        assert!(key.hex.starts_with("0001020304"));
+        assert!(key.hex.ends_with("1f"));
+    }
+
+    #[test]
+    fn clr_four_byte_blob_length_counts_the_first_byte() {
+        // ECMA-335 II.24.2.4: a first byte >= 0xC0 starts a four-byte
+        // little-endian... big-endian length covering the first byte, masked
+        // to 29 bits. [00, C0, 00, 00, 01, AA] at index 1 is a length of 1
+        // with payload AA; skipping the first byte would read 0x1AA and
+        // drop the blob.
+        let mut assembly = tilde_header(1u64 << 32, &[1]);
+        assembly.extend_from_slice(&0u32.to_le_bytes());
+        assembly.extend_from_slice(&1u16.to_le_bytes());
+        assembly.extend_from_slice(&2u16.to_le_bytes());
+        assembly.extend_from_slice(&3u16.to_le_bytes());
+        assembly.extend_from_slice(&4u16.to_le_bytes());
+        assembly.extend_from_slice(&0u32.to_le_bytes());
+        assembly.extend_from_slice(&1u16.to_le_bytes());
+        assembly.extend_from_slice(&1u16.to_le_bytes());
+        assembly.extend_from_slice(&0u16.to_le_bytes());
+        let mut names = vec![0u8];
+        names.extend_from_slice(b"Demo\0");
+        let mut blobs = vec![0u8];
+        blobs.extend_from_slice(&[0xC0, 0x00, 0x00, 0x01, 0xAA]);
+        let (file, streams) = with_blobs(&assembly, &names, &blobs);
+        let meta = read_metadata_names(&file, Some(0), &streams);
+        assert_eq!(
+            meta.assemblies[0].public_key,
+            Some(ClrBlob {
+                len: 1,
+                hex: "aa".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn clr_four_byte_blob_length_reads_a_16384_byte_blob() {
+        // The only legal encoding of a 16384-byte blob is C0 00 40 00 plus
+        // the payload; the old skip-first-byte decode inflated the length
+        // and returned None.
+        let mut assembly = tilde_header(1u64 << 32, &[1]);
+        assembly.extend_from_slice(&0u32.to_le_bytes());
+        assembly.extend_from_slice(&1u16.to_le_bytes());
+        assembly.extend_from_slice(&2u16.to_le_bytes());
+        assembly.extend_from_slice(&3u16.to_le_bytes());
+        assembly.extend_from_slice(&4u16.to_le_bytes());
+        assembly.extend_from_slice(&0u32.to_le_bytes());
+        assembly.extend_from_slice(&1u16.to_le_bytes());
+        assembly.extend_from_slice(&1u16.to_le_bytes());
+        assembly.extend_from_slice(&0u16.to_le_bytes());
+        let mut names = vec![0u8];
+        names.extend_from_slice(b"Demo\0");
+        let mut blobs = vec![0u8];
+        blobs.extend_from_slice(&[0xC0, 0x00, 0x40, 0x00]);
+        blobs.extend_from_slice(&vec![0x77u8; 16384]);
+        let (file, streams) = with_blobs(&assembly, &names, &blobs);
+        let meta = read_metadata_names(&file, Some(0), &streams);
+        let key = meta.assemblies[0].public_key.as_ref().unwrap();
+        assert_eq!(key.len, 16384);
+        assert_eq!(key.hex, "77".repeat(32));
+    }
+
+    #[test]
+    fn clr_blob_index_zero_or_past_the_heap_stays_empty() {
+        // Two Assembly rows: blob index 0, then an index past the heap. Names still read.
+        let mut assembly = tilde_header(1u64 << 32, &[2]);
+        assembly.extend_from_slice(&[0u8; 16]);
+        assembly.extend_from_slice(&0u16.to_le_bytes());
+        assembly.extend_from_slice(&1u16.to_le_bytes());
+        assembly.extend_from_slice(&0u16.to_le_bytes());
+        assembly.extend_from_slice(&[0u8; 16]);
+        assembly.extend_from_slice(&9u16.to_le_bytes());
+        assembly.extend_from_slice(&1u16.to_le_bytes());
+        assembly.extend_from_slice(&0u16.to_le_bytes());
+        let mut names = vec![0u8];
+        names.extend_from_slice(b"Demo\0");
+        // Blob at index 1 claims 4 bytes but carries 1.
+        let mut blobs = vec![0u8];
+        blobs.extend_from_slice(&[4, 0x01]);
+        let (file, streams) = with_blobs(&assembly, &names, &blobs);
+        let meta = read_metadata_names(&file, Some(0), &streams);
+        assert_eq!(meta.assemblies.len(), 2);
+        assert!(meta.assemblies[0].public_key.is_none());
+        assert!(meta.assemblies[1].public_key.is_none());
+        assert_eq!(meta.assemblies[0].name, "Demo");
+        assert_eq!(meta.assemblies[1].name, "Demo");
     }
 }

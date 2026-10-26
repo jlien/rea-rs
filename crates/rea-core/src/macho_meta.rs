@@ -486,12 +486,23 @@ fn cms_digest_present(directory: &[u8], cms: &[u8]) -> Option<bool> {
     if directory.len() < CODE_DIRECTORY_BASE {
         return None;
     }
-    let digest = match directory[37] {
+    let digest: Vec<u8> = match directory[37] {
         1 => crate::hash::sha1(directory).to_vec(),
         2 => crate::hash::sha256(directory).to_vec(),
+        3 => truncated_digest(&crate::hash::sha256(directory), directory[36] as usize)?,
+        4 => truncated_digest(&crate::hash::sha384(directory), directory[36] as usize)?,
         _ => return None,
     };
     Some(cms.windows(digest.len()).any(|window| window == digest.as_slice()))
+}
+
+/// Hash types 3 and 4 compare only the leading `hashSize` bytes of the digest.
+/// The size clamps to the digest length, so a size past the digest compares
+/// the whole digest; a zero size compares nothing and leaves `cms_verified`
+/// empty.
+fn truncated_digest(digest: &[u8], hash_size: usize) -> Option<Vec<u8>> {
+    let size = hash_size.min(digest.len());
+    (size > 0).then(|| digest[..size].to_vec())
 }
 
 fn superblob(bytes: &[u8], dataoff: u32, datasize: u32) -> Option<&[u8]> {
@@ -981,6 +992,94 @@ mod tests {
         push(blob.len() as u32);
         file.extend_from_slice(&blob);
         assert_eq!(facts(&file).unwrap().cms_verified, Some(true));
+    }
+
+    /// A code directory with the given hash type and `hashSize` byte.
+    fn code_directory_with_hash(hash_type: u8, hash_size: u8) -> Vec<u8> {
+        let mut cd = vec![0u8; 79];
+        write_be(&mut cd, 0, 0xfade_0c02);
+        write_be(&mut cd, 4, 79);
+        write_be(&mut cd, 8, 0x20200);
+        write_be(&mut cd, 20, 52);
+        cd[36] = hash_size;
+        cd[37] = hash_type;
+        write_be(&mut cd, 48, 68);
+        cd[52..68].copy_from_slice(b"com.example.app\0");
+        cd[68..79].copy_from_slice(b"TEAM123456\0");
+        cd
+    }
+
+    /// A superblob holding that directory plus a CMS blob of a filler byte and
+    /// `cms_digest`, so the window search has to slide.
+    fn signed_macho_with_cms_digest(cd: &[u8], cms_digest: &[u8]) -> Vec<u8> {
+        let cms_len = 9 + cms_digest.len();
+        let mut cms = vec![0u8; cms_len];
+        write_be(&mut cms, 0, 0x434d_532d);
+        write_be(&mut cms, 4, cms_len as u32);
+        cms[8] = 0x5a;
+        cms[9..].copy_from_slice(cms_digest);
+
+        let blob_len = 28 + cd.len() + cms.len();
+        let mut blob = vec![0u8; blob_len];
+        write_be(&mut blob, 0, 0xfade_0cc0);
+        write_be(&mut blob, 4, blob_len as u32);
+        write_be(&mut blob, 8, 2);
+        write_be(&mut blob, 12, 0x10000);
+        write_be(&mut blob, 16, (28 + cd.len()) as u32);
+        write_be(&mut blob, 20, 0);
+        write_be(&mut blob, 24, 28);
+        blob[28..28 + cd.len()].copy_from_slice(cd);
+        blob[28 + cd.len()..].copy_from_slice(&cms);
+
+        let mut file = Vec::new();
+        let mut push = |v: u32| file.extend_from_slice(&v.to_le_bytes());
+        push(0xfeed_facf);
+        push(0x0100_000c);
+        push(0);
+        push(1);
+        push(1);
+        push(16);
+        push(0);
+        push(0);
+        push(0x1d);
+        push(16);
+        push(48);
+        push(blob.len() as u32);
+        file.extend_from_slice(&blob);
+        file
+    }
+
+    #[test]
+    fn cms_window_matches_truncated_sha256_and_sha384_digests() {
+        // Type 3: the leading hashSize bytes of sha256.
+        let cd = code_directory_with_hash(3, 20);
+        let mut digest = crate::hash::sha256(&cd).to_vec();
+        digest.truncate(20);
+        let file = signed_macho_with_cms_digest(&cd, &digest);
+        assert_eq!(facts(&file).unwrap().cms_verified, Some(true));
+
+        // Type 4: sha384 truncated to hashSize bytes.
+        let cd = code_directory_with_hash(4, 32);
+        let mut digest = crate::hash::sha384(&cd).to_vec();
+        digest.truncate(32);
+        let file = signed_macho_with_cms_digest(&cd, &digest);
+        assert_eq!(facts(&file).unwrap().cms_verified, Some(true));
+
+        // A wrong truncated digest stays false.
+        let cd = code_directory_with_hash(3, 20);
+        let mut digest = crate::hash::sha256(&cd).to_vec();
+        digest.truncate(20);
+        digest[0] ^= 0xff;
+        let file = signed_macho_with_cms_digest(&cd, &digest);
+        assert_eq!(facts(&file).unwrap().cms_verified, Some(false));
+
+        // Types `none` and unassigned leave cms_verified empty.
+        let cd = code_directory_with_hash(0, 32);
+        let file = signed_macho_with_cms_digest(&cd, &[0u8; 20]);
+        assert_eq!(facts(&file).unwrap().cms_verified, None);
+        let cd = code_directory_with_hash(5, 20);
+        let file = signed_macho_with_cms_digest(&cd, &[0u8; 20]);
+        assert_eq!(facts(&file).unwrap().cms_verified, None);
     }
 
     /// A superblob with slot 0x10005 holding the XML `xml` and, when `der` is given, a DER slot after it.

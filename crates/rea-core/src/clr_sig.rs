@@ -69,6 +69,8 @@ pub fn property_sig(heap: &[u8], index: u32) -> Option<String> {
 }
 
 /// Opcode names from a tiny or fat method body. At most 48 instructions.
+/// Two-byte `0xFE` opcodes that take no operand are named; any other unknown
+/// byte, including an unmapped `0xFE` second byte, stops the listing.
 /// An unmapped or truncated body is empty.
 pub fn il_ops(bytes: &[u8]) -> Vec<String> {
     let Some((code, _size)) = il_code(bytes) else {
@@ -79,6 +81,31 @@ pub fn il_ops(bytes: &[u8]) -> Vec<String> {
     while at < code.len() && out.len() < 48 {
         let op = code[at];
         at += 1;
+        if op == 0xFE {
+            // Second byte of a two-byte opcode. Only operand-free names are
+            // walked; a `0xFE` outside that set stops the listing like any
+            // other unknown byte. Token operands and `u16` immediates stay
+            // unread, so no width is invented for them.
+            let Some(second) = code.get(at).copied() else {
+                break;
+            };
+            let name = match second {
+                0x01 => "ceq",
+                0x02 => "cgt",
+                0x03 => "cgt.un",
+                0x04 => "clt",
+                0x05 => "clt.un",
+                0x0f => "localloc",
+                0x11 => "endfilter",
+                _ => {
+                    out.push(format!("op-fe-{second:02x}"));
+                    break;
+                }
+            };
+            at += 1;
+            out.push(name.to_string());
+            continue;
+        }
         let Some(name) = opcode(op) else {
             out.push(format!("op-{op:02x}"));
             break;
@@ -162,6 +189,8 @@ fn opcode(op: u8) -> Option<&'static str> {
         0x5f => "and",
         0x60 => "or",
         0x61 => "xor",
+        // ECMA-335: ckfinite is the one-byte opcode 0xC3, not a 0xFE prefix.
+        0xc3 => "ckfinite",
         _ => return None,
     })
 }
@@ -250,6 +279,35 @@ mod tests {
         // codesize 2, ldarg.0, ret
         assert_eq!(il_ops(&[0x0a, 0x02, 0x2a]), vec!["ldarg.0".to_string(), "ret".to_string()]);
         assert!(il_ops(&[0x00]).is_empty());
+    }
+
+    #[test]
+    fn operand_free_prefix_opcodes_join_the_listing() {
+        // codesize 3: 0xFE 0x01 ceq, then ret.
+        assert_eq!(il_ops(&[0x0e, 0xfe, 0x01, 0x2a]), vec!["ceq".to_string(), "ret".to_string()]);
+        // Every operand-free second byte maps to its name.
+        for (second, name) in [
+            (0x01u8, "ceq"),
+            (0x02, "cgt"),
+            (0x03, "cgt.un"),
+            (0x04, "clt"),
+            (0x05, "clt.un"),
+            (0x0f, "localloc"),
+            (0x11, "endfilter"),
+        ] {
+            // codesize 2: the prefix opcode alone.
+            assert_eq!(il_ops(&[0x0a, 0xfe, second]), vec![name.to_string()]);
+        }
+        // A second byte outside the set — `ldftn` (0x06), whose token operand
+        // stays unread — stops the listing at the marker.
+        assert_eq!(il_ops(&[0x0a, 0xfe, 0x06]), vec!["op-fe-06".to_string()]);
+        // `readonly.` is 0xFE 0x1E, not ckfinite; it stays an unknown marker.
+        assert_eq!(il_ops(&[0x0a, 0xfe, 0x1e]), vec!["op-fe-1e".to_string()]);
+        // ckfinite is the one-byte opcode 0xC3 (ECMA-335); header 0x06 is a
+        // tiny body of one byte.
+        assert_eq!(il_ops(&[0x06, 0xc3]), vec!["ckfinite".to_string()]);
+        // A truncated prefix stops silently.
+        assert!(il_ops(&[0x0a, 0xfe]).is_empty());
     }
 
     #[test]

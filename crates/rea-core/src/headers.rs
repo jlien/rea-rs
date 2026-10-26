@@ -1,7 +1,7 @@
 //! C header text for names already recovered on a [`Target`](crate::Target).
 //!
-//! An Itanium demangle becomes a declaration. Any other local or export with
-//! a C identifier is `extern void name();`. Imports are omitted.
+//! An Itanium or MSVC demangle becomes a declaration. Any other local or
+//! export with a C identifier is `extern void name();`. Imports are omitted.
 
 use crate::{SymbolKind, Target};
 
@@ -34,7 +34,16 @@ pub fn emit(target: &Target) -> String {
 fn decl_from_demangled(demangled: &str) -> Option<String> {
     let (qual, params) = demangled.split_once('(')?;
     let params = params.strip_suffix(')')?;
-    let func = qual.rsplit("::").next().unwrap_or(qual);
+    // An MSVC demangle carries a return type before the name path
+    // (`int foo(int)`); an Itanium or Rust demangle does not. A name path in
+    // this subset never contains a space, so the return type is whatever
+    // precedes the last one. The return type is not parsed again from the raw
+    // `?` mangling — the demangled string is the only input.
+    let (ret, path) = match qual.rsplit_once(' ') {
+        Some((ret, path)) => (Some(ret), path),
+        None => (None, qual),
+    };
+    let func = path.rsplit("::").next().unwrap_or(path);
     if c_ident(func).is_none() {
         return None;
     }
@@ -43,10 +52,11 @@ fn decl_from_demangled(demangled: &str) -> Option<String> {
     } else {
         params.to_string()
     };
-    if qual.contains("::") {
-        Some(format!("extern void {qual}({args});"))
+    let ret = ret.unwrap_or("void");
+    if path.contains("::") {
+        Some(format!("extern {ret} {path}({args});"))
     } else {
-        Some(format!("extern void {func}({args});"))
+        Some(format!("extern {ret} {func}({args});"))
     }
 }
 
@@ -93,5 +103,29 @@ mod tests {
         assert!(header.contains("widget"), "{header}");
         assert!(header.contains("foo(int)"), "{header}");
         assert!(!header.contains("printf"), "{header}");
+    }
+
+    #[test]
+    fn msvc_names_become_declarations_with_their_return_type() {
+        let header = emit(&target_with(vec![
+            Symbol::new(0x1200, 0, "?foo@@YAHH@Z", SymbolKind::Local),
+            Symbol::new(0x1300, 0, "?bar@Foo@@YAXH@Z", SymbolKind::Export),
+        ]));
+        assert!(header.contains("extern int foo(int);"), "{header}");
+        assert!(header.contains("extern void Foo::bar(int);"), "{header}");
+        assert!(header.contains("/* void Foo::bar(int) */"), "{header}");
+    }
+
+    #[test]
+    fn a_rust_path_stays_omitted_from_the_declarations() {
+        let header = emit(&target_with(vec![
+            Symbol::new(0x1400, 0, "_RNvC3_foo3_bar", SymbolKind::Local),
+            Symbol::new(0x1500, 0, "?foo@@YA", SymbolKind::Local),
+        ]));
+        // `foo::bar` has no parameter list, so it does not become a
+        // declaration; the truncated `?` name is not even a C identifier.
+        assert!(header.contains("extern void _RNvC3_foo3_bar();"), "{header}");
+        assert!(!header.contains("foo::bar("), "{header}");
+        assert!(!header.contains("?foo@@YA"), "{header}");
     }
 }

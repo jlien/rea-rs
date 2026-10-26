@@ -737,7 +737,12 @@ pub fn strings_with_xrefs(target: &Target, min_len: usize) -> Vec<AnnotatedStrin
             continue;
         };
         let vaddr = sec.addr.saturating_add(hit.offset - sec.file_offset);
-        let len = hit.value.len() as u64;
+        // UTF-16 runs decode one char per code unit but occupy two bytes each.
+        let len = if hit.encoding.is_some() {
+            (hit.value.len() as u64) * 2
+        } else {
+            hit.value.len() as u64
+        };
         let lo = vaddr.saturating_sub(16);
         let hi = vaddr.saturating_add(len);
         let mut refs: Vec<u64> = Vec::new();
@@ -765,6 +770,7 @@ pub fn strings_with_xrefs(target: &Target, min_len: usize) -> Vec<AnnotatedStrin
             out.push(AnnotatedString {
                 vaddr,
                 value: hit.value,
+                encoding: hit.encoding,
                 refs,
             });
         }
@@ -776,6 +782,9 @@ pub fn strings_with_xrefs(target: &Target, min_len: usize) -> Vec<AnnotatedStrin
 pub struct AnnotatedString {
     pub vaddr: u64,
     pub value: String,
+    /// `utf-16le` or `utf-16be` for UTF-16 runs; absent for ASCII.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<&'static str>,
     /// Code addresses that reference this string.
     pub refs: Vec<u64>,
 }
