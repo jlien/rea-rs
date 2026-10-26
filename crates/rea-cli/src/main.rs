@@ -416,6 +416,16 @@ fn main() -> anyhow::Result<()> {
                             "exports": module.exports.len(),
                         });
                     }
+                    if target.format == rea_core::Format::Sqlite {
+                        let hdr = rea_core::sqlite::header(&target.bytes)
+                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                        let objects = rea_core::sqlite::schema(&target.bytes)
+                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                        value["sqlite"] = serde_json::json!({
+                            "application_id": hdr.application_id,
+                            "schema_objects": objects.len(),
+                        });
+                    }
                     value
                 }
                 Command::Sections { .. } => serde_json::json!(target.sections),

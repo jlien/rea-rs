@@ -185,6 +185,16 @@ fn handle_tool_call(msg: &Value) -> Result<Value, String> {
                         "exports": module.exports.len(),
                     });
                 }
+                if target.format == rea_core::Format::Sqlite {
+                    let hdr =
+                        rea_core::sqlite::header(&target.bytes).map_err(|e| e.to_string())?;
+                    let objects =
+                        rea_core::sqlite::schema(&target.bytes).map_err(|e| e.to_string())?;
+                    value["sqlite"] = json!({
+                        "application_id": hdr.application_id,
+                        "schema_objects": objects.len(),
+                    });
+                }
                 value
             }
             "rea_sections" => json!(target.sections),
@@ -664,6 +674,79 @@ mod tests {
         let msg = json!({
             "jsonrpc": "2.0",
             "id": 12,
+            "method": "tools/call",
+            "params": {
+                "name": "rea_funcs",
+                "arguments": { "path": path.to_str().unwrap() }
+            }
+        });
+        let result = handle_tool_call(&msg).unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("no native code view"), "{text}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// One 512-byte page: application id `0x01020304`, and a leaf schema
+    /// b-tree with one row — table `notes`, root page 2, NULL SQL.
+    fn sqlite_db() -> Vec<u8> {
+        let mut db = vec![0u8; 512];
+        db[..16].copy_from_slice(b"SQLite format 3\0");
+        db[16..18].copy_from_slice(&512u16.to_be_bytes());
+        db[18] = 1;
+        db[19] = 1;
+        db[21] = 64;
+        db[22] = 32;
+        db[23] = 32;
+        db[28..32].copy_from_slice(&1u32.to_be_bytes());
+        db[44..48].copy_from_slice(&4u32.to_be_bytes());
+        db[56..60].copy_from_slice(&1u32.to_be_bytes());
+        db[68..72].copy_from_slice(&0x0102_0304u32.to_be_bytes());
+        let mut payload: Vec<u8> = vec![6, 23, 23, 23, 1, 0];
+        payload.extend_from_slice(b"tablenotesnotes");
+        payload.push(2);
+        let mut cell = vec![payload.len() as u8, 1];
+        cell.extend_from_slice(&payload);
+        let at = 512 - cell.len();
+        db[at..at + cell.len()].copy_from_slice(&cell);
+        db[100] = 0x0d;
+        db[103..105].copy_from_slice(&1u16.to_be_bytes());
+        db[105..107].copy_from_slice(&(at as u16).to_be_bytes());
+        db[108..110].copy_from_slice(&(at as u16).to_be_bytes());
+        db
+    }
+
+    #[test]
+    fn rea_info_reports_sqlite_identity_counts() {
+        let path =
+            std::env::temp_dir().join(format!("rea-mcp-sqlite-info-{}.db", std::process::id()));
+        std::fs::write(&path, sqlite_db()).unwrap();
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": 21,
+            "method": "tools/call",
+            "params": {
+                "name": "rea_info",
+                "arguments": { "path": path.to_str().unwrap() }
+            }
+        });
+        let result = handle_tool_call(&msg).unwrap();
+        let v: Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(v["format"], "sqlite");
+        assert_eq!(v["arch"], "unknown");
+        assert_eq!(v["sqlite"]["application_id"], 16909060);
+        assert_eq!(v["sqlite"]["schema_objects"], 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rea_funcs_rejects_a_sqlite_target() {
+        let path =
+            std::env::temp_dir().join(format!("rea-mcp-sqlite-funcs-{}.db", std::process::id()));
+        std::fs::write(&path, sqlite_db()).unwrap();
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": 22,
             "method": "tools/call",
             "params": {
                 "name": "rea_funcs",
