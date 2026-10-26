@@ -669,6 +669,7 @@ impl LeImage {
                 let file_offset = if o.mapsize > 0
                     && o.pagemap >= 1
                     && (o.pagemap as usize) <= self.pages.pages.len()
+                    && self.pages.pages[o.pagemap as usize - 1] != 0
                 {
                     let page = u64::from(self.pages.pages[o.pagemap as usize - 1]);
                     self.pages.header_off as u64
@@ -753,6 +754,22 @@ mod tests {
         // The entry (0x400005) sits inside the pagemap-0 object: translate
         // must return None, not underflow `pagemap - 1`.
         assert_eq!(img.pages.translate(0x400005), None);
+        assert_eq!(img.pages.translate(0x400000), None);
+    }
+
+    #[test]
+    fn a_zero_page_number_keeps_the_section_offset_at_zero() {
+        // mpages 1, pagemap 1, mapsize 1, but the page-map slot's high u16
+        // (the 1-based page number) is 0: sections() must not compute
+        // (page - 1) * pagesize from it. The fixture zeroes the slot the
+        // synthetic image wrote.
+        let mut b = synthetic();
+        b[0x40 + 0xD8..0x40 + 0xDC].copy_from_slice(&0u32.to_le_bytes());
+        let img = LeImage::parse(&b).unwrap();
+        let secs = img.sections();
+        assert_eq!(secs.len(), 1);
+        assert_eq!(secs[0].file_offset, 0);
+        // translate() already refused page number 0 before this fix.
         assert_eq!(img.pages.translate(0x400000), None);
     }
 
