@@ -22,7 +22,7 @@ type Result<T> = std::result::Result<T, DisasmError>;
 
 /// Disassemble up to `count` instructions starting at virtual address `vaddr`.
 pub fn disassemble(target: &Target, vaddr: u64, count: usize) -> Result<Vec<Instruction>> {
-    let mut cs = build_capstone(target.arch)?;
+    let cs = build_capstone(target.arch)?;
 
     let code = target
         .read_at_vaddr(vaddr, 4096)

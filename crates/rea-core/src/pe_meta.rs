@@ -613,14 +613,6 @@ fn table_name(index: u32) -> String {
     }
 }
 
-fn metadata_type_names(
-    file: &[u8],
-    metadata_off: Option<usize>,
-    streams: &[ClrStream],
-) -> Vec<ClrType> {
-    read_metadata_names(file, metadata_off, streams).types
-}
-
 struct MetaRead {
     types: Vec<ClrType>,
     member_refs: Vec<String>,
@@ -1908,7 +1900,7 @@ mod tests {
         let mut strings = vec![0u8];
         strings.extend_from_slice(b"Hello\0World\0App\0");
         let (file, streams) = with_strings(&tilde, &strings);
-        let types = metadata_type_names(&file, Some(0), &streams);
+        let types = read_metadata_names(&file, Some(0), &streams).types;
         assert_eq!(
             types,
             vec![
@@ -1951,7 +1943,7 @@ mod tests {
         let mut strings = vec![0u8];
         strings.extend_from_slice(b"Mod\0A\0N1\0B\0N2\0");
         let (file, streams) = with_strings(&tilde, &strings);
-        let types = metadata_type_names(&file, Some(0), &streams);
+        let types = read_metadata_names(&file, Some(0), &streams).types;
         assert_eq!(types[1].name, "A");
         assert_eq!(types[1].namespace, "N1");
         assert_eq!(types[2].name, "B");
@@ -1985,7 +1977,7 @@ mod tests {
         let mut strings = vec![0u8];
         strings.extend_from_slice(b"App\0Ns\0Run\0Stop\0Other\0Done\0Fld\0");
         let (file, streams) = with_strings(&tilde, &strings);
-        let types = metadata_type_names(&file, Some(0), &streams);
+        let types = read_metadata_names(&file, Some(0), &streams).types;
         assert_eq!(types[0].table, "TypeDef");
         assert_eq!(types[0].namespace, "Ns");
         assert_eq!(types[0].name, "App");
@@ -2031,7 +2023,7 @@ mod tests {
         let mut strings = vec![0u8];
         strings.extend_from_slice(b"App\0Ns\0Run\0Other\0Done\0Fld\0More\0");
         let (file, streams) = with_strings(&tilde, &strings);
-        let types = metadata_type_names(&file, Some(0), &streams);
+        let types = read_metadata_names(&file, Some(0), &streams).types;
         assert_eq!(types[0].name, "App");
         assert_eq!(types[0].namespace, "Ns");
         assert_eq!(types[0].fields, vec!["Fld".to_string()]);
@@ -2068,7 +2060,7 @@ mod tests {
         let mut strings = vec![0u8];
         strings.extend_from_slice(b"App\0Ns\0Run\0Stop\0a\0b\0c\0");
         let (file, streams) = with_strings(&tilde, &strings);
-        let types = metadata_type_names(&file, Some(0), &streams);
+        let types = read_metadata_names(&file, Some(0), &streams).types;
         assert_eq!(types[0].name, "App");
         assert_eq!(types[0].namespace, "Ns");
         assert_eq!(
@@ -2154,7 +2146,7 @@ mod tests {
                 size: 6,
             },
         ];
-        let types = metadata_type_names(&file, Some(0), &streams);
+        let types = read_metadata_names(&file, Some(0), &streams).types;
         assert_eq!(types[0].name, "Run");
         assert_eq!(types[0].methods[0].signature.as_deref(), Some("void(int32)"));
         assert!(types[0].methods[0].il.is_empty());
@@ -2195,7 +2187,7 @@ mod tests {
         let mut names = vec![0u8];
         names.extend_from_slice(b"App\0Text\0");
         let (file, streams) = with_strings(&props, &names);
-        let types = metadata_type_names(&file, Some(0), &streams);
+        let types = read_metadata_names(&file, Some(0), &streams).types;
         assert_eq!(types[0].name, "App");
         assert_eq!(types[0].properties, vec!["Text".to_string()]);
 
@@ -2212,7 +2204,7 @@ mod tests {
         events.extend_from_slice(&5u16.to_le_bytes());
         events.extend_from_slice(&0u16.to_le_bytes());
         let (file, streams) = with_strings(&events, &names);
-        let types = metadata_type_names(&file, Some(0), &streams);
+        let types = read_metadata_names(&file, Some(0), &streams).types;
         assert_eq!(types[0].events, vec!["Text".to_string()]);
     }
 
@@ -2224,7 +2216,7 @@ mod tests {
             offset: 0,
             size: tilde.len() as u32,
         }];
-        assert!(metadata_type_names(&tilde, Some(0), &streams).is_empty());
+        assert!(read_metadata_names(&tilde, Some(0), &streams).types.is_empty());
     }
 
     fn cor20_header(
