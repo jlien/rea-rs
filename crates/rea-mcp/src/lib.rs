@@ -422,7 +422,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "rea_wasm",
-            "description": "WASM section ids, imports, exports, type signatures, function-body opcodes, element and data segments, a capped custom payload, memory and table limits, the data count, and the start index. Optional execute runs one export with an i32 interpreter. No WASI and no memory.",
+            "description": "WASM section ids, imports, exports, type signatures, function-body opcodes, element and data segments, a capped custom payload, memory limits with the shared flag, imported memories with their limits, table limits, the data count, and the start index. Optional execute runs one export with an i32 interpreter. No WASI, and execute does not touch memory.",
             "inputSchema": schema(false, json!({
                 "execute": { "type": "string", "description": "Export name to run. Omit to inspect only." },
                 "args": { "type": "array", "items": { "type": "integer" }, "description": "i32 arguments for execute." }

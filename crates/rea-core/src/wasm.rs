@@ -1,7 +1,8 @@
 //! WebAssembly binary inspector. Parses imports, exports, type signatures, function
 //! bodies as opcode names, element and data segments, and a capped custom payload.
+//! Memory limits carry the shared flag, and imported memories keep their limits.
 //! `execute` runs an exported function that stays inside i32 locals, with a step cap.
-//! It does not provide WASI or a host memory import.
+//! It does not provide WASI, and `execute` does not touch memory.
 
 use crate::{Error, Result};
 
@@ -24,6 +25,16 @@ pub struct WasmExport {
 pub struct WasmMemory {
     pub min: u32,
     pub max: Option<u32>,
+    /// True when the limits carry the shared flag.
+    pub shared: bool,
+}
+
+/// A memory import: module, name, and the imported limits.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct WasmMemoryImport {
+    pub module: String,
+    pub name: String,
+    pub memory: WasmMemory,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -77,8 +88,11 @@ pub struct WasmModule {
     pub elements: Vec<WasmElem>,
     /// Active data segments. Bytes are capped. A segment that does not fit is omitted.
     pub data: Vec<WasmData>,
-    /// Memories declared in the memory section. Imported memories stay on `imports`.
+    /// Memories declared in the memory section. Imported memories stay on `imports`
+    /// and `imported_memories`.
     pub memories: Vec<WasmMemory>,
+    /// Memories imported from the import section, in import order.
+    pub imported_memories: Vec<WasmMemoryImport>,
     /// Tables declared in the table section. Imported tables stay on `imports`.
     pub tables: Vec<WasmTable>,
     /// Start function index, when the start section is present.
@@ -113,6 +127,7 @@ pub fn inspect(bytes: &[u8]) -> Result<WasmModule> {
     let mut elements = Vec::new();
     let mut data = Vec::new();
     let mut memories = Vec::new();
+    let mut imported_memories = Vec::new();
     let mut tables = Vec::new();
     let mut start = None;
     let mut data_count = None;
@@ -145,7 +160,11 @@ pub fn inspect(bytes: &[u8]) -> Result<WasmModule> {
                 types = count;
                 signatures = sigs;
             }
-            2 => imports.extend(decode_imports(payload)?),
+            2 => {
+                let (imp, mem_imports) = decode_imports(payload)?;
+                imports.extend(imp);
+                imported_memories.extend(mem_imports);
+            }
             3 => {
                 if saw_functions {
                     return Err(Error::Parse("duplicate wasm function section".into()));
@@ -215,6 +234,7 @@ pub fn inspect(bytes: &[u8]) -> Result<WasmModule> {
         elements,
         data,
         memories,
+        imported_memories,
         tables,
         start,
         data_count,
@@ -247,6 +267,143 @@ pub fn execute(bytes: &[u8], name: &str, args: &[i32]) -> Result<Vec<i32>> {
         .get(index)
         .ok_or_else(|| Error::Parse("wasm: function body is missing".into()))?;
     interpret(body, args, &ops)
+}
+
+/// A WAT-flavored readability listing of what `inspect` decoded. Sections are
+/// emitted in section order. It is not a full WAT writer: bodies are the same
+/// capped opcode strings as `bodies`, an unknown opcode prints as `opcode 0xNN`,
+/// and details that stay undecoded (element offsets, data offsets, global
+/// valtypes) are not recovered.
+pub fn wat(module: &WasmModule) -> String {
+    let mut out = String::from("(module\n");
+    let imported_funcs = module
+        .imports
+        .iter()
+        .filter(|i| i.kind == "func")
+        .count() as u32;
+    let mut custom_i = 0usize;
+    let mut mem_i = 0usize;
+    for &id in &module.sections {
+        match id {
+            0 => {
+                if let Some(name) = module.customs.get(custom_i) {
+                    out.push_str(&format!("  ;; custom \"{name}\"\n"));
+                }
+                custom_i += 1;
+            }
+            1 => {
+                for sig in &module.signatures {
+                    out.push_str("  (type (func");
+                    if !sig.params.is_empty() {
+                        out.push_str(&format!(" (param {})", sig.params.join(" ")));
+                    }
+                    if !sig.results.is_empty() {
+                        out.push_str(&format!(" (result {})", sig.results.join(" ")));
+                    }
+                    out.push_str("))\n");
+                }
+            }
+            2 => {
+                for imp in &module.imports {
+                    let desc = match imp.kind.as_str() {
+                        "func" => format!("(func (type {}))", imp.index),
+                        "mem" => {
+                            let limits = module.imported_memories.get(mem_i);
+                            mem_i += 1;
+                            format!(
+                                "(memory {})",
+                                limits
+                                    .map(|m| limit_text(&m.memory))
+                                    .unwrap_or_else(|| imp.index.to_string())
+                            )
+                        }
+                        "table" => format!("(table {})", imp.index),
+                        _ => "(global)".to_string(),
+                    };
+                    out.push_str(&format!(
+                        "  (import \"{}\" \"{}\" {})\n",
+                        imp.module, imp.name, desc
+                    ));
+                }
+            }
+            4 => {
+                for table in &module.tables {
+                    out.push_str(&format!("  (table {})\n", table_limits(table)));
+                }
+            }
+            5 => {
+                for memory in &module.memories {
+                    out.push_str(&format!("  (memory {})\n", limit_text(memory)));
+                }
+            }
+            7 => {
+                for export in &module.exports {
+                    out.push_str(&format!(
+                        "  (export \"{}\" ({} {}))\n",
+                        export.name, export.kind, export.index
+                    ));
+                }
+            }
+            8 => {
+                if let Some(start) = module.start {
+                    out.push_str(&format!("  (start {start})\n"));
+                }
+            }
+            9 => {
+                for elem in &module.elements {
+                    let funcs: Vec<String> = elem.functions.iter().map(|f| f.to_string()).collect();
+                    out.push_str(&format!("  (elem func {})\n", funcs.join(" ")));
+                }
+            }
+            10 => {
+                for (i, ty) in module.func_types.iter().enumerate() {
+                    let index = imported_funcs + i as u32;
+                    match module.bodies.get(i) {
+                        Some(body) => {
+                            out.push_str(&format!("  (func (;{index};) (type {ty})\n"));
+                            for op in &body.ops {
+                                let spelled = match op.strip_prefix("op-") {
+                                    Some(hex) => format!("opcode 0x{hex}"),
+                                    None => op.clone(),
+                                };
+                                out.push_str(&format!("    {spelled}\n"));
+                            }
+                            out.push_str("  )\n");
+                        }
+                        None => out.push_str(&format!("  (func (;{index};) (type {ty}))\n")),
+                    }
+                }
+            }
+            11 => {
+                for segment in &module.data {
+                    let bytes: Vec<String> =
+                        segment.bytes.iter().map(|b| format!("{b:02x}")).collect();
+                    out.push_str(&format!("  (data \"{}\")\n", bytes.join(" ")));
+                }
+            }
+            _ => {}
+        }
+    }
+    out.push(')');
+    out
+}
+
+fn limit_text(memory: &WasmMemory) -> String {
+    let mut text = match memory.max {
+        Some(max) => format!("{} {max}", memory.min),
+        None => memory.min.to_string(),
+    };
+    if memory.shared {
+        text.push_str(" shared");
+    }
+    text
+}
+
+fn table_limits(table: &WasmTable) -> String {
+    match table.max {
+        Some(max) => format!("{} {max} {}", table.min, table.kind),
+        None => format!("{} {}", table.min, table.kind),
+    }
 }
 
 fn decode_types(payload: &[u8]) -> Result<(u32, Vec<WasmFuncType>)> {
@@ -601,7 +758,8 @@ fn decode_memories(payload: &[u8]) -> Result<Vec<WasmMemory>> {
         } else {
             None
         };
-        out.push(WasmMemory { min, max });
+        let shared = flags & 2 != 0;
+        out.push(WasmMemory { min, max, shared });
     }
     if !r.eof() {
         return Err(Error::Parse("trailing bytes in wasm memory section".into()));
@@ -618,10 +776,11 @@ fn decode_start(payload: &[u8]) -> Result<u32> {
     Ok(index)
 }
 
-fn decode_imports(payload: &[u8]) -> Result<Vec<WasmImport>> {
+fn decode_imports(payload: &[u8]) -> Result<(Vec<WasmImport>, Vec<WasmMemoryImport>)> {
     let mut r = Reader::new(payload);
     let count = r.read_u32_leb()?;
     let mut out = Vec::new();
+    let mut memories = Vec::new();
     for _ in 0..count {
         let module = r.read_name()?;
         let name = r.read_name()?;
@@ -632,7 +791,15 @@ fn decode_imports(payload: &[u8]) -> Result<Vec<WasmImport>> {
                 let _elemtype = r.read_u8()?;
                 ("table", r.read_limits()?)
             }
-            2 => ("mem", r.read_limits()?),
+            2 => {
+                let (min, max, shared) = r.read_limits_full()?;
+                memories.push(WasmMemoryImport {
+                    module: module.clone(),
+                    name: name.clone(),
+                    memory: WasmMemory { min, max, shared },
+                });
+                ("mem", min)
+            }
             3 => {
                 let _valtype = r.read_u8()?;
                 let _mutable = r.read_u8()?;
@@ -652,7 +819,7 @@ fn decode_imports(payload: &[u8]) -> Result<Vec<WasmImport>> {
     if !r.eof() {
         return Err(Error::Parse("trailing bytes in wasm import section".into()));
     }
-    Ok(out)
+    Ok((out, memories))
 }
 
 fn decode_exports(payload: &[u8]) -> Result<Vec<WasmExport>> {
@@ -771,13 +938,22 @@ impl<'a> Reader<'a> {
         String::from_utf8(bytes.to_vec()).map_err(|_| Error::Parse("invalid utf-8 name".into()))
     }
 
-    /// `flags`, `min`, and `max` when `flags & 1 != 0`. Returns `min`.
-    fn read_limits(&mut self) -> Result<u32> {
+    /// `flags`, `min`, and `max` when `flags & 1 != 0`; `flags & 2` is the
+    /// shared flag. Returns `(min, max, shared)`.
+    fn read_limits_full(&mut self) -> Result<(u32, Option<u32>, bool)> {
         let flags = self.read_u8()?;
         let min = self.read_u32_leb()?;
-        if flags & 1 != 0 {
-            let _max = self.read_u32_leb()?;
-        }
+        let max = if flags & 1 != 0 {
+            Some(self.read_u32_leb()?)
+        } else {
+            None
+        };
+        Ok((min, max, flags & 2 != 0))
+    }
+
+    /// `flags`, `min`, and `max` when `flags & 1 != 0`. Returns `min`.
+    fn read_limits(&mut self) -> Result<u32> {
+        let (min, _max, _shared) = self.read_limits_full()?;
         Ok(min)
     }
 }
@@ -912,10 +1088,76 @@ mod tests {
             vec![WasmMemory {
                 min: 1,
                 max: Some(2),
+                shared: false,
             }]
         );
         assert_eq!(m.start, Some(3));
         assert_eq!(m.functions, 0);
+    }
+
+    #[test]
+    fn memory_shared_flag_and_imported_memory() {
+        // One shared memory: flags 0x03 = has-max + shared.
+        let m = inspect(&hex("0061736d01000000050401030102")).unwrap();
+        assert_eq!(
+            m.memories,
+            vec![WasmMemory {
+                min: 1,
+                max: Some(2),
+                shared: true,
+            }]
+        );
+
+        // Min-only memory is not shared.
+        let plain = inspect(&hex("0061736d010000000503010005")).unwrap();
+        assert_eq!(plain.memories[0].shared, false);
+        assert_eq!(plain.memories[0].max, None);
+
+        // An imported memory keeps module, name, and its limits with the shared flag.
+        let imported = inspect(&hex("0061736d010000000209010165016d02030204")).unwrap();
+        assert_eq!(imported.imports[0].kind, "mem");
+        assert_eq!(imported.imports[0].index, 2);
+        assert!(imported.memories.is_empty());
+        assert_eq!(
+            imported.imported_memories,
+            vec![WasmMemoryImport {
+                module: "e".into(),
+                name: "m".into(),
+                memory: WasmMemory {
+                    min: 2,
+                    max: Some(4),
+                    shared: true,
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn wat_lists_types_functions_and_exports() {
+        let bytes = hex("0061736d010000000105016000017f03020100070501016600000a06010400412a0b");
+        let text = wat(&inspect(&bytes).unwrap());
+        assert!(text.starts_with("(module\n"));
+        assert!(text.contains("  (type (func (result i32)))\n"));
+        assert!(text.contains("  (func (;0;) (type 0)\n    i32.const 42\n    end\n  )\n"));
+        assert!(text.contains("  (export \"f\" (func 0))\n"));
+        assert!(text.ends_with(")"));
+    }
+
+    #[test]
+    fn wat_lists_imported_shared_memory() {
+        let m = inspect(&hex("0061736d010000000209010165016d02030204")).unwrap();
+        let text = wat(&m);
+        assert!(text.contains("  (import \"e\" \"m\" (memory 2 4 shared))\n"));
+    }
+
+    #[test]
+    fn wat_passes_unknown_opcodes_through() {
+        // Body: local group count 0, i32.const 42, opcode 0x28, end. The unknown
+        // opcode carries no decoded immediate, so the next byte is its own opcode.
+        let m = inspect(&hex("0061736d01000000010401600000030201000a07010500412a280b")).unwrap();
+        assert_eq!(m.bodies[0].ops[1], "op-28");
+        let text = wat(&m);
+        assert!(text.contains("    opcode 0x28\n"));
     }
 
     #[test]

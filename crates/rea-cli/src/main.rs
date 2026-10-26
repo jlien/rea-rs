@@ -88,7 +88,7 @@ enum Command {
         #[arg(long)]
         arch: Option<String>,
     },
-    /// WASM section ids, imports, exports, type signatures, function bodies, element and data segments, and a capped custom payload. `--execute` runs one export with the i32 interpreter. No WASI and no memory.
+    /// WASM section ids, imports, exports, type signatures, function bodies, element and data segments, and a capped custom payload. Memory limits carry the shared flag, and imported memories list their limits. `--wat` prints a WAT-flavored readability listing of what is decoded; it is not a full WAT writer. `--execute` runs one export with the i32 interpreter. No WASI, and `--execute` does not touch memory.
     Wasm {
         path: String,
         /// Exported function to run. Omit this to inspect only.
@@ -97,6 +97,9 @@ enum Command {
         /// i32 argument for `--execute`. Repeat the flag for each argument.
         #[arg(long = "arg")]
         args: Vec<i32>,
+        /// Print a WAT-flavored readability listing instead of JSON. Not a full WAT writer.
+        #[arg(long, conflicts_with = "execute")]
+        wat: bool,
     },
     /// Go build info. Go 1.18+ inline blobs and pre-1.18 file offsets. A null or out-of-range offset is an error.
     Goinfo { path: String },
@@ -170,8 +173,18 @@ fn main() -> anyhow::Result<()> {
                 .context("mcp server terminated")?;
             Ok(())
         }
-        Command::Wasm { path, execute, args } => {
+        Command::Wasm {
+            path,
+            execute,
+            args,
+            wat,
+        } => {
             let bytes = std::fs::read(path).context("failed to read target")?;
+            if *wat {
+                let module = rea_core::wasm::inspect(&bytes).context("wasm")?;
+                println!("{}", rea_core::wasm::wat(&module));
+                return Ok(());
+            }
             if let Some(name) = execute {
                 let result = rea_core::wasm::execute(&bytes, name, args)
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
