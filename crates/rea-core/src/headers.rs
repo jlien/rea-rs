@@ -1,6 +1,7 @@
 //! C header text for names already recovered on a [`Target`](crate::Target).
 //!
-//! An Itanium or MSVC demangle becomes a declaration. Any other local or
+//! An Itanium or MSVC demangle becomes a declaration. A demangled path with
+//! `::` but no parameter list becomes a comment. Any other local or
 //! export with a C identifier is `extern void name();`. Imports are omitted.
 
 use crate::{SymbolKind, Target};
@@ -12,7 +13,15 @@ pub fn emit(target: &Target) -> String {
             continue;
         }
         if let Some(demangled) = &sym.demangled {
-            if let Some(line) = decl_from_demangled(demangled) {
+            if !demangled.contains('(') {
+                // A demangled path with no parameter list (a Rust path, for
+                // example) is not callable syntax, so it is a comment only.
+                if demangled.contains("::") {
+                    out.push_str("/* ");
+                    out.push_str(demangled);
+                    out.push_str(" */\n");
+                }
+            } else if let Some(line) = decl_from_demangled(demangled) {
                 out.push_str("/* ");
                 out.push_str(demangled);
                 out.push_str(" */\n");
@@ -117,13 +126,15 @@ mod tests {
     }
 
     #[test]
-    fn a_rust_path_stays_omitted_from_the_declarations() {
+    fn a_rust_path_becomes_a_comment_but_not_a_declaration() {
         let header = emit(&target_with(vec![
             Symbol::new(0x1400, 0, "_RNvC3_foo3_bar", SymbolKind::Local),
             Symbol::new(0x1500, 0, "?foo@@YA", SymbolKind::Local),
         ]));
-        // `foo::bar` has no parameter list, so it does not become a
-        // declaration; the truncated `?` name is not even a C identifier.
+        // `foo::bar` has no parameter list, so it is a comment, never a
+        // declaration; the raw name's C-identifier line stays. The truncated
+        // `?` name is not even a C identifier.
+        assert!(header.contains("/* foo::bar */"), "{header}");
         assert!(header.contains("extern void _RNvC3_foo3_bar();"), "{header}");
         assert!(!header.contains("foo::bar("), "{header}");
         assert!(!header.contains("?foo@@YA"), "{header}");

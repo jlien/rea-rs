@@ -25,7 +25,7 @@ pub struct MachoFacts {
     pub entitlements: Option<MachoEntitlements>,
     /// Byte size of the DER entitlements slot (`0x10006`), when present. The DER contents stay unparsed.
     pub entitlements_der_size: Option<u32>,
-    /// XML `__info_plist` section, when its identifying keys are present.
+    /// `__info_plist` section, when its identifying keys are present.
     pub info_plist: Option<crate::plist::PlistInfo>,
     /// Bytes past the last segment's file range.
     pub overlay: Option<crate::Overlay>,
@@ -114,7 +114,7 @@ pub struct MachoArch {
     pub entitlements: Option<MachoEntitlements>,
     /// DER entitlements slot size of this slice, same shape as [`MachoFacts::entitlements_der_size`].
     pub entitlements_der_size: Option<u32>,
-    /// XML `__info_plist` of this slice.
+    /// `__info_plist` of this slice.
     pub info_plist: Option<crate::plist::PlistInfo>,
     /// Bytes past this slice's last segment.
     pub overlay: Option<crate::Overlay>,
@@ -1741,6 +1741,62 @@ mod tests {
         let overlay = got.overlay.expect("overlay");
         assert_eq!(overlay.size, 5);
         assert_eq!(&over[overlay.offset as usize..], b"EXTRA");
+    }
+
+    /// A minimal `bplist00` payload: one dict of the given ASCII keys and
+    /// values, offset size 1, ref size 1.
+    fn binary_plist(entries: &[(&str, &str)]) -> Vec<u8> {
+        let n = entries.len();
+        let mut dict = vec![0xD0 | n as u8];
+        for i in 0..n {
+            dict.push((1 + 2 * i) as u8);
+        }
+        for i in 0..n {
+            dict.push((2 + 2 * i) as u8);
+        }
+        let mut objects = vec![dict];
+        for (k, v) in entries {
+            for s in [k, v] {
+                let raw = s.as_bytes();
+                let mut obj = if raw.len() < 0xF {
+                    let mut obj = vec![0x50 | raw.len() as u8];
+                    obj.extend_from_slice(raw);
+                    obj
+                } else {
+                    let mut obj = vec![0x5F, 0x10, raw.len() as u8];
+                    obj.extend_from_slice(raw);
+                    obj
+                };
+                objects.push(std::mem::take(&mut obj));
+            }
+        }
+        let mut file = b"bplist00".to_vec();
+        let mut offsets = Vec::new();
+        for obj in &objects {
+            offsets.push(file.len() as u8);
+            file.extend_from_slice(obj);
+        }
+        let table_at = file.len() as u64;
+        file.extend_from_slice(&offsets);
+        file.extend_from_slice(&[0u8; 5]);
+        file.push(0);
+        file.push(1);
+        file.push(1);
+        file.extend_from_slice(&(objects.len() as u64).to_be_bytes());
+        file.extend_from_slice(&0u64.to_be_bytes());
+        file.extend_from_slice(&table_at.to_be_bytes());
+        file
+    }
+
+    #[test]
+    fn reads_an_embedded_binary_plist() {
+        let bp = binary_plist(&[("CFBundleIdentifier", "com.example.bplist"), ("CFBundleName", "Example")]);
+        let file = segment_slice(0x0100_000c, "__info_plist", &bp, b"");
+        let got = facts(&file).unwrap();
+        let info = got.info_plist.expect("plist");
+        assert_eq!(info.bundle_id.as_deref(), Some("com.example.bplist"));
+        assert_eq!(info.bundle_name.as_deref(), Some("Example"));
+        assert_eq!(info.bundle_version.as_deref(), None);
     }
 
     /// One 64-bit `__TEXT` segment. `extra` is past `filesize`.

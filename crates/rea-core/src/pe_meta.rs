@@ -74,7 +74,7 @@ pub struct PePdb {
     pub age: u32,
 }
 
-/// Leading `IMAGE_COR20_HEADER` fields, the BSJB version string, metadata stream headers, table row counts, and type, field, method, parameter, member-ref, module-ref, and assembly names.
+/// Leading `IMAGE_COR20_HEADER` fields, the BSJB version string, metadata stream headers, table row counts, and type, field, method, parameter, member-ref, module-ref, and assembly names, plus each member-ref's resolved parent.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ClrHeader {
     pub major_runtime: u16,
@@ -95,6 +95,8 @@ pub struct ClrHeader {
     pub member_refs: Vec<String>,
     /// Method or field signature for each `member_refs` entry. `None` when the blob is missing or does not fit.
     pub member_ref_signatures: Vec<Option<String>>,
+    /// Resolved `MemberRefParent` for each `member_refs` entry. TypeDef and TypeRef parents become names when that row is in the name lists; `ModuleRef`, `MethodDef`, and `TypeSpec` stay as `ModuleRef#N`, `MethodDef#N`, and `TypeSpec#N`. Empty when the parent row does not fit.
+    pub member_ref_parents: Vec<String>,
     /// One `ClrAssembly` per `Assembly` row, in table order.
     pub assemblies: Vec<ClrAssembly>,
     /// One `ClrAssembly` per `AssemblyRef` row, in table order.
@@ -440,6 +442,7 @@ fn parse_clr(header: &[u8], file: &[u8], metadata_off: Option<usize>) -> Option<
         tables,
         types: meta.types,
         member_refs: meta.member_refs,
+        member_ref_parents: meta.member_ref_parents,
         member_ref_signatures: meta.member_ref_signatures,
         assemblies: meta.assemblies,
         assembly_refs: meta.assembly_refs,
@@ -682,6 +685,7 @@ fn table_name(index: u32) -> String {
 struct MetaRead {
     types: Vec<ClrType>,
     member_refs: Vec<String>,
+    member_ref_parents: Vec<String>,
     member_ref_signatures: Vec<Option<String>>,
     assemblies: Vec<ClrAssembly>,
     assembly_refs: Vec<ClrAssembly>,
@@ -689,10 +693,15 @@ struct MetaRead {
 }
 
 impl MetaRead {
-    fn partial(types: Vec<ClrType>, member_refs: Vec<String>) -> Self {
+    fn partial(
+        types: Vec<ClrType>,
+        member_refs: Vec<String>,
+        member_ref_parents: Vec<String>,
+    ) -> Self {
         Self {
             types,
             member_refs,
+            member_ref_parents,
             member_ref_signatures: Vec::new(),
             assemblies: Vec::new(),
             assembly_refs: Vec::new(),
@@ -703,33 +712,33 @@ impl MetaRead {
 
 /// `Module`, `TypeRef`, and `TypeDef` names, plus `Field` and `MethodDef` names on each `TypeDef`, `Param` names on each method, `MemberRef` names, and `InterfaceImpl` names on each `TypeDef`.
 ///
-/// `FieldPtr`, `MethodPtr`, and `ParamPtr` are skipped by row size; `InterfaceImpl` rows are read, which keeps later tables aligned the same way a skip does. The pointer tables are not applied. String, blob, and coded-index widths follow the `#~` heap-size byte and the row counts. A row that does not fit ends the list and keeps the names already read. `Assembly` and `AssemblyRef` rows carry their version numbers, culture, and public-key blob through `enrich_metadata`. Signatures, RVAs, and IL are not read.
+/// `FieldPtr`, `MethodPtr`, and `ParamPtr` rows are read by row size and reorder the `Field`, `MethodDef`, and `Param` names through their one index per row; a pointer table shorter than its list, or an index past the list, leaves the row order in place and does not fail the parse. `InterfaceImpl` rows are read, which keeps later tables aligned the same way a skip does. String, blob, and coded-index widths follow the `#~` heap-size byte and the row counts. A row that does not fit ends the list and keeps the names already read. Each `MemberRef` row also records its `MemberRefParent` coded index resolved against the name lists; a parent that does not resolve leaves the field empty. `Assembly` and `AssemblyRef` rows carry their version numbers, culture, and public-key blob through `enrich_metadata`. Signatures, RVAs, and IL are not read.
 fn read_metadata_names(
     file: &[u8],
     metadata_off: Option<usize>,
     streams: &[ClrStream],
 ) -> MetaRead {
     let Some(root) = metadata_off else {
-        return MetaRead::partial(Vec::new(), Vec::new());
+        return MetaRead::partial(Vec::new(), Vec::new(), Vec::new());
     };
     let Some(blob) = stream_bytes(file, root, streams, "#~")
         .or_else(|| stream_bytes(file, root, streams, "#-"))
     else {
-        return MetaRead::partial(Vec::new(), Vec::new());
+        return MetaRead::partial(Vec::new(), Vec::new(), Vec::new());
     };
     let Some(strings) = stream_bytes(file, root, streams, "#Strings") else {
-        return MetaRead::partial(Vec::new(), Vec::new());
+        return MetaRead::partial(Vec::new(), Vec::new(), Vec::new());
     };
     if blob.len() < 24 {
-        return MetaRead::partial(Vec::new(), Vec::new());
+        return MetaRead::partial(Vec::new(), Vec::new(), Vec::new());
     }
     let valid = u64::from_le_bytes(blob[8..16].try_into().unwrap());
     let count = valid.count_ones() as usize;
     let Some(header_end) = count.checked_mul(4).and_then(|n| n.checked_add(24)) else {
-        return MetaRead::partial(Vec::new(), Vec::new());
+        return MetaRead::partial(Vec::new(), Vec::new(), Vec::new());
     };
     if blob.len() < header_end {
-        return MetaRead::partial(Vec::new(), Vec::new());
+        return MetaRead::partial(Vec::new(), Vec::new(), Vec::new());
     }
     let str_w = if blob[6] & 0x01 != 0 { 4 } else { 2 };
     let guid_w = if blob[6] & 0x02 != 0 { 4 } else { 2 };
@@ -778,6 +787,7 @@ fn read_metadata_names(
     let mut cursor = header_end;
     let mut out = Vec::new();
     let mut member_refs = Vec::new();
+    let mut member_parents = Vec::new();
     // Index into `out`, then the 1-based FieldList and MethodList for each TypeDef.
     let mut typedefs: Vec<(usize, u32, u32)> = Vec::new();
     // Index into `out` for each TypeRef row, 1-based row order.
@@ -787,6 +797,10 @@ fn read_metadata_names(
     // Method name and its 1-based ParamList, in MethodDef order.
     let mut method_recs: Vec<(String, u32)> = Vec::new();
     let mut params_attached = false;
+    // One index per Field, MethodDef, or Param row, read from the pointer tables.
+    let mut field_ptrs: Vec<u32> = Vec::new();
+    let mut method_ptrs: Vec<u32> = Vec::new();
+    let mut param_ptrs: Vec<u32> = Vec::new();
     for bit in 0..11u32 {
         if valid & (1u64 << bit) == 0 {
             continue;
@@ -800,10 +814,10 @@ fn read_metadata_names(
                 };
                 for _ in 0..rows {
                     let Some(end) = cursor.checked_add(size) else {
-                        return MetaRead::partial(out, member_refs);
+                        return MetaRead::partial(out, member_refs, member_parents);
                     };
                     if end > blob.len() {
-                        return MetaRead::partial(out, member_refs);
+                        return MetaRead::partial(out, member_refs, member_parents);
                     }
                     let row = &blob[cursor..end];
                     let (namespace, name) = match bit {
@@ -844,13 +858,29 @@ fn read_metadata_names(
                 }
             }
             3 | 5 => {
-                let (rows, size) = if bit == 3 {
-                    (rows_at(blob, valid, 3), field_w)
+                let rows = rows_at(blob, valid, bit);
+                let size = if bit == 3 { field_w } else { method_w };
+                let mut ptrs = Vec::new();
+                let mut fit = true;
+                for _ in 0..rows {
+                    let Some(end) = cursor.checked_add(size) else {
+                        fit = false;
+                        break;
+                    };
+                    if end > blob.len() {
+                        fit = false;
+                        break;
+                    }
+                    ptrs.push(read_index(&blob[cursor..end], 0, size));
+                    cursor = end;
+                }
+                if !fit {
+                    return MetaRead::partial(out, member_refs, member_parents);
+                }
+                if bit == 3 {
+                    field_ptrs = ptrs;
                 } else {
-                    (rows_at(blob, valid, 5), method_w)
-                };
-                if !skip_rows(blob, &mut cursor, rows, size) {
-                    return MetaRead::partial(out, member_refs);
+                    method_ptrs = ptrs;
                 }
             }
             4 => {
@@ -858,15 +888,18 @@ fn read_metadata_names(
                 for _ in 0..field_rows {
                     let Some(end) = cursor.checked_add(field_size) else {
                         attach_field_names(&mut out, &typedefs, &names);
-                        return MetaRead::partial(out, member_refs);
+                        return MetaRead::partial(out, member_refs, member_parents);
                     };
                     if end > blob.len() {
                         attach_field_names(&mut out, &typedefs, &names);
-                        return MetaRead::partial(out, member_refs);
+                        return MetaRead::partial(out, member_refs, member_parents);
                     }
                     let row = &blob[cursor..end];
                     names.push(heap_string(strings, read_index(row, 2, str_w)));
                     cursor = end;
+                }
+                if let Some(ordered) = ptr_order(&names, &field_ptrs) {
+                    names = ordered;
                 }
                 attach_field_names(&mut out, &typedefs, &names);
             }
@@ -874,11 +907,11 @@ fn read_metadata_names(
                 for _ in 0..method_rows {
                     let Some(end) = cursor.checked_add(method_size) else {
                         attach_methods(&mut out, &typedefs, &method_recs, &[]);
-                        return MetaRead::partial(out, member_refs);
+                        return MetaRead::partial(out, member_refs, member_parents);
                     };
                     if end > blob.len() {
                         attach_methods(&mut out, &typedefs, &method_recs, &[]);
-                        return MetaRead::partial(out, member_refs);
+                        return MetaRead::partial(out, member_refs, member_parents);
                     }
                     let row = &blob[cursor..end];
                     method_recs.push((
@@ -887,24 +920,42 @@ fn read_metadata_names(
                     ));
                     cursor = end;
                 }
+                if let Some(ordered) = ptr_order(&method_recs, &method_ptrs) {
+                    method_recs = ordered;
+                }
             }
             7 => {
                 let rows = rows_at(blob, valid, 7);
-                if !skip_rows(blob, &mut cursor, rows, param_w) {
-                    attach_methods(&mut out, &typedefs, &method_recs, &[]);
-                    return MetaRead::partial(out, member_refs);
+                let mut ptrs = Vec::new();
+                let mut fit = true;
+                for _ in 0..rows {
+                    let Some(end) = cursor.checked_add(param_w) else {
+                        fit = false;
+                        break;
+                    };
+                    if end > blob.len() {
+                        fit = false;
+                        break;
+                    }
+                    ptrs.push(read_index(&blob[cursor..end], 0, param_w));
+                    cursor = end;
                 }
+                if !fit {
+                    attach_methods(&mut out, &typedefs, &method_recs, &[]);
+                    return MetaRead::partial(out, member_refs, member_parents);
+                }
+                param_ptrs = ptrs;
             }
             8 => {
                 let mut names: Vec<(u16, String)> = Vec::new();
                 for _ in 0..param_rows {
                     let Some(end) = cursor.checked_add(param_size) else {
                         attach_methods(&mut out, &typedefs, &method_recs, &names);
-                        return MetaRead::partial(out, member_refs);
+                        return MetaRead::partial(out, member_refs, member_parents);
                     };
                     if end > blob.len() {
                         attach_methods(&mut out, &typedefs, &method_recs, &names);
-                        return MetaRead::partial(out, member_refs);
+                        return MetaRead::partial(out, member_refs, member_parents);
                     }
                     let row = &blob[cursor..end];
                     names.push((
@@ -912,6 +963,9 @@ fn read_metadata_names(
                         heap_string(strings, read_index(row, 4, str_w)),
                     ));
                     cursor = end;
+                }
+                if let Some(ordered) = ptr_order(&names, &param_ptrs) {
+                    names = ordered;
                 }
                 attach_methods(&mut out, &typedefs, &method_recs, &names);
                 params_attached = true;
@@ -924,14 +978,14 @@ fn read_metadata_names(
                         if !params_attached {
                             attach_methods(&mut out, &typedefs, &method_recs, &[]);
                         }
-                        return MetaRead::partial(out, member_refs);
+                        return MetaRead::partial(out, member_refs, member_parents);
                     };
                     if end > blob.len() {
                         attach_interfaces(&mut out, &typedefs, &interfaces);
                         if !params_attached {
                             attach_methods(&mut out, &typedefs, &method_recs, &[]);
                         }
-                        return MetaRead::partial(out, member_refs);
+                        return MetaRead::partial(out, member_refs, member_parents);
                     }
                     let row = &blob[cursor..end];
                     let owner = read_index(row, 0, typedef_w);
@@ -966,18 +1020,24 @@ fn read_metadata_names(
                         if !params_attached {
                             attach_methods(&mut out, &typedefs, &method_recs, &[]);
                         }
-                        return MetaRead::partial(out, member_refs);
+                        return MetaRead::partial(out, member_refs, member_parents);
                     };
                     if end > blob.len() {
                         if !params_attached {
                             attach_methods(&mut out, &typedefs, &method_recs, &[]);
                         }
-                        return MetaRead::partial(out, member_refs);
+                        return MetaRead::partial(out, member_refs, member_parents);
                     }
                     let row = &blob[cursor..end];
                     member_refs.push(heap_string(
                         strings,
                         read_index(row, member_parent_w, str_w),
+                    ));
+                    member_parents.push(member_parent_name(
+                        read_index(row, 0, member_parent_w),
+                        &out,
+                        &typedefs,
+                        &typerefs,
                     ));
                     cursor = end;
                 }
@@ -990,10 +1050,11 @@ fn read_metadata_names(
     attach_interfaces(&mut out, &typedefs, &interfaces);
     let blobs = stream_bytes(file, root, streams, "#Blob");
     let (member_ref_signatures, assemblies, assembly_refs, module_refs) =
-        enrich_metadata(&mut out, &member_refs, blobs, blob, strings);
+        enrich_metadata(&mut out, &member_refs, blobs, blob, strings, &field_ptrs, &method_ptrs);
     MetaRead {
         types: out,
         member_refs,
+        member_ref_parents: member_parents,
         member_ref_signatures,
         assemblies,
         assembly_refs,
@@ -1001,13 +1062,15 @@ fn read_metadata_names(
     }
 }
 
-/// Field and method signatures, assembly, assembly-ref, and module-ref rows, properties, and events. A row that does not fit keeps what was already read.
+/// Field and method signatures, assembly, assembly-ref, and module-ref rows, properties, and events. A row that does not fit keeps what was already read. `field_ptrs` and `method_ptrs` reorder the signature and RVA records the same way the names were reordered, so each record stays on its row.
 fn enrich_metadata(
     types: &mut [ClrType],
     member_refs: &[String],
     blobs: Option<&[u8]>,
     tilde: &[u8],
     strings: &[u8],
+    field_ptrs: &[u32],
+    method_ptrs: &[u32],
 ) -> (
     Vec<Option<String>>,
     Vec<ClrAssembly>,
@@ -1283,6 +1346,9 @@ fn enrich_metadata(
         }
     }
     if fields_done {
+        if let Some(ordered) = ptr_order(&field_sigs, field_ptrs) {
+            field_sigs = ordered;
+        }
         let count: usize = types.iter().map(|ty| ty.fields.len()).sum();
         if count == field_sigs.len() {
             let mut index = 0;
@@ -1295,6 +1361,9 @@ fn enrich_metadata(
         }
     }
     if methods_done {
+        if let Some(ordered) = ptr_order(&method_recs, method_ptrs) {
+            method_recs = ordered;
+        }
         let count: usize = types.iter().map(|ty| ty.methods.len()).sum();
         if count == method_recs.len() {
             let mut index = 0;
@@ -1357,6 +1426,34 @@ fn attach_mapped(
                 .collect();
         }
     }
+}
+
+/// One `MemberRefParent` coded index resolved to a display string. TypeDef and TypeRef rows become names when read; `ModuleRef`, `MethodDef`, and `TypeSpec` stay as `ModuleRef#N`, `MethodDef#N`, and `TypeSpec#N`. An unknown tag or a row that is not in the name lists is empty.
+fn member_parent_name(
+    coded: u32,
+    types: &[ClrType],
+    typedefs: &[(usize, u32, u32)],
+    typerefs: &[usize],
+) -> String {
+    let tag = coded & 0x7;
+    let target = (coded >> 3) as usize;
+    match tag {
+        0 => target
+            .checked_sub(1)
+            .and_then(|row| typedefs.get(row))
+            .map(|&(at, _, _)| at)
+            .and_then(|at| qualified_name(types, at)),
+        1 => target
+            .checked_sub(1)
+            .and_then(|row| typerefs.get(row))
+            .copied()
+            .and_then(|at| qualified_name(types, at)),
+        2 => Some(format!("ModuleRef#{target}")),
+        3 => Some(format!("MethodDef#{target}")),
+        4 => Some(format!("TypeSpec#{target}")),
+        _ => None,
+    }
+    .unwrap_or_default()
 }
 
 /// `Namespace.Name` for the `types` entry at `at`.
@@ -1447,18 +1544,21 @@ fn list_span(lists: &[u32], index: usize, len: usize) -> (usize, usize) {
     (start, end)
 }
 
-fn skip_rows(blob: &[u8], cursor: &mut usize, rows: u32, size: usize) -> bool {
-    let Some(total) = usize::try_from(rows).ok().and_then(|rows| rows.checked_mul(size)) else {
-        return false;
-    };
-    let Some(end) = cursor.checked_add(total) else {
-        return false;
-    };
-    if end > blob.len() {
-        return false;
+/// `items` reordered through a pointer table. `Some` only when the table holds one in-range index per list row; otherwise the row order stands and the caller keeps `items` as read.
+fn ptr_order<T: Clone>(items: &[T], ptrs: &[u32]) -> Option<Vec<T>> {
+    if ptrs.len() != items.len() {
+        return None;
     }
-    *cursor = end;
-    true
+    items
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            ptrs[index]
+                .checked_sub(1)
+                .filter(|&row| (row as usize) < items.len())
+                .map(|row| items[row as usize].clone())
+        })
+        .collect()
 }
 
 fn stream_bytes<'a>(
@@ -2321,7 +2421,7 @@ mod tests {
 
     #[test]
     fn clr_typedef_fields_follow_the_field_list() {
-        // FieldPtr sits between TypeDef and Field. Its one index is skipped, not applied.
+        // FieldPtr sits between TypeDef and Field. Its one row is shorter than the Field list, so the row order stands.
         let mut tilde = tilde_header((1 << 2) | (1 << 3) | (1 << 4) | (1 << 6), &[2, 1, 2, 2]);
         for (name, namespace, fields, methods) in
             [(1u16, 5u16, 1u16, 1u16), (12u16, 0u16, 2u16, 2u16)]
@@ -2362,7 +2462,7 @@ mod tests {
 
     #[test]
     fn clr_method_params_skip_the_param_ptr_row() {
-        // ParamPtr sits between MethodDef and Param. Its one index is skipped, not applied.
+        // ParamPtr sits between MethodDef and Param. Its one row is shorter than the Param list, so the row order stands.
         let mut tilde = tilde_header((1 << 2) | (1 << 6) | (1 << 7) | (1 << 8), &[1, 2, 1, 3]);
         tilde.extend_from_slice(&0u32.to_le_bytes());
         tilde.extend_from_slice(&1u16.to_le_bytes());
@@ -2400,6 +2500,219 @@ mod tests {
     }
 
     #[test]
+    fn clr_field_ptr_orders_the_field_names() {
+        // FieldPtr row 1 points at Field 2 and row 2 at Field 1; the owned names move.
+        let mut tilde = tilde_header((1 << 2) | (1 << 3) | (1 << 4) | (1 << 6), &[2, 2, 2, 2]);
+        for (name, namespace, fields, methods) in
+            [(1u16, 5u16, 1u16, 1u16), (12u16, 0u16, 2u16, 2u16)]
+        {
+            tilde.extend_from_slice(&0u32.to_le_bytes());
+            tilde.extend_from_slice(&name.to_le_bytes());
+            tilde.extend_from_slice(&namespace.to_le_bytes());
+            tilde.extend_from_slice(&0u16.to_le_bytes());
+            tilde.extend_from_slice(&fields.to_le_bytes());
+            tilde.extend_from_slice(&methods.to_le_bytes());
+        }
+        tilde.extend_from_slice(&2u16.to_le_bytes());
+        tilde.extend_from_slice(&1u16.to_le_bytes());
+        for name in [23u16, 27u16] {
+            tilde.extend_from_slice(&0u16.to_le_bytes());
+            tilde.extend_from_slice(&name.to_le_bytes());
+            tilde.extend_from_slice(&0u16.to_le_bytes());
+        }
+        for name in [8u16, 18u16] {
+            tilde.extend_from_slice(&0u32.to_le_bytes());
+            tilde.extend_from_slice(&0u16.to_le_bytes());
+            tilde.extend_from_slice(&0u16.to_le_bytes());
+            tilde.extend_from_slice(&name.to_le_bytes());
+            tilde.extend_from_slice(&0u16.to_le_bytes());
+            tilde.extend_from_slice(&1u16.to_le_bytes());
+        }
+        let mut strings = vec![0u8];
+        strings.extend_from_slice(b"App\0Ns\0Run\0Other\0Done\0Fld\0More\0");
+        let (file, streams) = with_strings(&tilde, &strings);
+        let types = read_metadata_names(&file, Some(0), &streams).types;
+        assert_eq!(types[0].name, "App");
+        assert_eq!(types[0].fields, vec![clr_field("More")]);
+        assert_eq!(types[0].methods, vec![clr_method("Run", &[])]);
+        assert_eq!(types[1].name, "Other");
+        assert_eq!(types[1].fields, vec![clr_field("Fld")]);
+        assert_eq!(types[1].methods, vec![clr_method("Done", &[])]);
+    }
+
+    #[test]
+    fn clr_field_ptr_short_of_the_list_keeps_row_order() {
+        // One FieldPtr row for two Field rows, then a pointer past the list: the row order stands.
+        for (rows, ptrs) in [(&[2u32, 1, 2, 2][..], vec![2u16]), (&[2, 2, 2, 2][..], vec![5, 1])] {
+            let mut tilde = tilde_header((1 << 2) | (1 << 3) | (1 << 4) | (1 << 6), rows);
+            for (name, namespace, fields, methods) in
+                [(1u16, 5u16, 1u16, 1u16), (12u16, 0u16, 2u16, 2u16)]
+            {
+                tilde.extend_from_slice(&0u32.to_le_bytes());
+                tilde.extend_from_slice(&name.to_le_bytes());
+                tilde.extend_from_slice(&namespace.to_le_bytes());
+                tilde.extend_from_slice(&0u16.to_le_bytes());
+                tilde.extend_from_slice(&fields.to_le_bytes());
+                tilde.extend_from_slice(&methods.to_le_bytes());
+            }
+            for ptr in ptrs {
+                tilde.extend_from_slice(&ptr.to_le_bytes());
+            }
+            for name in [23u16, 27u16] {
+                tilde.extend_from_slice(&0u16.to_le_bytes());
+                tilde.extend_from_slice(&name.to_le_bytes());
+                tilde.extend_from_slice(&0u16.to_le_bytes());
+            }
+            for name in [8u16, 18u16] {
+                tilde.extend_from_slice(&0u32.to_le_bytes());
+                tilde.extend_from_slice(&0u16.to_le_bytes());
+                tilde.extend_from_slice(&0u16.to_le_bytes());
+                tilde.extend_from_slice(&name.to_le_bytes());
+                tilde.extend_from_slice(&0u16.to_le_bytes());
+                tilde.extend_from_slice(&1u16.to_le_bytes());
+            }
+            let mut strings = vec![0u8];
+            strings.extend_from_slice(b"App\0Ns\0Run\0Other\0Done\0Fld\0More\0");
+            let (file, streams) = with_strings(&tilde, &strings);
+            let types = read_metadata_names(&file, Some(0), &streams).types;
+            assert_eq!(types[0].fields, vec![clr_field("Fld")]);
+            assert_eq!(types[1].fields, vec![clr_field("More")]);
+        }
+    }
+
+    #[test]
+    fn clr_field_ptr_moves_the_signature_with_the_name() {
+        // The signature of each Field row follows the name the pointer selects.
+        let mut tilde = tilde_header((1 << 2) | (1 << 3) | (1 << 4), &[1, 2, 2]);
+        tilde.extend_from_slice(&0u32.to_le_bytes());
+        tilde.extend_from_slice(&1u16.to_le_bytes());
+        tilde.extend_from_slice(&0u16.to_le_bytes());
+        tilde.extend_from_slice(&0u16.to_le_bytes());
+        tilde.extend_from_slice(&1u16.to_le_bytes());
+        tilde.extend_from_slice(&0u16.to_le_bytes());
+        tilde.extend_from_slice(&2u16.to_le_bytes());
+        tilde.extend_from_slice(&1u16.to_le_bytes());
+        for (name, sig) in [(5u16, 1u16), (9u16, 0u16)] {
+            tilde.extend_from_slice(&0u16.to_le_bytes());
+            tilde.extend_from_slice(&name.to_le_bytes());
+            tilde.extend_from_slice(&sig.to_le_bytes());
+        }
+        let mut strings = vec![0u8];
+        strings.extend_from_slice(b"App\0Fld\0Blank\0");
+        let mut file = tilde.clone();
+        let strings_at = file.len() as u32;
+        file.extend_from_slice(&strings);
+        let blob_at = file.len() as u32;
+        // Entry 1: length 2, field calling convention, int32. Entry 0 is no blob.
+        file.extend_from_slice(&[0x00, 0x02, 0x06, 0x08]);
+        let streams = vec![
+            ClrStream {
+                name: "#~".into(),
+                offset: 0,
+                size: strings_at,
+            },
+            ClrStream {
+                name: "#Strings".into(),
+                offset: strings_at,
+                size: strings.len() as u32,
+            },
+            ClrStream {
+                name: "#Blob".into(),
+                offset: blob_at,
+                size: 4,
+            },
+        ];
+        let types = read_metadata_names(&file, Some(0), &streams).types;
+        assert_eq!(
+            types[0].fields,
+            vec![
+                ClrField {
+                    name: "Blank".into(),
+                    signature: None,
+                },
+                ClrField {
+                    name: "Fld".into(),
+                    signature: Some("field int32".into()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn clr_method_ptr_orders_the_method_names() {
+        // MethodPtr row 1 points at MethodDef 2 and row 2 at MethodDef 1; the owners move.
+        let mut tilde = tilde_header((1 << 2) | (1 << 5) | (1 << 6), &[2, 2, 2]);
+        for (name, namespace, fields, methods) in
+            [(1u16, 5u16, 0u16, 1u16), (12u16, 0u16, 0u16, 2u16)]
+        {
+            tilde.extend_from_slice(&0u32.to_le_bytes());
+            tilde.extend_from_slice(&name.to_le_bytes());
+            tilde.extend_from_slice(&namespace.to_le_bytes());
+            tilde.extend_from_slice(&0u16.to_le_bytes());
+            tilde.extend_from_slice(&fields.to_le_bytes());
+            tilde.extend_from_slice(&methods.to_le_bytes());
+        }
+        tilde.extend_from_slice(&2u16.to_le_bytes());
+        tilde.extend_from_slice(&1u16.to_le_bytes());
+        for name in [8u16, 18u16] {
+            tilde.extend_from_slice(&0u32.to_le_bytes());
+            tilde.extend_from_slice(&0u16.to_le_bytes());
+            tilde.extend_from_slice(&0u16.to_le_bytes());
+            tilde.extend_from_slice(&name.to_le_bytes());
+            tilde.extend_from_slice(&0u16.to_le_bytes());
+            tilde.extend_from_slice(&1u16.to_le_bytes());
+        }
+        let mut strings = vec![0u8];
+        strings.extend_from_slice(b"App\0Ns\0Run\0Other\0Done\0");
+        let (file, streams) = with_strings(&tilde, &strings);
+        let types = read_metadata_names(&file, Some(0), &streams).types;
+        assert_eq!(types[0].name, "App");
+        assert_eq!(types[0].methods, vec![clr_method("Done", &[])]);
+        assert!(types[0].fields.is_empty());
+        assert_eq!(types[1].name, "Other");
+        assert_eq!(types[1].methods, vec![clr_method("Run", &[])]);
+    }
+
+    #[test]
+    fn clr_param_ptr_orders_the_param_names() {
+        // ParamPtr row 1 points at Param 2 and row 2 at Param 1; the sequences move with the names.
+        let mut tilde = tilde_header((1 << 2) | (1 << 6) | (1 << 7) | (1 << 8), &[1, 2, 3, 3]);
+        tilde.extend_from_slice(&0u32.to_le_bytes());
+        tilde.extend_from_slice(&1u16.to_le_bytes());
+        tilde.extend_from_slice(&5u16.to_le_bytes());
+        tilde.extend_from_slice(&0u16.to_le_bytes());
+        tilde.extend_from_slice(&1u16.to_le_bytes());
+        tilde.extend_from_slice(&1u16.to_le_bytes());
+        for (name, params) in [(8u16, 1u16), (12u16, 3u16)] {
+            tilde.extend_from_slice(&0u32.to_le_bytes());
+            tilde.extend_from_slice(&0u16.to_le_bytes());
+            tilde.extend_from_slice(&0u16.to_le_bytes());
+            tilde.extend_from_slice(&name.to_le_bytes());
+            tilde.extend_from_slice(&0u16.to_le_bytes());
+            tilde.extend_from_slice(&params.to_le_bytes());
+        }
+        tilde.extend_from_slice(&2u16.to_le_bytes());
+        tilde.extend_from_slice(&1u16.to_le_bytes());
+        tilde.extend_from_slice(&3u16.to_le_bytes());
+        for (seq, name) in [(1u16, 17u16), (2u16, 19u16), (1u16, 21u16)] {
+            tilde.extend_from_slice(&seq.to_le_bytes());
+            tilde.extend_from_slice(&0u16.to_le_bytes());
+            tilde.extend_from_slice(&name.to_le_bytes());
+        }
+        let mut strings = vec![0u8];
+        strings.extend_from_slice(b"App\0Ns\0Run\0Stop\0a\0b\0c\0");
+        let (file, streams) = with_strings(&tilde, &strings);
+        let types = read_metadata_names(&file, Some(0), &streams).types;
+        assert_eq!(
+            types[0].methods,
+            vec![
+                clr_method("Run", &[("b", 2), ("a", 1)]),
+                clr_method("Stop", &[("c", 1)])
+            ]
+        );
+    }
+
+    #[test]
     fn clr_member_refs_skip_the_interface_row() {
         // InterfaceImpl sits between Param and MemberRef. Its row is skipped.
         let mut tilde = tilde_header((1 << 9) | (1 << 10), &[1, 2]);
@@ -2416,6 +2729,62 @@ mod tests {
         let meta = read_metadata_names(&file, Some(0), &streams);
         assert!(meta.types.is_empty());
         assert_eq!(meta.member_refs, vec!["Write".to_string(), "Read".to_string()]);
+    }
+
+    #[test]
+    fn clr_member_ref_parents_resolve_and_stay_empty_when_unfit() {
+        // TypeRef 1 is Ns.IFace; TypeDef 1 is App. Seven MemberRef rows cover every parent tag,
+        // a TypeRef row past the table, and an unknown tag.
+        let mut tilde = tilde_header((1 << 1) | (1 << 2) | (1 << 10), &[1, 1, 7]);
+        // TypeRef: scope, name, namespace.
+        tilde.extend_from_slice(&0u16.to_le_bytes());
+        tilde.extend_from_slice(&8u16.to_le_bytes());
+        tilde.extend_from_slice(&5u16.to_le_bytes());
+        // TypeDef: flags, name, namespace, extends, field list, method list.
+        tilde.extend_from_slice(&0u32.to_le_bytes());
+        tilde.extend_from_slice(&1u16.to_le_bytes());
+        tilde.extend_from_slice(&0u16.to_le_bytes());
+        tilde.extend_from_slice(&0u16.to_le_bytes());
+        tilde.extend_from_slice(&1u16.to_le_bytes());
+        tilde.extend_from_slice(&1u16.to_le_bytes());
+        // MemberRef rows: coded parent, name, blob index 0. Tags: 0 TypeDef, 1 TypeRef,
+        // 2 ModuleRef, 3 MethodDef, 4 TypeSpec, then TypeRef row 5 (absent) and tag 5.
+        for (coded, name) in [
+            (8u16, 14u16),
+            (9, 16),
+            (10, 18),
+            (19, 20),
+            (12, 22),
+            (41, 24),
+            (13, 26),
+        ] {
+            tilde.extend_from_slice(&coded.to_le_bytes());
+            tilde.extend_from_slice(&name.to_le_bytes());
+            tilde.extend_from_slice(&0u16.to_le_bytes());
+        }
+        let mut strings = vec![0u8];
+        strings.extend_from_slice(b"App\0Ns\0IFace\0a\0b\0c\0d\0e\0f\0g\0");
+        let (file, streams) = with_strings(&tilde, &strings);
+        let meta = read_metadata_names(&file, Some(0), &streams);
+        assert_eq!(
+            meta.member_refs,
+            vec!["a", "b", "c", "d", "e", "f", "g"]
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            meta.member_ref_parents,
+            vec![
+                "App".to_string(),
+                "Ns.IFace".to_string(),
+                "ModuleRef#1".to_string(),
+                "MethodDef#2".to_string(),
+                "TypeSpec#1".to_string(),
+                String::new(),
+                String::new(),
+            ]
+        );
     }
 
     fn clr_method(name: &str, params: &[(&str, u16)]) -> ClrMethod {

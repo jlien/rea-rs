@@ -127,7 +127,7 @@ enum Command {
     },
     /// C header of recovered local and export names. An Itanium demangle becomes a declaration.
     Headers { path: String },
-    /// Identifying fields of an XML Info.plist. A binary plist or a file with none of the keys prints null.
+    /// Identifying fields of an XML or binary Info.plist. A file with none of the keys prints null.
     Plist { path: String },
     /// Identifying lines of a text crash report. A report with none of them prints null.
     Crash { path: String },
@@ -382,17 +382,42 @@ fn main() -> anyhow::Result<()> {
                 _ => None,
             };
             let target = loader::load_arch(path, arch).context("failed to load target")?;
+            // Native-code commands do not read a WASM target; the deep view
+            // is `rea wasm`.
+            if matches!(
+                cli.command,
+                Command::Disasm { .. }
+                    | Command::Funcs { .. }
+                    | Command::Xrefs { .. }
+                    | Command::Decompile { .. }
+            ) {
+                target
+                    .require_native()
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
             let json = match &cli.command {
-                Command::Info { .. } => serde_json::json!({
-                    "path": target.path,
-                    "format": target.format.as_str(),
-                    "arch": target.arch.as_str(),
-                    "bits": target.bits,
-                    "little_endian": target.little_endian,
-                    "entry": target.entry,
-                    "sections": target.sections.len(),
-                    "symbols": target.symbols.len(),
-                }),
+                Command::Info { .. } => {
+                    let mut value = serde_json::json!({
+                        "path": target.path,
+                        "format": target.format.as_str(),
+                        "arch": target.arch.as_str(),
+                        "bits": target.bits,
+                        "little_endian": target.little_endian,
+                        "entry": target.entry,
+                        "sections": target.sections.len(),
+                        "symbols": target.symbols.len(),
+                    });
+                    if target.format == rea_core::Format::Wasm {
+                        let module = rea_core::wasm::inspect(&target.bytes)
+                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                        value["wasm"] = serde_json::json!({
+                            "sections": module.sections.len(),
+                            "functions": module.functions,
+                            "exports": module.exports.len(),
+                        });
+                    }
+                    value
+                }
                 Command::Sections { .. } => serde_json::json!(target.sections),
                 Command::Symbols { kind, .. } => {
                     let want: &[&str] = match kind {
