@@ -4,15 +4,21 @@
 //! follows unconditional `jmp` / `b` / `br` with a direct target inside the
 //! enclosing function — bounds come from rea-core's function discovery, or
 //! from the forward-jump walk from the address itself when no discovered
-//! function covers it. The listing keeps the 64-instruction cap and follows
-//! at most 8 hops; a repeated target, an out-of-function branch, an indirect
-//! jump, or a `ret` ends it. On x86_64 and arm64, registers that receive a
-//! value of known width are rendered as synthetic typed locals
+//! function covers it. One forward conditional (`jcc` on x86_64, `b.cond` on
+//! arm64) whose target is inside the same function and ahead of the branch is
+//! also followed: the fall-through block is listed up to the target, where
+//! both paths join, and the walk continues from there. The listing keeps the
+//! 64-instruction cap and follows at most 8 hops; a repeated target, an
+//! out-of-function branch, an indirect jump, or a `ret` ends it. A backward
+//! conditional, or one whose target is outside the function, stays a `goto`
+//! line and its taken path is not explored. On x86_64 and arm64, registers
+//! that receive a value of known width are rendered as synthetic typed locals
 //! (`int v1; void* v2;`): loads are typed by the signedness and width of the
 //! load mnemonic, and `lea` / `adrp`+`add` targets become `void*`. A type
 //! flows through a followed join while the register state is trivially
-//! carried (same physical register, no writes in the skipped gap); an
-//! unsound join drops the type instead of guessing. It is still not a
+//! carried (same physical register, no writes in the skipped gap); across a
+//! conditional join, a type carries only when every incoming path agrees on
+//! it — an unsound join drops the type instead of guessing. It is still not a
 //! type-recovering decompiler: memory objects keep no types, and struct
 //! recovery and cross-function dataflow stay out of scope. A short or
 //! unmapped body returns an error from disassembly and does not invent
@@ -36,16 +42,26 @@ struct Gap {
     insns: Option<Vec<disasm::Instruction>>,
 }
 
+/// A followed conditional branch's join. `branch` is the window index of the
+/// branch itself, `after` the window index of the first instruction at its
+/// target, and `insns` the listed fall-through block between the two.
+struct CondJoin {
+    branch: usize,
+    after: usize,
+    insns: Vec<disasm::Instruction>,
+}
+
 /// Pseudo-C for at most `limit` instructions from `addr`, following
-/// unconditional jumps inside the enclosing function. `limit` is capped at 64.
+/// unconditional jumps and one forward conditional inside the enclosing
+/// function. `limit` is capped at 64.
 pub fn decompile(target: &Target, addr: u64, limit: usize) -> Result<String> {
     let limit = limit.clamp(1, 64);
-    let (insns, skipped, gaps) = walk(target, addr, limit)?;
+    let (insns, skipped, gaps, joins) = walk(target, addr, limit)?;
     if insns.is_empty() {
         return Err(Error::Parse("decompile: no instructions".into()));
     }
     let typed = plan_types(&insns, target.arch);
-    let (declared, kills) = carry_types(&typed, &gaps, target.arch);
+    let (declared, kills) = carry_types(&typed, &gaps, &joins, target.arch);
     let mut names = Names::new(target.arch);
     let mut next = 0usize;
     let mut dead = 0usize;
@@ -76,23 +92,35 @@ pub fn decompile(target: &Target, addr: u64, limit: usize) -> Result<String> {
 }
 
 /// Walk the window from `addr`, following unconditional jumps whose direct
-/// target stays inside `[fstart, fend)`. Returns the flow-ordered
-/// instructions, the indices of followed jumps (not rendered), and the gaps
-/// behind them. Stops at `ret`, an indirect or out-of-bounds branch (rendered
-/// as `goto`), a repeated target, the instruction cap, or undecodable bytes.
+/// target stays inside `[fstart, fend)`. One forward conditional (`jcc` /
+/// `b.cond`) whose target is inside the function and ahead of the branch is
+/// also followed: its fall-through block is listed up to the target, where
+/// both paths join, and the walk continues from there; a fall-through that
+/// stops short of the target leaves the branch an ordinary `goto` line.
+/// Returns the flow-ordered instructions, the indices of followed jumps (not
+/// rendered), the gaps behind them, and the conditional joins. Stops at
+/// `ret`, an indirect or out-of-bounds branch (rendered as `goto`), a
+/// repeated target, the instruction cap, or undecodable bytes.
 fn walk(
     target: &Target,
     addr: u64,
     limit: usize,
-) -> Result<(Vec<disasm::Instruction>, HashSet<usize>, Vec<Gap>)> {
+) -> Result<(
+    Vec<disasm::Instruction>,
+    HashSet<usize>,
+    Vec<Gap>,
+    Vec<CondJoin>,
+)> {
     let (fstart, fend) = function_bounds(target, addr);
     let mut out: Vec<disasm::Instruction> = Vec::new();
     let mut gaps: Vec<Gap> = Vec::new();
+    let mut joins: Vec<CondJoin> = Vec::new();
     let mut skipped: HashSet<usize> = HashSet::new();
     let mut visited: HashSet<u64> = HashSet::new();
     let mut cur = addr;
     let mut remaining = limit;
     let mut hops = 0u32;
+    let mut cond_done = false;
     loop {
         let chunk = match disasm::disassemble(target, cur, remaining) {
             Ok(c) => c,
@@ -143,6 +171,39 @@ fn walk(
                 }
                 break;
             }
+            // One forward conditional per window: list the fall-through block
+            // and continue at the target, where both paths join. A backward
+            // or out-of-function target stays a `goto` line.
+            if !cond_done && followable_cond(m, target.arch) {
+                if let Some(t) = analysis::direct_target(&insn.operands) {
+                    let branch_end = insn.addr.saturating_add(insn.size as u64);
+                    let followable = t > insn.addr
+                        && t >= fstart
+                        && t < fend
+                        && !visited.contains(&t)
+                        && hops < MAX_HOPS;
+                    if followable {
+                        if let Some(fall) = walk_fallthrough(target, branch_end, t, remaining) {
+                            let branch_at = out.len() - 1;
+                            for fi in &fall {
+                                visited.insert(fi.addr);
+                                out.push(fi.clone());
+                            }
+                            remaining -= fall.len();
+                            joins.push(CondJoin {
+                                branch: branch_at,
+                                after: out.len(),
+                                insns: fall,
+                            });
+                            hops += 1;
+                            cond_done = true;
+                            cur = t;
+                            jumped = true;
+                            break;
+                        }
+                    }
+                }
+            }
             if m == "ret" || m == "retf" {
                 stop = true;
                 break;
@@ -164,7 +225,7 @@ fn walk(
         let last = chunk.last().unwrap();
         cur = last.addr.saturating_add(last.size as u64);
     }
-    Ok((out, skipped, gaps))
+    Ok((out, skipped, gaps, joins))
 }
 
 /// Instructions in the skipped gap `(from, to)`, decoded to check for
@@ -177,6 +238,47 @@ fn scan_gap(target: &Target, from: u64, to: u64) -> Option<Vec<disasm::Instructi
         return None;
     }
     Some(insns.into_iter().take_while(|i| i.addr < to).collect())
+}
+
+/// The fall-through block of a followed conditional: the instructions from
+/// `from` up to (not including) the join target `to`, decoded linearly within
+/// `budget`. `None` when the block does not decode cleanly to `to` — a
+/// `ret`, a branch, undecodable bytes, an instruction straddling `to`, or
+/// the budget spent — because the path then stops short of the join and the
+/// branch stays an ordinary `goto` line.
+fn walk_fallthrough(
+    target: &Target,
+    from: u64,
+    to: u64,
+    budget: usize,
+) -> Option<Vec<disasm::Instruction>> {
+    let mut out = Vec::new();
+    let mut cur = from;
+    while cur < to {
+        if out.len() >= budget {
+            return None;
+        }
+        let insns = disasm::disassemble(target, cur, 1).ok()?;
+        let insn = insns.into_iter().next()?;
+        let end = insn.addr.checked_add(insn.size as u64)?;
+        if end > to {
+            return None;
+        }
+        let m = insn.mnemonic.as_str();
+        if m == "ret"
+            || m == "retf"
+            || m == "jmp"
+            || m == "b"
+            || m == "br"
+            || m.starts_with("invalid")
+            || is_cond(m)
+        {
+            return None;
+        }
+        out.push(insn);
+        cur = end;
+    }
+    Some(out)
 }
 
 /// Bounds of the function containing `addr`, from rea-core's function
@@ -204,13 +306,20 @@ fn written_reg(insn: &disasm::Instruction, arch: Arch) -> Option<String> {
 }
 
 /// Resolve which typed registers survive the followed joins. A register keeps
-/// its type across a hop when the skipped gap holds no write to it (same
-/// physical register, no intervening writes); an undecodable gap drops every
-/// type carried into the join. Returns the declared registers with their
-/// synthetic-local numbers, and the window index after which each type dies.
+/// its type across an unconditional hop when the skipped gap holds no write
+/// to it (same physical register, no intervening writes); an undecodable gap
+/// drops every type carried into the join. Across a followed conditional's
+/// join, the incoming paths are the fall-through block and the direct entry
+/// at the target: a type carries only when every incoming path agrees on it —
+/// a register first typed inside the fall-through block is untyped on the
+/// direct path, and a block write that leaves a different type (or no
+/// inferable type) kills the carried type. Returns the declared registers
+/// with their synthetic-local numbers, and the window index after which each
+/// type dies.
 fn carry_types<'a>(
     typed: &'a [TypedReg],
     gaps: &[Gap],
+    joins: &[CondJoin],
     arch: Arch,
 ) -> (Vec<(&'a TypedReg, usize)>, Vec<(usize, String)>) {
     let mut kill: HashMap<String, usize> = HashMap::new();
@@ -225,6 +334,43 @@ fn carry_types<'a>(
                 kill.entry(reg)
                     .and_modify(|k| *k = (*k).min(gap.after))
                     .or_insert(gap.after);
+            }
+        }
+    }
+    for join in joins {
+        // Types established before the branch, as the direct path carries
+        // them into the join.
+        let pre: HashMap<String, &'static str> = typed
+            .iter()
+            .filter(|r| r.first < join.branch)
+            .map(|r| (r.aliases[0].clone(), r.ty))
+            .collect();
+        for r in typed {
+            if r.first >= join.after {
+                continue;
+            }
+            let reg = &r.aliases[0];
+            let disagreed = if r.first >= join.branch {
+                // First typed inside the fall-through block: the direct path
+                // arrives with the register untyped.
+                true
+            } else {
+                // Replay the block's writes: the carried type survives only
+                // when the block leaves the same type the direct path has.
+                let mut state = Some(r.ty);
+                for insn in &join.insns {
+                    if written_reg(insn, arch).as_deref() == Some(reg.as_str()) {
+                        state = infer_insn(insn, arch, &pre)
+                            .filter(|(c, _)| c == reg)
+                            .map(|(_, ty)| ty);
+                    }
+                }
+                state != Some(r.ty)
+            };
+            if disagreed {
+                kill.entry(reg.clone())
+                    .and_modify(|k| *k = (*k).min(join.after))
+                    .or_insert(join.after);
             }
         }
     }
@@ -278,6 +424,16 @@ fn statement(insn: &disasm::Instruction, names: &Names) -> String {
         format!("{m} {ops}")
     };
     names.rename(&raw)
+}
+
+/// Whether the window may follow `m` as a conditional branch: `jcc` on
+/// x86_64, `b.cond` on arm64. Other architectures stay linear.
+fn followable_cond(m: &str, arch: Arch) -> bool {
+    match arch {
+        Arch::X86_64 => m.starts_with('j') && m != "jmp",
+        Arch::Arm64 => m.starts_with("b."),
+        _ => false,
+    }
 }
 
 fn is_cond(m: &str) -> bool {
@@ -862,6 +1018,86 @@ mod tests {
         assert!(text.contains("v1 = dword ptr [rip"), "{text}");
         assert!(text.contains("  return;\n"), "{text}");
         assert!(!text.contains("return (int)"), "{text}");
+    }
+
+    #[test]
+    fn x86_64_type_flows_through_a_followed_conditional_join() {
+        // movsxd rax, dword ptr [rip + 0]; je 0x100a; nop; ret
+        let code = [
+            0x48, 0x63, 0x05, 0x00, 0x00, 0x00, 0x00, 0x74, 0x01, 0x90, 0xc3,
+        ];
+        let text = decompile(&target(Arch::X86_64, 64, &code), 0x1000, 16).unwrap();
+        assert!(text.contains("int v1;"), "{text}");
+        assert!(text.contains("if (je) goto 0x100a;"), "{text}");
+        assert!(text.contains("return (int)v1"), "{text}");
+    }
+
+    #[test]
+    fn x86_64_fallthrough_write_of_a_different_type_drops_the_type_at_the_join() {
+        // movzx eax, byte ptr [rip + 0]; je 0x1010; movsxd rax, dword ptr
+        // [rip + 0]; ret. The fall-through rewrites rax as int, so the direct
+        // path's uint8_t disagrees and the register is untyped at the join.
+        let code = [
+            0x0f, 0xb6, 0x05, 0x00, 0x00, 0x00, 0x00, 0x74, 0x07, 0x48, 0x63, 0x05, 0x00, 0x00,
+            0x00, 0x00, 0xc3,
+        ];
+        let text = decompile(&target(Arch::X86_64, 64, &code), 0x1000, 16).unwrap();
+        assert!(text.contains("uint8_t v1;"), "{text}");
+        assert!(text.contains("v1 = dword ptr [rip"), "{text}");
+        assert!(text.contains("  return;\n"), "{text}");
+        assert!(!text.contains("return (uint8_t)"), "{text}");
+    }
+
+    #[test]
+    fn x86_64_backward_conditional_stays_a_goto_and_the_fallthrough_continues() {
+        // mov eax, 1; je 0x1000; ret
+        let code = [0xb8, 0x01, 0x00, 0x00, 0x00, 0x74, 0xf9, 0xc3];
+        let text = decompile(&target(Arch::X86_64, 64, &code), 0x1000, 16).unwrap();
+        assert!(text.contains("if (je) goto 0x1000;"), "{text}");
+        assert!(text.contains("return"), "{text}");
+        // The taken path is not re-listed: exactly one `eax = 1`.
+        assert_eq!(text.matches("eax = 1").count(), 1);
+    }
+
+    #[test]
+    fn x86_64_conditional_to_an_out_of_function_target_stays_a_goto() {
+        // mov eax, 1; je 0x9000; ret
+        let code = [
+            0xb8, 0x01, 0x00, 0x00, 0x00, 0x0f, 0x84, 0xf5, 0x7f, 0x00, 0x00, 0xc3,
+        ];
+        let text = decompile(&target(Arch::X86_64, 64, &code), 0x1000, 16).unwrap();
+        assert!(text.contains("if (je) goto 0x9000;"), "{text}");
+        assert!(text.contains("return"), "{text}");
+    }
+
+    #[test]
+    fn x86_64_conditional_whose_fallthrough_stops_short_is_not_followed() {
+        // mov eax, 1; je 0x100b; ret; nop; nop; nop; mov ebx, 2; ret.
+        // The fall-through path hits the ret, so the branch stays a goto and
+        // the taken path at 0x100b is never listed.
+        let code = [
+            0xb8, 0x01, 0x00, 0x00, 0x00, 0x74, 0x04, 0xc3, 0x90, 0x90, 0x90, 0xbb, 0x02, 0x00,
+            0x00, 0x00, 0xc3,
+        ];
+        let text = decompile(&target(Arch::X86_64, 64, &code), 0x1000, 16).unwrap();
+        assert!(text.contains("if (je) goto 0x100b;"), "{text}");
+        assert!(text.contains("return"), "{text}");
+        assert!(!text.contains("ebx = 2"), "{text}");
+    }
+
+    #[test]
+    fn arm64_b_cond_follows_to_the_join_and_carries_the_type() {
+        // ldr w0, [x9]; b.eq #0x100c; nop; ret — the type survives the join,
+        // so the return casts the synthetic local.
+        let code = [
+            0x20, 0x01, 0x40, 0xb9, 0x40, 0x00, 0x00, 0x54, 0x1f, 0x20, 0x03, 0xd5, 0xc0, 0x03,
+            0x5f, 0xd6,
+        ];
+        let text = decompile(&target(Arch::Arm64, 64, &code), 0x1000, 16).unwrap();
+        assert!(text.contains("unsigned int v1;"), "{text}");
+        assert!(text.contains("v1 = [x9]"), "{text}");
+        assert!(text.contains("if (b.eq) goto #0x100c;"), "{text}");
+        assert!(text.contains("return (unsigned int)v1"), "{text}");
     }
 
     #[test]

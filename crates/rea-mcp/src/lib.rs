@@ -501,7 +501,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "rea_decompile",
-            "description": "Bounded pseudo-C at a virtual address: assignments, calls, gotos, and returns, following unconditional jumps inside the enclosing function (up to 64 instructions, 8 hops). Width-based types on x86_64 and arm64: typed synthetic locals, casts at call arguments and returns; types cross a followed join only when trivially carried. No memory-object or struct types, no cross-function dataflow. Optional arch selects a Mach-O slice.",
+            "description": "Bounded pseudo-C at a virtual address: assignments, calls, gotos, and returns, following unconditional jumps and one forward conditional (jcc / b.cond) inside the enclosing function (up to 64 instructions, 8 hops). Width-based types on x86_64 and arm64: typed synthetic locals, casts at call arguments and returns; types cross a followed join only when every incoming path agrees. No memory-object or struct types, no cross-function dataflow. Optional arch selects a Mach-O slice.",
             "inputSchema": schema(false, json!({
                 "address": { "type": "integer", "description": "Virtual address. Default is the entry point." },
                 "count": { "type": "integer", "description": "Maximum instructions (default 32, cap 64)." },

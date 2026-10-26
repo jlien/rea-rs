@@ -76,7 +76,7 @@ enum Command {
     },
     /// Direct call graph over discovered functions.
     Callgraph { path: String },
-    /// Pseudo-C at a virtual address. Follows an unconditional branch to a direct target inside the enclosing function; a target already listed ends the walk as a `goto`. Assignments, calls, gotos, and returns. Width-based types on x86_64 and arm64: typed synthetic locals, casts at call arguments and returns. `--arch` selects a Mach-O slice.
+    /// Pseudo-C at a virtual address. Follows an unconditional branch to a direct target inside the enclosing function, and one forward conditional (`jcc` / `b.cond`) whose target is in the function and ahead of the branch: the fall-through block is listed and both paths join at the target. A target already listed, a backward branch, or a branch outside the function ends the walk as a `goto`. Assignments, calls, gotos, and returns. Width-based types on x86_64 and arm64: typed synthetic locals, casts at call arguments and returns; a type carries across a conditional join only when every incoming path agrees. `--arch` selects a Mach-O slice.
     Decompile {
         path: String,
         /// Virtual address, hex (0x…) or decimal. Defaults to the entry point.
