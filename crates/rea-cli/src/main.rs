@@ -88,7 +88,7 @@ enum Command {
         #[arg(long)]
         arch: Option<String>,
     },
-    /// WASM section ids, imports, exports, type signatures, function bodies, element and data segments, and a capped custom payload. Memory limits carry the shared flag, and imported memories list their limits. `--wat` prints a WAT-flavored readability listing of what is decoded; it is not a full WAT writer. `--execute` runs one export with the i32 interpreter. No WASI, and `--execute` does not touch memory.
+    /// WASM section ids, imports, exports, type signatures, function bodies, element and data segments, and a capped custom payload. Memory limits carry the shared flag, and imported memories list their limits. `--wat` prints a WAT-flavored readability listing of what is decoded; it is not a full WAT writer. `--wat-full` prints a full WAT emission of the same decoded content, with unknown opcodes as inline comments. `--execute` runs one export with the i32 interpreter. No WASI, and `--execute` does not touch memory.
     Wasm {
         path: String,
         /// Exported function to run. Omit this to inspect only.
@@ -100,6 +100,9 @@ enum Command {
         /// Print a WAT-flavored readability listing instead of JSON. Not a full WAT writer.
         #[arg(long, conflicts_with = "execute")]
         wat: bool,
+        /// Print a full WAT emission of what is decoded instead of JSON: types with full param and result lists, imports with kind details, segment offsets, and function bodies with locals. Still not a writer for undecoded things.
+        #[arg(long, conflicts_with_all = ["execute", "wat"])]
+        wat_full: bool,
     },
     /// Go build info. Go 1.18+ inline blobs and pre-1.18 file offsets. A null or out-of-range offset is an error.
     Goinfo { path: String },
@@ -183,8 +186,14 @@ fn main() -> anyhow::Result<()> {
             execute,
             args,
             wat,
+            wat_full,
         } => {
             let bytes = std::fs::read(path).context("failed to read target")?;
+            if *wat_full {
+                let module = rea_core::wasm::inspect(&bytes).context("wasm")?;
+                println!("{}", rea_core::wasm::wat_full(&module));
+                return Ok(());
+            }
             if *wat {
                 let module = rea_core::wasm::inspect(&bytes).context("wasm")?;
                 println!("{}", rea_core::wasm::wat(&module));
