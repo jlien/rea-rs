@@ -348,7 +348,7 @@ fn sh_flag_names(flags: u64) -> Vec<String> {
     push(0x200, "GROUP");
     push(0x400, "TLS");
     push(0x800, "COMPRESSED");
-    push(0x4000000, "EXCLUDE");
+    push(0x8000_0000, "EXCLUDE");
     if flags & SHF_MASKOS != 0 {
         out.push(format!("os-0x{:x}", flags & SHF_MASKOS));
     }

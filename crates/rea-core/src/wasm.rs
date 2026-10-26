@@ -45,6 +45,8 @@ pub struct WasmTable {
     pub kind: String,
     pub min: u32,
     pub max: Option<u32>,
+    /// True when the limits carry the shared flag.
+    pub shared: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -598,10 +600,14 @@ fn limit_text(memory: &WasmMemory) -> String {
 }
 
 fn table_limits(table: &WasmTable) -> String {
-    match table.max {
+    let mut text = match table.max {
         Some(max) => format!("{} {max} {}", table.min, table.kind),
         None => format!("{} {}", table.min, table.kind),
+    };
+    if table.shared {
+        text.push_str(" shared");
     }
+    text
 }
 
 fn decode_types(payload: &[u8]) -> Result<(u32, Vec<WasmFuncType>)> {
@@ -680,7 +686,8 @@ fn decode_tables(payload: &[u8]) -> Result<Vec<WasmTable>> {
         } else {
             None
         };
-        out.push(WasmTable { kind, min, max });
+        let shared = flags & 2 != 0;
+        out.push(WasmTable { kind, min, max, shared });
     }
     if !r.eof() {
         return Err(Error::Parse("trailing bytes in wasm table section".into()));
@@ -1026,11 +1033,12 @@ fn decode_imports(payload: &[u8]) -> Result<DecodedImports> {
             0 => ("func", r.read_u32_leb()?),
             1 => {
                 let elemtype = r.read_u8()?;
-                let (min, max, _shared) = r.read_limits_full()?;
+                let (min, max, shared) = r.read_limits_full()?;
                 tables.push(WasmTable {
                     kind: ref_name(elemtype),
                     min,
                     max,
+                    shared,
                 });
                 ("table", min)
             }
@@ -1339,6 +1347,39 @@ mod tests {
     }
 
     #[test]
+    fn table_shared_flag_and_imported_table() {
+        // One shared table: kind funcref, flags 0x03 = has-max + shared.
+        let m = inspect(&hex("0061736d0100000004050170030102")).unwrap();
+        assert_eq!(
+            m.tables,
+            vec![WasmTable {
+                kind: "funcref".into(),
+                min: 1,
+                max: Some(2),
+                shared: true,
+            }]
+        );
+
+        // Min-only table is not shared.
+        let plain = inspect(&hex("0061736d01000000040401700002")).unwrap();
+        assert_eq!(plain.tables[0].shared, false);
+        assert_eq!(plain.tables[0].max, None);
+
+        // An imported table keeps its limits with the shared flag.
+        let imported = inspect(&hex("0061736d01000000020a010165016d0170030204")).unwrap();
+        assert_eq!(imported.imports[0].kind, "table");
+        assert_eq!(
+            imported.imported_tables,
+            vec![WasmTable {
+                kind: "funcref".into(),
+                min: 2,
+                max: Some(4),
+                shared: true,
+            }]
+        );
+    }
+
+    #[test]
     fn memory_shared_flag_and_imported_memory() {
         // One shared memory: flags 0x03 = has-max + shared.
         let m = inspect(&hex("0061736d01000000050401030102")).unwrap();
@@ -1498,11 +1539,13 @@ mod tests {
                     kind: "funcref".into(),
                     min: 1,
                     max: Some(4),
+                    shared: false,
                 },
                 WasmTable {
                     kind: "externref".into(),
                     min: 2,
                     max: None,
+                    shared: false,
                 },
             ]
         );
