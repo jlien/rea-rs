@@ -634,7 +634,7 @@ mod tests {
     #[test]
     fn rea_info_reports_wasm_identity_counts() {
         let path =
-            std::env::temp_dir().join(format!("rea-mcp-wasm-{}.wasm", std::process::id()));
+            std::env::temp_dir().join(format!("rea-mcp-wasm-info-{}.wasm", std::process::id()));
         std::fs::write(&path, wasm_module()).unwrap();
         let msg = json!({
             "jsonrpc": "2.0",
@@ -659,7 +659,7 @@ mod tests {
     #[test]
     fn rea_funcs_rejects_a_wasm_target() {
         let path =
-            std::env::temp_dir().join(format!("rea-mcp-wasm-{}.wasm", std::process::id()));
+            std::env::temp_dir().join(format!("rea-mcp-wasm-funcs-{}.wasm", std::process::id()));
         std::fs::write(&path, wasm_module()).unwrap();
         let msg = json!({
             "jsonrpc": "2.0",
