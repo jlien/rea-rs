@@ -23,8 +23,14 @@ pub struct MachoFacts {
     /// values, and the XML payload capped at 8 KiB (hex when the payload is not XML). `None` when the slot is absent
     /// or empty. Not an Apple trust decision.
     pub entitlements: Option<MachoEntitlements>,
-    /// Byte size of the DER entitlements slot (`0x10006`), when present. The DER contents stay unparsed.
+    /// Byte size of the DER entitlements slot (`0x10006`), when present.
     pub entitlements_der_size: Option<u32>,
+    /// Top-level keys parsed from the DER entitlements slot (`0x10006`), beside the XML keys of
+    /// [`MachoFacts::entitlements`]: a UTF8String key with a UTF8String or boolean value, each pair
+    /// counted toward a 32-pair cap; a nested sequence or set value is counted and skipped. Empty
+    /// when the slot is absent or its payload is not that sequence-of-pairs shape. No signature is
+    /// checked. Not an Apple trust decision.
+    pub entitlements_der_keys: Vec<MachoEntitlement>,
     /// `__info_plist` section, when its identifying keys are present.
     pub info_plist: Option<crate::plist::PlistInfo>,
     /// NUL-terminated printable C strings from every section whose name contains `objc`
@@ -139,6 +145,8 @@ pub struct MachoArch {
     pub entitlements: Option<MachoEntitlements>,
     /// DER entitlements slot size of this slice, same shape as [`MachoFacts::entitlements_der_size`].
     pub entitlements_der_size: Option<u32>,
+    /// DER entitlement keys of this slice, same shape as [`MachoFacts::entitlements_der_keys`].
+    pub entitlements_der_keys: Vec<MachoEntitlement>,
     /// `__info_plist` of this slice.
     pub info_plist: Option<crate::plist::PlistInfo>,
     /// ObjC strings of this slice, same shape as [`MachoFacts::objc_strings`].
@@ -165,6 +173,7 @@ pub fn facts(bytes: &[u8]) -> Result<MachoFacts> {
         cms_verified: body.cms_verified,
         entitlements: body.entitlements,
         entitlements_der_size: body.entitlements_der_size,
+        entitlements_der_keys: body.entitlements_der_keys,
         info_plist: body.info_plist,
         objc_strings: body.objc_strings,
         overlay: body.overlay,
@@ -184,6 +193,7 @@ struct SliceBody {
     cms_verified: Option<bool>,
     entitlements: Option<MachoEntitlements>,
     entitlements_der_size: Option<u32>,
+    entitlements_der_keys: Vec<MachoEntitlement>,
     info_plist: Option<crate::plist::PlistInfo>,
     objc_strings: Vec<ObjcString>,
     overlay: Option<crate::Overlay>,
@@ -214,13 +224,13 @@ fn slice_body(mo: &goblin::mach::MachO, bytes: &[u8]) -> SliceBody {
             goblin::mach::load_command::CommandVariant::CodeSignature(_)
         )
     });
-    let (signature, cms, cms_verified, entitlements, entitlements_der_size) =
+    let (signature, cms, cms_verified, entitlements, entitlements_der_size, entitlements_der_keys) =
         mo.load_commands.iter().find_map(|cmd| match &cmd.command {
             goblin::mach::load_command::CommandVariant::CodeSignature(linkedit) => {
                 Some(signature_parts(bytes, linkedit.dataoff, linkedit.datasize))
             }
             _ => None,
-        }).unwrap_or((None, None, None, None, None));
+        }).unwrap_or((None, None, None, None, None, Vec::new()));
     SliceBody {
         dylibs: mo.libs.iter().map(|lib| (*lib).to_string()).collect(),
         rpaths: mo.rpaths.iter().map(|path| (*path).to_string()).collect(),
@@ -234,6 +244,7 @@ fn slice_body(mo: &goblin::mach::MachO, bytes: &[u8]) -> SliceBody {
         cms_verified,
         entitlements,
         entitlements_der_size,
+        entitlements_der_keys,
         info_plist: embedded_plist(mo),
         objc_strings: objc_strings(mo),
         overlay: crate::trailing_overlay(segment_file_end(mo), bytes.len() as u64),
@@ -356,9 +367,10 @@ fn signature_parts(
     Option<bool>,
     Option<MachoEntitlements>,
     Option<u32>,
+    Vec<MachoEntitlement>,
 ) {
     let Some(blob) = superblob(bytes, dataoff, datasize) else {
-        return (None, None, None, None, None);
+        return (None, None, None, None, None, Vec::new());
     };
     let signature = code_directory(blob);
     let cms = cms_blob(blob);
@@ -367,14 +379,23 @@ fn signature_parts(
         _ => None,
     };
     let entitlements = entitlements_slot(blob);
-    let entitlements_der_size = slot_bytes(blob, CSSLOT_ENTITLEMENTS_DER).map(|der| {
+    let der_slot = slot_bytes(blob, CSSLOT_ENTITLEMENTS_DER);
+    let entitlements_der_size = der_slot.map(|der| {
         let declared = if der.len() >= 8 { be_u32(der, 4).map(|v| v as usize) } else { None };
         match declared {
             Some(v) if v >= 8 && v <= der.len() => v as u32,
             _ => der.len() as u32,
         }
     });
-    (signature, cms, verified, entitlements, entitlements_der_size)
+    let entitlements_der_keys = der_slot.map(der_entitlement_keys).unwrap_or_default();
+    (
+        signature,
+        cms,
+        verified,
+        entitlements,
+        entitlements_der_size,
+        entitlements_der_keys,
+    )
 }
 
 /// The bytes of one superblob slot. The slot blob's declared length (big-endian at its offset + 4) is honored when it
@@ -430,6 +451,86 @@ fn entitlements_slot(blob: &[u8]) -> Option<MachoEntitlements> {
         None => cap_hex(payload),
     };
     Some(MachoEntitlements { entries, payload })
+}
+
+/// Top-level keys from the DER entitlements slot (`0x10006`). A `blob-wrapper` header
+/// (`0xfade_0b01`) is stripped the way [`entitlements_slot`] strips it. The payload then parses as
+/// one DER `SEQUENCE` of pairs: a UTF8String key (tag `0x0C`) whose value is a UTF8String or a
+/// `BOOLEAN` (tag `0x01`). Each pair counts toward [`NESTED_ENTITLEMENTS_CAP`] keys; a value that
+/// is itself a `SEQUENCE` or a `SET` is counted and skipped. A payload that does not start with a
+/// sequence, a pair whose key is not a UTF8String, or a value this task does not recognize leaves
+/// the keys empty; the size stays and the Mach-O parse never fails. No signature is checked.
+fn der_entitlement_keys(slot: &[u8]) -> Vec<MachoEntitlement> {
+    let payload = if slot.len() >= 8 && be_u32(slot, 0) == Some(CSMAGIC_BLOBWRAPPER) {
+        let declared = be_u32(slot, 4).map(|v| v as usize);
+        match declared {
+            Some(v) if v >= 8 && v <= slot.len() => &slot[8..v],
+            _ => &slot[8..],
+        }
+    } else {
+        slot
+    };
+    let Some((0x30, content, _)) = der_tlv(payload, 0) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut counted = 0usize;
+    let mut at = 0usize;
+    while at < content.len() && counted < NESTED_ENTITLEMENTS_CAP {
+        counted += 1;
+        let Some((0x0C, key_bytes, next)) = der_tlv(content, at) else {
+            return Vec::new();
+        };
+        let Some((value_tag, value_bytes, next)) = der_tlv(content, next) else {
+            return Vec::new();
+        };
+        at = next;
+        let key = match std::str::from_utf8(key_bytes) {
+            Ok(key) => key,
+            Err(_) => return Vec::new(),
+        };
+        match value_tag {
+            0x0C => match std::str::from_utf8(value_bytes) {
+                Ok(value) => out.push(MachoEntitlement {
+                    key: key.to_string(),
+                    value: Some(value.to_string()),
+                }),
+                Err(_) => return Vec::new(),
+            },
+            0x01 if value_bytes.len() == 1 => out.push(MachoEntitlement {
+                key: key.to_string(),
+                value: Some(if value_bytes[0] == 0 { "false" } else { "true" }.to_string()),
+            }),
+            0x30 | 0x31 => {}
+            _ => return Vec::new(),
+        }
+    }
+    out
+}
+
+/// One DER tag-length-value at `at`: `(tag, content, offset past it)`. A short or long-form length
+/// up to four bytes is honored; a tag, length, or content that does not fit is `None`.
+fn der_tlv(bytes: &[u8], at: usize) -> Option<(u8, &[u8], usize)> {
+    let tag = *bytes.get(at)?;
+    let first = *bytes.get(at + 1)?;
+    let mut len_at = at + 2;
+    let len = match first {
+        n if n < 0x80 => n as usize,
+        n => {
+            let count = usize::from(n & 0x7f);
+            if count == 0 || count > 4 {
+                return None;
+            }
+            let mut len = 0usize;
+            for _ in 0..count {
+                len = (len << 8) | usize::from(*bytes.get(len_at)?);
+                len_at += 1;
+            }
+            len
+        }
+    };
+    let content = bytes.get(len_at..len_at.checked_add(len)?)?;
+    Some((tag, content, len_at + len))
 }
 
 /// Top-level `<key>` names with their immediate `<string>` or boolean value. A nested `<dict>` or `<array>`
@@ -948,6 +1049,7 @@ fn arch_of(cpu: String, offset: u64, size: u64, slice: &[u8]) -> MachoArch {
         cms_verified: body.cms_verified,
         entitlements: body.entitlements,
         entitlements_der_size: body.entitlements_der_size,
+        entitlements_der_keys: body.entitlements_der_keys,
         info_plist: body.info_plist,
         objc_strings: body.objc_strings,
         overlay: body.overlay,
@@ -979,6 +1081,7 @@ fn empty_slice() -> SliceBody {
         cms_verified: None,
         entitlements: None,
         entitlements_der_size: None,
+        entitlements_der_keys: Vec::new(),
         info_plist: None,
         objc_strings: Vec::new(),
         overlay: None,
@@ -1056,6 +1159,7 @@ mod tests {
                 cms_verified: None,
                 entitlements: None,
                 entitlements_der_size: None,
+                entitlements_der_keys: Vec::new(),
                 info_plist: None,
                 objc_strings: Vec::new(),
                 overlay: None,
@@ -1095,6 +1199,7 @@ mod tests {
                 cms_verified: None,
                 entitlements: None,
                 entitlements_der_size: None,
+                entitlements_der_keys: Vec::new(),
                 info_plist: None,
                 objc_strings: Vec::new(),
                 overlay: None,
@@ -1548,15 +1653,122 @@ mod tests {
     }
 
     #[test]
-    fn der_slot_is_a_size_only() {
-        let der = b"\x30\x82\x04\x10\x02\x01\x01";
+    fn der_slot_keys_parse_beside_the_size() {
+        // SEQUENCE { UTF8String "key1", UTF8String "value1", UTF8String "key2", BOOLEAN true }
+        let der: &[u8] = &[
+            0x30, 0x17, 0x0C, 0x04, b'k', b'e', b'y', b'1', 0x0C, 0x06, b'v', b'a', b'l', b'u',
+            b'e', b'1', 0x0C, 0x04, b'k', b'e', b'y', b'2', 0x01, 0x01, 0x01,
+        ];
         let xml = entitlement_xml(&[("com.example.one", "1")]);
         let got = facts(&entitled_macho(&xml, Some(der))).unwrap();
         assert_eq!(got.entitlements_der_size, Some(der.len() as u32));
         assert_eq!(got.entitlements.expect("entitlements").entries.len(), 1);
+        assert_eq!(
+            got.entitlements_der_keys,
+            vec![
+                MachoEntitlement { key: "key1".into(), value: Some("value1".into()) },
+                MachoEntitlement { key: "key2".into(), value: Some("true".into()) },
+            ]
+        );
 
         let got = facts(&entitled_macho(&xml, None)).unwrap();
         assert_eq!(got.entitlements_der_size, None);
+        assert!(got.entitlements_der_keys.is_empty());
+    }
+
+    #[test]
+    fn der_slot_without_sequence_stays_size_only() {
+        // An INTEGER pair where a sequence opener would be: no keys, size kept.
+        let der: &[u8] = &[0x02, 0x01, 0x01, 0x0C, 0x01, b'x'];
+        let xml = entitlement_xml(&[("com.example.one", "1")]);
+        let got = facts(&entitled_macho(&xml, Some(der))).unwrap();
+        assert_eq!(got.entitlements_der_size, Some(der.len() as u32));
+        assert!(got.entitlements_der_keys.is_empty());
+        assert_eq!(got.entitlements.expect("entitlements").entries.len(), 1);
+    }
+
+    #[test]
+    fn der_unrecognized_pair_or_value_leaves_keys_empty() {
+        let xml = entitlement_xml(&[("com.example.one", "1")]);
+        // Key is an INTEGER, not a UTF8String.
+        let der: &[u8] = &[0x30, 0x05, 0x02, 0x01, 0x01, 0x01, 0x00];
+        let got = facts(&entitled_macho(&xml, Some(der))).unwrap();
+        assert_eq!(got.entitlements_der_size, Some(der.len() as u32));
+        assert!(got.entitlements_der_keys.is_empty());
+
+        // UTF8String key with a value tag this task does not recognize (NULL).
+        let der: &[u8] = &[0x30, 0x05, 0x0C, 0x01, b'k', 0x05, 0x00];
+        let got = facts(&entitled_macho(&xml, Some(der))).unwrap();
+        assert_eq!(got.entitlements_der_size, Some(der.len() as u32));
+        assert!(got.entitlements_der_keys.is_empty());
+    }
+
+    #[test]
+    fn der_boolean_zero_is_false_and_multibyte_lengths_parse() {
+        let der: &[u8] = &[
+            0x30, 0x81, 0x0e, 0x0C, 0x01, b'k', 0x01, 0x01, 0x00, 0x0C, 0x01, b'v', 0x0C, 0x03,
+            b'a', b'b', b'c',
+        ];
+        let got = facts(&entitled_macho(&entitlement_xml(&[("x", "1")]), Some(der))).unwrap();
+        assert_eq!(
+            got.entitlements_der_keys,
+            vec![
+                MachoEntitlement { key: "k".into(), value: Some("false".into()) },
+                MachoEntitlement { key: "v".into(), value: Some("abc".into()) },
+            ]
+        );
+    }
+
+    #[test]
+    fn der_nested_sequence_and_set_are_counted_and_skipped() {
+        // A SEQUENCE value, then a SET value; each counts toward the cap but contributes no key.
+        let der: &[u8] = &[
+            0x30, 0x14, 0x0C, 0x01, b'k', 0x30, 0x02, 0x05, 0x00, 0x0C, 0x01, b'j', 0x31, 0x02,
+            0x05, 0x00, 0x0C, 0x01, b'z', 0x0C, 0x01, b'w',
+        ];
+        let got = facts(&entitled_macho(&entitlement_xml(&[("x", "1")]), Some(der))).unwrap();
+        assert_eq!(
+            got.entitlements_der_keys,
+            vec![MachoEntitlement { key: "z".into(), value: Some("w".into()) }]
+        );
+    }
+
+    #[test]
+    fn der_keys_stop_at_the_cap() {
+        // 33 UTF8String/UTF8String pairs; the first 32 keys parse, the 33rd is never read.
+        let mut der = vec![0x30u8, 0x81, 0xc6];
+        for _ in 0..33u8 {
+            der.extend_from_slice(&[0x0C, 0x01, b'k', 0x0C, 0x01, b'v']);
+        }
+        let got = facts(&entitled_macho(&entitlement_xml(&[("x", "1")]), Some(&der))).unwrap();
+        assert_eq!(got.entitlements_der_keys.len(), 32);
+        assert_eq!(got.entitlements_der_keys[0].key, "k");
+
+        // An unrecognized pair before the cap leaves everything empty, even pairs after it.
+        let der: &[u8] = &[0x30, 0x0a, 0x0C, 0x01, b'a', 0x0C, 0x01, b'b', 0x02, 0x01, 0x01, 0x0C, 0x01, b'z'];
+        let got = facts(&entitled_macho(&entitlement_xml(&[("x", "1")]), Some(der))).unwrap();
+        assert!(got.entitlements_der_keys.is_empty());
+    }
+
+    #[test]
+    fn fat_slices_carry_their_own_der_keys() {
+        let der_arm: &[u8] = &[0x30, 0x06, 0x0C, 0x01, b'a', 0x01, 0x01, 0xFF];
+        let der_intel: &[u8] = &[0x30, 0x06, 0x0C, 0x01, b'b', 0x01, 0x01, 0x00];
+        let arm = entitled_macho(&entitlement_xml(&[("com.example.arm", "arm")]), Some(der_arm));
+        let intel =
+            entitled_macho(&entitlement_xml(&[("com.example.intel", "intel")]), Some(der_intel));
+        let arches = architectures(&fat_two(&arm, &intel)).unwrap();
+        assert_eq!(
+            arches[0].entitlements_der_keys,
+            vec![MachoEntitlement { key: "a".into(), value: Some("true".into()) }]
+        );
+        assert_eq!(
+            arches[1].entitlements_der_keys,
+            vec![MachoEntitlement { key: "b".into(), value: Some("false".into()) }]
+        );
+        let mixed = fat_two(&entitled_macho(&entitlement_xml(&[("a", "1")]), None), b"not-a-slice");
+        let arches = architectures(&mixed).unwrap();
+        assert!(arches[1].entitlements_der_keys.is_empty());
     }
 
     #[test]
