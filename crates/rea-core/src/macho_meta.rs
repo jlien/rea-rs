@@ -31,10 +31,24 @@ pub struct MachoFacts {
     /// (class names, method names, type strings), in file order, capped at
     /// [`OBJC_STRINGS_CAP`] with a trailing `... N more` marker. A section that holds
     /// pointers instead of characters contributes nothing. No `class_ro_t`, method list,
-    /// or protocol is walked.
-    pub objc_strings: Vec<String>,
+    /// or protocol is walked. A string that is a name [`crate::demangle::swift`] accepts
+    /// carries its `module.name` text beside the raw string; a name `swift` rejects
+    /// stays raw.
+    pub objc_strings: Vec<ObjcString>,
     /// Bytes past the last segment's file range.
     pub overlay: Option<crate::Overlay>,
+}
+
+/// One ObjC section string: the raw text, plus the Swift `module.name` demangling when
+/// [`crate::demangle::swift`] accepts the raw text. The `... N more` cap marker is an
+/// entry with no demangling.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ObjcString {
+    /// The raw string as it appears in the section, or the `... N more` marker.
+    pub text: String,
+    /// `module.name` from `crate::demangle::swift`, when the raw text demangles. Types,
+    /// generics, punycode, and labels stay unread; a rejected name stays raw.
+    pub module_name: Option<String>,
 }
 
 /// The Mach-O code directory inside `LC_CODE_SIGNATURE`.
@@ -123,7 +137,7 @@ pub struct MachoArch {
     /// `__info_plist` of this slice.
     pub info_plist: Option<crate::plist::PlistInfo>,
     /// ObjC strings of this slice, same shape as [`MachoFacts::objc_strings`].
-    pub objc_strings: Vec<String>,
+    pub objc_strings: Vec<ObjcString>,
     /// Bytes past this slice's last segment.
     pub overlay: Option<crate::Overlay>,
 }
@@ -166,7 +180,7 @@ struct SliceBody {
     entitlements: Option<MachoEntitlements>,
     entitlements_der_size: Option<u32>,
     info_plist: Option<crate::plist::PlistInfo>,
-    objc_strings: Vec<String>,
+    objc_strings: Vec<ObjcString>,
     overlay: Option<crate::Overlay>,
 }
 
@@ -254,9 +268,11 @@ const OBJC_STRINGS_CAP: usize = 128;
 /// NUL-terminated printable C strings from every section whose name contains `objc`,
 /// in file order. A section that holds pointers rather than characters (for example
 /// `__objc_classlist`) yields no printable runs and contributes nothing; no `class_ro_t`,
-/// method list, or protocol is walked, and Swift names are not demangled.
-fn objc_strings(mo: &goblin::mach::MachO) -> Vec<String> {
-    let mut hits: Vec<String> = Vec::new();
+/// method list, or protocol is walked. A string that is a name [`crate::demangle::swift`]
+/// accepts carries its `module.name` beside the raw text; a name `swift` rejects stays
+/// raw, and a demangle failure does not fail the parse.
+fn objc_strings(mo: &goblin::mach::MachO) -> Vec<ObjcString> {
+    let mut hits: Vec<ObjcString> = Vec::new();
     for seg in mo.segments.iter() {
         let Ok(sections) = seg.sections() else {
             continue;
@@ -280,7 +296,9 @@ fn objc_strings(mo: &goblin::mach::MachO) -> Vec<String> {
                 } else if b == 0 {
                     if let Some(s) = start.take() {
                         if i > s {
-                            hits.push(String::from_utf8_lossy(&data[s..i]).into_owned());
+                            let text = String::from_utf8_lossy(&data[s..i]).into_owned();
+                            let module_name = crate::demangle::swift(&text);
+                            hits.push(ObjcString { text, module_name });
                         }
                     }
                 } else {
@@ -294,7 +312,10 @@ fn objc_strings(mo: &goblin::mach::MachO) -> Vec<String> {
     if hits.len() > OBJC_STRINGS_CAP {
         let more = hits.len() - OBJC_STRINGS_CAP;
         hits.truncate(OBJC_STRINGS_CAP);
-        hits.push(format!("... {more} more"));
+        hits.push(ObjcString {
+            text: format!("... {more} more"),
+            module_name: None,
+        });
     }
     hits
 }
@@ -1871,7 +1892,11 @@ mod tests {
         let got = facts(&file).unwrap();
         assert_eq!(
             got.objc_strings,
-            vec!["NSObject".to_string(), "UIViewController".to_string(), "_something".to_string()]
+            vec![
+                ObjcString { text: "NSObject".into(), module_name: None },
+                ObjcString { text: "UIViewController".into(), module_name: None },
+                ObjcString { text: "_something".into(), module_name: None },
+            ]
         );
         assert_eq!(architectures(&file).unwrap()[0].objc_strings, got.objc_strings);
     }
@@ -1882,22 +1907,22 @@ mod tests {
         // not printable runs ending in NUL, so the list stays empty.
         let pointers = 0u64.to_le_bytes();
         let file = segment_slice(0x0100_000c, "__objc_classlist", &pointers, b"");
-        assert_eq!(facts(&file).unwrap().objc_strings, Vec::<String>::new());
+        assert_eq!(facts(&file).unwrap().objc_strings, Vec::<ObjcString>::new());
 
         // A non-objc section with the same bytes contributes nothing.
         let text = b"NSObject\0";
         let file = segment_slice(0x0100_000c, "__cstring", text, b"");
-        assert_eq!(facts(&file).unwrap().objc_strings, Vec::<String>::new());
+        assert_eq!(facts(&file).unwrap().objc_strings, Vec::<ObjcString>::new());
 
         // A printable run with no terminating NUL is not a C string and stays unread.
         let unterminated = b"NSObject";
         let file = segment_slice(0x0100_000c, "__objc_classname", unterminated, b"");
-        assert_eq!(facts(&file).unwrap().objc_strings, Vec::<String>::new());
+        assert_eq!(facts(&file).unwrap().objc_strings, Vec::<ObjcString>::new());
 
         // An empty section and a section whose bytes cannot be read leave an empty
         // list and do not fail the parse.
         let file = segment_slice(0x0100_000c, "__objc_methname", b"", b"");
-        assert_eq!(facts(&file).unwrap().objc_strings, Vec::<String>::new());
+        assert_eq!(facts(&file).unwrap().objc_strings, Vec::<ObjcString>::new());
     }
 
     #[test]
@@ -1909,9 +1934,38 @@ mod tests {
         let file = segment_slice(0x0100_000c, "__objc_classname", &body, b"");
         let got = facts(&file).unwrap();
         assert_eq!(got.objc_strings.len(), 129);
-        assert_eq!(got.objc_strings[0], "Cls0");
-        assert_eq!(got.objc_strings[127], "Cls127");
-        assert_eq!(got.objc_strings[128], "... 12 more");
+        assert_eq!(got.objc_strings[0].text, "Cls0");
+        assert_eq!(got.objc_strings[0].module_name, None);
+        assert_eq!(got.objc_strings[127].text, "Cls127");
+        assert_eq!(got.objc_strings[128].text, "... 12 more");
+        assert_eq!(got.objc_strings[128].module_name, None);
+    }
+
+    #[test]
+    fn a_swift_name_on_an_objc_section_string_carries_module_name() {
+        let body = b"$s4main3fooyyF\0_$s4main3bar3quxSfE\0";
+        let file = segment_slice(0x0100_000c, "__objc_classname", body, b"");
+        let got = facts(&file).unwrap();
+        assert_eq!(got.objc_strings.len(), 2);
+        assert_eq!(got.objc_strings[0].text, "$s4main3fooyyF");
+        assert_eq!(got.objc_strings[0].module_name.as_deref(), Some("main.foo"));
+        assert_eq!(got.objc_strings[1].text, "_$s4main3bar3quxSfE");
+        assert_eq!(got.objc_strings[1].module_name.as_deref(), Some("main.bar"));
+        assert_eq!(architectures(&file).unwrap()[0].objc_strings, got.objc_strings);
+    }
+
+    #[test]
+    fn a_swift_rejected_objc_string_stays_raw_and_does_not_fail_the_parse() {
+        // A plain class name is not a Swift mangled name and stays raw.
+        // A truncated Swift name is rejected and stays raw. Neither fails the parse.
+        let body = b"NSObject\0$s4main\0";
+        let file = segment_slice(0x0100_000c, "__objc_classname", body, b"");
+        let got = facts(&file).unwrap();
+        assert_eq!(got.objc_strings.len(), 2);
+        assert_eq!(got.objc_strings[0].text, "NSObject");
+        assert_eq!(got.objc_strings[0].module_name, None);
+        assert_eq!(got.objc_strings[1].text, "$s4main");
+        assert_eq!(got.objc_strings[1].module_name, None);
     }
 
     /// One 64-bit `__TEXT` segment. `extra` is past `filesize`.
