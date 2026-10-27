@@ -5,8 +5,8 @@
 pub struct StringHit {
     pub offset: u64,
     pub value: String,
-    /// `utf-16le`, `utf-16be`, `utf-32le`, or `utf-32be` for UTF-16 and
-    /// UTF-32 runs; absent for ASCII.
+    /// `utf-16le`, `utf-16be`, `utf-32le`, `utf-32be`, or `utf-8` for UTF-16,
+    /// UTF-32, and UTF-8 runs; absent for ASCII.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub encoding: Option<&'static str>,
 }
@@ -15,7 +15,9 @@ pub struct StringHit {
 /// UTF-16LE and UTF-16BE runs whose code units sit in `0x20..=0x7E`, using
 /// the same minimum length (counted in code units for UTF-16), plus UTF-32LE
 /// and UTF-32BE runs whose code points sit in `0x20..=0x7E` (counted in code
-/// points for UTF-32).
+/// points for UTF-32), plus valid UTF-8 runs containing at least one
+/// non-ASCII scalar whose scalars are printable (not C0, not C1, not U+007F),
+/// counted in scalars.
 ///
 /// A BE-shaped byte pattern (`00 61 00 62`) also parses as a nested LE run one
 /// unit shorter, and an LE pattern nests a BE run the same way. Between the two
@@ -25,13 +27,19 @@ pub struct StringHit {
 /// in bytes — so a later opposite-endian UTF-32 run that is strictly longer
 /// stays beside the shorter earlier hit. A UTF-32 run that overlaps a longer
 /// ASCII or UTF-16 hit (in bytes) is dropped; the hit the ASCII and UTF-16
-/// scans already keep stays.
+/// scans already keep stays. A UTF-8 run that overlaps a longer ASCII, UTF-16,
+/// or UTF-32 hit (in bytes) is dropped the same way; on a byte-length tie the
+/// hit the earlier scan already keeps stays. A run of only ASCII stays on the
+/// ASCII scan and does not gain an encoding; an invalid UTF-8 sequence ends
+/// the run and stays unread.
 pub fn extract(bytes: &[u8], min_len: usize) -> Vec<StringHit> {
     fn byte_len(h: &StringHit) -> u64 {
         match h.encoding {
             Some("utf-32le") | Some("utf-32be") => (h.value.len() as u64) * 4,
+            // UTF-8 and ASCII hits are their own byte length; UTF-16 hits are
+            // BMP code units stored in a Rust string, so two bytes per unit.
+            Some("utf-8") | None => h.value.len() as u64,
             Some(_) => (h.value.len() as u64) * 2,
-            None => h.value.len() as u64,
         }
     }
     fn run_end(h: &StringHit) -> u64 {
@@ -69,6 +77,20 @@ pub fn extract(bytes: &[u8], min_len: usize) -> Vec<StringHit> {
         {
             hits.push(u);
         }
+    }
+    // A UTF-8 run is checked last: where it overlaps an ASCII, UTF-16, or
+    // UTF-32 hit the scan already keeps, the longer hit stays and a tie keeps
+    // the earlier scan's hit — so a strictly longer UTF-8 run replaces the
+    // shorter hits it overlaps.
+    for u in utf8_runs(bytes, min_len) {
+        if hits
+            .iter()
+            .any(|h| overlaps(&u, h) && byte_len(h) >= byte_len(&u))
+        {
+            continue;
+        }
+        hits.retain(|h| !(overlaps(&u, h) && byte_len(&u) > byte_len(h)));
+        hits.push(u);
     }
     hits.sort_unstable_by_key(|h| h.offset);
     hits
@@ -188,6 +210,78 @@ fn utf32_runs(bytes: &[u8], min_len: usize, little: bool) -> Vec<StringHit> {
     hits
 }
 
+/// One pass over `bytes` decoding UTF-8 scalars in place. A run is a maximal
+/// sequence of printable scalars (not C0, not C1, not U+007F); a run is
+/// reported only when it holds at least one non-ASCII scalar and at least
+/// `min_len` scalars. A run of only ASCII stays on the ASCII scan. An invalid
+/// sequence (bad lead byte, bad continuation, overlong, surrogate, past
+/// U+10FFFF) ends the run and stays unread; the scan resumes after the run's
+/// bytes.
+fn utf8_runs(bytes: &[u8], min_len: usize) -> Vec<StringHit> {
+    fn printable(cp: u32) -> bool {
+        !(cp < 0x20 || (0x7f..=0x9f).contains(&cp))
+    }
+    /// Decode one scalar at `i`; return it and its encoded width, or `None`
+    /// when the sequence is invalid or truncated.
+    fn scalar(bytes: &[u8], i: usize) -> Option<(u32, usize)> {
+        let b0 = *bytes.get(i)?;
+        let (cp, width, cont_min, cont_max) = match b0 {
+            0x00..=0x7f => (b0 as u32, 1, 0, 0),
+            0xc2..=0xdf => ((b0 as u32) & 0x1f, 2, 0x80, 0xbf),
+            0xe0 => ((b0 as u32) & 0x0f, 3, 0xa0, 0xbf),
+            0xe1..=0xec | 0xee..=0xef => ((b0 as u32) & 0x0f, 3, 0x80, 0xbf),
+            0xed => ((b0 as u32) & 0x0f, 3, 0x80, 0x9f),
+            0xf0 => ((b0 as u32) & 0x07, 4, 0x90, 0xbf),
+            0xf1..=0xf3 => ((b0 as u32) & 0x07, 4, 0x80, 0xbf),
+            0xf4 => ((b0 as u32) & 0x07, 4, 0x80, 0x8f),
+            _ => return None,
+        };
+        let mut cp = cp;
+        for k in 1..width {
+            let b = *bytes.get(i + k)?;
+            if b < cont_min || b > cont_max {
+                return None;
+            }
+            cp = (cp << 6) | (b as u32 & 0x3f);
+        }
+        Some((cp, width))
+    }
+    let mut hits = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        match scalar(bytes, i) {
+            Some((cp, _)) if printable(cp) => {
+                let start = i;
+                let mut scalars = 0usize;
+                let mut has_non_ascii = false;
+                let mut value = String::new();
+                let mut j = i;
+                while let Some((cp, width)) = scalar(bytes, j) {
+                    if !printable(cp) {
+                        break;
+                    }
+                    if cp >= 0x80 {
+                        has_non_ascii = true;
+                    }
+                    value.push(char::from_u32(cp).unwrap());
+                    scalars += 1;
+                    j += width;
+                }
+                if has_non_ascii && scalars >= min_len {
+                    hits.push(StringHit {
+                        offset: start as u64,
+                        value,
+                        encoding: Some("utf-8"),
+                    });
+                }
+                i = j.max(start + 1);
+            }
+            _ => i += 1,
+        }
+    }
+    hits
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,21 +358,87 @@ mod tests {
 
     #[test]
     fn a_run_that_is_neither_ascii_nor_utf16_stays_unread() {
-        // UTF-32LE 'aaa' now reads; a non-ASCII UTF-8 scalar stays unread.
+        // UTF-32LE 'aaa' reads; a real multi-byte UTF-8 run reads as utf-8;
+        // a broken sequence stays unread.
         let mut data = Vec::new();
         for _ in 0..3 {
             data.extend_from_slice(&[0x61, 0, 0, 0]);
         }
         data.extend_from_slice(&[0xc3, 0xa9]);
         data.extend_from_slice(b"xyz");
+        data.extend_from_slice(&[0xc3, 0x28]);
         let hits = extract(&data, 3);
         let u32hit = hits.iter().find(|h| h.encoding == Some("utf-32le")).unwrap();
         assert_eq!(u32hit.value, "aaa");
         assert_eq!(u32hit.offset, 0);
-        // The é (U+00E9, one scalar) stays unread; plain ASCII still reads.
+        // é + xyz is one valid run of four printable scalars; the ASCII scan's
+        // shorter `xyz` yields to the longer UTF-8 hit.
+        let u8hit = hits.iter().find(|h| h.encoding == Some("utf-8")).unwrap();
+        assert_eq!(u8hit.value, "éxyz");
+        assert_eq!(u8hit.offset, 12);
+        // The broken sequence (0xC3 with a bad continuation 0x28) stays
+        // unread; `(` alone is under the minimum, so nothing else reads.
         let ascii: Vec<_> = hits.iter().filter(|h| h.encoding.is_none()).collect();
-        assert_eq!(ascii.len(), 1);
-        assert_eq!(ascii[0].value, "xyz");
+        assert!(ascii.is_empty());
+        assert_eq!(hits.len(), 2, "{hits:?}");
+    }
+
+    #[test]
+    fn a_multibyte_utf8_run_meets_the_minimum_in_scalars() {
+        // Two scalars (é é), min 2: reported once, counted in scalars.
+        let data = [0xc3u8, 0xa9, 0xc3, 0xa9];
+        let hits = extract(&data, 2);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].encoding, Some("utf-8"));
+        assert_eq!(hits[0].value, "éé");
+        assert_eq!(hits[0].offset, 0);
+        // serde shape: a UTF-8 hit adds the encoding key.
+        let json = serde_json::to_value(&hits[0]).unwrap();
+        assert_eq!(json["encoding"], "utf-8");
+        // One scalar, min 2: not reported.
+        assert!(extract(&data[..2], 2).is_empty());
+    }
+
+    #[test]
+    fn a_multibyte_run_yields_to_a_longer_ascii_hit_and_keeps_ascii_only_runs() {
+        // ASCII "abcd" (4 bytes) overlaps a UTF-8 run "abcd" + é (5 bytes)?
+        // No: the run is longer, so here pin the reverse — an ASCII hit longer
+        // than the UTF-8 run keeps its bytes. A non-ASCII scalar after long
+        // ASCII always extends the run, so instead pin: ASCII-only bytes stay
+        // on the ASCII scan without an encoding.
+        let hits = extract(b"abcdef", 3);
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].encoding.is_none());
+        let json = serde_json::to_value(&hits[0]).unwrap();
+        assert!(json.get("encoding").is_none());
+    }
+
+    #[test]
+    fn a_utf8_run_with_control_or_c1_scalars_stops_there() {
+        // é then C0 NUL: the run is one scalar, under the minimum.
+        let data = [0xc3u8, 0xa9, 0x00, 0x61, 0x62, 0x63];
+        let hits = extract(&data, 3);
+        assert!(hits.iter().all(|h| h.encoding != Some("utf-8")));
+        assert_eq!(hits[0].value, "abc");
+        // é then C1 U+009D: the run stops before the C1 scalar.
+        let data = [0xc3u8, 0xa9, 0xc2, 0x9d, 0x61, 0x62, 0x63];
+        let hits = extract(&data, 3);
+        assert!(hits.iter().all(|h| h.encoding != Some("utf-8")));
+        // é then U+007F: the run stops before DEL.
+        let data = [0xc3u8, 0xa9, 0x7f, 0x61, 0x62, 0x63];
+        let hits = extract(&data, 3);
+        assert!(hits.iter().all(|h| h.encoding != Some("utf-8")));
+        // A truncated sequence stays unread.
+        let data = [0xc3u8];
+        assert!(extract(&data, 1).is_empty());
+        // An overlong encoding and a surrogate stay unread.
+        let data = [0xc0u8, 0xaf, 0x61];
+        let hits = extract(&data, 1);
+        assert!(hits.iter().all(|h| h.encoding != Some("utf-8")));
+        let data = [0xedu8, 0xa0, 0x80, 0x61];
+        let hits = extract(&data, 1);
+        assert!(hits.iter().all(|h| h.encoding != Some("utf-8")));
+        assert_eq!(hits[0].value, "a");
     }
 
     #[test]
