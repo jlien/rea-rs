@@ -1,0 +1,47 @@
+# Task: Plan the next several iterations (7+) of the rea-rs task loop
+
+You are planning future work for rea-rs, a clean-room Rust rewrite of an MCP reverse-engineering toolkit (Mach-O / ELF / PE / LE / WASM / SQLite static inspection; crates rea-core, rea-mcp, rea-cli). This is a RESEARCH + WRITING task: do NOT modify any code. Your only deliverable is the plan file named below.
+
+## Read first (in this order)
+
+1. README.md — tool surface, MCP tool list (18 tools), notes on what each tool still stops before.
+2. docs/rea-rs-review.html — the living status board. CRITICAL: its "stops before" / "stays unread" clauses and the "gaps" section (vs upstream morluto/rea) are the definitive remaining-work list. The "Done" table lists landed commits.
+3. `git log --oneline -40` — recent history. Current HEAD: `a98aff5` (merge of iteration 6). Test gate: rea-core 271, rea-mcp 15, rea-cli 4 — all green.
+4. docs/iterations-3plus-plan.md — the previous plan (iterations 3–6). It is FULLY LANDED. Treat it as a CLOSED LIST: do not re-propose anything it shipped (IL prefix opcodes, MSVC decls, wasm host-import naming, UTF-16 runs, ELF iterated pages, slot-poisoning contract, hex displacement parsing, unscaled stur family, post-index exclusion, carry_types ordering, gap upserts, etc.). Read its per-iteration sections to know what exists; read the CURRENT review.html to know what clauses remain.
+
+## Standing scope exclusions (per the repo owner — never plan these)
+
+EVM, firmware, Flutter, packet parsing, signals, bridge tool launching (Hopper/Ghidra/IDA must stay parse-only), WASI, WASM memory access at execute time, Apple trust decisions (cms_verified stays a digest window), struct-type recovery, cross-function dataflow, `rea funcs` seeding, Swift demangles in headers, Objective-C class-metadata walking, `--arch` beyond Mach-O slices.
+
+## Loop conventions every task must fit (binding)
+
+- One offline commit per task: `cargo test --workspace --offline` must pass; allowed external crates are ONLY goblin, serde, serde_json, anyhow, thiserror, clap, capstone. No new dependencies — hand-roll anything else (the repo already hand-rolls sha384, binary plist, demanglers).
+- Every task ends with fixture tests plus README.md and docs/rea-rs-review.html closeout: newest code commit id in the `#now` meta line, a Done table row, and the touched clause rewritten to match what the code actually does. Docs must never claim behavior the code doesn't exhibit.
+- Synthetic fixtures only (no network, no real binaries needed); arm64 tests hand-encode instruction bytes.
+- The codebase style is honest, bounded limits: a task that narrows a "stops before" clause must say what landed AND what still stops.
+
+## Deliverable
+
+Write the plan to: /Users/jimmylien/Eng/rea-rs/docs/iterations-7plus-plan.md
+(It does not exist yet; create it. Overwrite freely.)
+
+Structure it as 3–5 iterations (Iteration 7, 8, 9, ...), each with 4–6 numbered tasks (7.1, 7.2, ...). For EVERY task give:
+
+- A one-line title and the target crate/module file(s)
+- The exact "stops before" / "stays unread" clause in docs/rea-rs-review.html it retires (quote it)
+- A bounded scope statement (what it does NOT attempt)
+- Rough difficulty: small / medium / hard
+- Suggested commit subject in the repo style: `rea-rs: <what it added>`
+
+Order each iteration so small wins come first and the riskiest task sits last (a failed test gate stops the loop). End the file with a "Parked / not planned" section listing what you considered and rejected, with one-line reasons — including anything from the upstream gaps table excluded by the standing exclusions above.
+
+## Anti-fabrication rules
+
+- Base every task on clauses you actually saw in docs/rea-rs-review.html or README.md. If you are unsure a clause exists, re-read the file before citing it. Quote clauses verbatim.
+- Do not invent upstream tool names — the gaps table lists them; cite from what you read.
+- Mark anything speculative explicitly as speculative.
+- Honest counts: cite the current test counts exactly as 271/15/4.
+
+## When done
+
+Print a short numbered summary (iterations planned, task counts, the single riskiest task). Then write the deliverable path as the last line.
