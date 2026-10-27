@@ -151,9 +151,11 @@ impl BpList<'_> {
                 let secs = f64::from_be_bytes(raw);
                 // Only a finite whole number inside `i64` range is the
                 // seconds the payload holds. `as i64` saturates at the `i64`
-                // ends, so anything at or past `2^63` in magnitude (or below
-                // `i64::MIN`, the next f64 down) is not representable and
-                // stays unread instead of becoming a different integer.
+                // ends, so anything above `i64::MAX` (including `2^63`
+                // itself, the first f64 past it) or below `i64::MIN` (the
+                // next f64 below `-2^63`) is not representable and stays
+                // unread instead of becoming a different integer. `-2^63`
+                // itself is representable and stores exactly.
                 if !secs.is_finite()
                     || secs.fract() != 0.0
                     || secs < -9.223372036854776e18
