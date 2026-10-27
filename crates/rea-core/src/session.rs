@@ -4,16 +4,22 @@
 //! identity summary (format, arch, bits, endianness, entry, section and symbol
 //! counts). A path that does not load stays open with no summary. `record`
 //! stores a summary, and with a `tool` name re-runs that named command against
-//! the session's binary and embeds the output, capped. The file on disk stays
-//! the source of truth: nothing is held mapped between calls. Comparing two
+//! the session's binary and embeds the output, capped. Each record also keeps
+//! the unix-seconds time it was written and optional caller-supplied argument
+//! text, capped. The file on disk stays the source of truth: nothing is held
+//! mapped between calls. Comparing two
 //! sessions lists identity evidence and records that appear on only one side.
 
 use crate::{loader, Error, Result, Target};
 use std::fs;
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Embedded tool output is capped at 16 KiB.
 pub const EMBED_CAP: usize = 16 * 1024;
+
+/// Caller-supplied argument text is capped at this many bytes.
+pub const ARGUMENTS_CAP: usize = 1024;
 
 const TRUNCATION_MARKER: &str = "\n[truncated]";
 
@@ -46,6 +52,14 @@ pub struct Record {
     /// Output of the named command re-run against the session's binary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<String>,
+    /// Caller-supplied argument text, capped at [`ARGUMENTS_CAP`] bytes. Absent
+    /// on records written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<String>,
+    /// Unix seconds, decimal, when the record was written. Absent on records
+    /// written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -77,8 +91,33 @@ pub fn load(dir: &Path, id: &str) -> Result<Session> {
 
 /// Append a record. With a `tool`, the named command (`info`, `sections`,
 /// `symbols`, `strings`, `funcs`, `disasm`) is re-run against the session's
-/// binary and its output embedded, capped at [`EMBED_CAP`].
-pub fn record(dir: &Path, id: &str, tool: Option<&str>, summary: &str) -> Result<Session> {
+/// binary and its output embedded, capped at [`EMBED_CAP`]. Optional
+/// `arguments` text is stored as-is, capped at [`ARGUMENTS_CAP`] bytes. The
+/// timestamp is unix seconds, decimal, from `SystemTime::now`.
+pub fn record(
+    dir: &Path,
+    id: &str,
+    tool: Option<&str>,
+    summary: &str,
+    arguments: Option<&str>,
+) -> Result<Session> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| Error::Parse(format!("session: {e}")))?
+        .as_secs();
+    record_at(dir, id, tool, summary, arguments, timestamp)
+}
+
+/// [`record`] with an explicit unix-seconds timestamp. Tests that need a fixed
+/// value call this instead of reading the clock.
+pub fn record_at(
+    dir: &Path,
+    id: &str,
+    tool: Option<&str>,
+    summary: &str,
+    arguments: Option<&str>,
+    timestamp: u64,
+) -> Result<Session> {
     let mut session = load(dir, id)?;
     let output = match tool {
         None => None,
@@ -91,9 +130,23 @@ pub fn record(dir: &Path, id: &str, tool: Option<&str>, summary: &str) -> Result
         tool: tool.unwrap_or("").to_string(),
         summary: summary.to_string(),
         output,
+        arguments: arguments.map(capped_arguments),
+        timestamp: Some(timestamp),
     });
     save(dir, &session)?;
     Ok(session)
+}
+
+/// Truncate argument text at [`ARGUMENTS_CAP`] bytes, never mid-character.
+fn capped_arguments(arguments: &str) -> String {
+    if arguments.len() <= ARGUMENTS_CAP {
+        return arguments.to_string();
+    }
+    let mut end = ARGUMENTS_CAP;
+    while !arguments.is_char_boundary(end) {
+        end -= 1;
+    }
+    arguments[..end].to_string()
 }
 
 /// Summaries of the form `tool: summary`, with embedded output in brackets,
@@ -128,23 +181,25 @@ pub fn diff(left: &Session, right: &Session) -> SessionDiff {
 }
 
 /// One upstream-morphic Evidence record, mapped from a native [`Record`].
-/// Fields the native store does not capture are explicit `null`s, never
-/// fabricated.
+/// Fields the native store does not capture — the session handle, a live
+/// mapping — are explicit `null`s, never fabricated.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct EvidenceRecord {
     /// The session the record came from.
     pub session: String,
     /// The recorded rea command; empty for a plain summary record.
     pub tool: String,
-    /// Upstream echoes the caller's arguments. The native store keeps only
-    /// the summary text, so this stays null.
+    /// Upstream echoes the caller's arguments. The native store keeps the
+    /// caller-supplied text, echoed as a JSON string; null when none was
+    /// stored.
     pub arguments: Option<serde_json::Value>,
     pub summary: String,
     /// Embedded command output, capped at [`EMBED_CAP`]; the `[truncated]`
     /// marker is carried through verbatim. Null for a plain summary record.
     pub output: Option<String>,
-    /// The native store timestamps nothing.
-    pub timestamp: Option<String>,
+    /// Unix seconds, decimal, as stored on the record; null when the record
+    /// predates the field.
+    pub timestamp: Option<u64>,
 }
 
 /// The upstream-morphic Evidence export of one session file.
@@ -175,10 +230,13 @@ pub fn export_evidence(session: &Session) -> EvidenceExport {
             .map(|record| EvidenceRecord {
                 session: session.id.clone(),
                 tool: record.tool.clone(),
-                arguments: None,
+                arguments: record
+                    .arguments
+                    .clone()
+                    .map(serde_json::Value::String),
                 summary: record.summary.clone(),
                 output: record.output.clone(),
-                timestamp: None,
+                timestamp: record.timestamp,
             })
             .collect(),
     }
@@ -288,7 +346,7 @@ fn next_id(dir: &Path) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{bounded_output, diff, open, record, EMBED_CAP};
+    use super::{bounded_output, diff, open, record, record_at, ARGUMENTS_CAP, EMBED_CAP};
     use crate::{Arch, Format, Target};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -377,7 +435,7 @@ mod tests {
         let session = open(&dir, "missing.bin").unwrap();
         assert!(session.target.is_none());
         assert_eq!(session.path, "missing.bin");
-        let session = record(&dir, &session.id, None, "noted").unwrap();
+        let session = record(&dir, &session.id, None, "noted", None).unwrap();
         assert_eq!(session.records.len(), 1);
         assert!(session.records[0].output.is_none());
         assert_eq!(session.records[0].tool, "");
@@ -391,13 +449,13 @@ mod tests {
         let bin = dir.join("fixture.elf");
         std::fs::write(&bin, elf_fixture()).unwrap();
         let session = open(&dir, bin.to_str().unwrap()).unwrap();
-        let session = record(&dir, &session.id, Some("info"), "identity").unwrap();
+        let session = record(&dir, &session.id, Some("info"), "identity", None).unwrap();
         let output = session.records[0].output.as_ref().unwrap();
         assert!(output.contains("\"format\": \"elf\""));
         assert_eq!(session.records[0].tool, "info");
         // The record re-runs against the file; a missing binary errors.
         std::fs::remove_file(&bin).unwrap();
-        assert!(record(&dir, &session.id, Some("strings"), "s").is_err());
+        assert!(record(&dir, &session.id, Some("strings"), "s", None).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -429,6 +487,8 @@ mod tests {
                 tool: "info".to_string(),
                 summary: "identity".to_string(),
                 output: Some("{\"format\": \"elf\"}".to_string()),
+                arguments: None,
+                timestamp: None,
             }],
         };
         let plain = super::Session {
@@ -439,6 +499,8 @@ mod tests {
                 tool: "".to_string(),
                 summary: "mach-o".to_string(),
                 output: None,
+                arguments: None,
+                timestamp: None,
             }],
         };
         let got = diff(&mapped, &plain);
@@ -462,8 +524,8 @@ mod tests {
         let dir = scratch();
         let left = open(&dir, "a.bin").unwrap();
         let right = open(&dir, "b.bin").unwrap();
-        let left = record(&dir, &left.id, None, "mach-o").unwrap();
-        let right = record(&dir, &right.id, None, "elf").unwrap();
+        let left = record(&dir, &left.id, None, "mach-o", None).unwrap();
+        let right = record(&dir, &right.id, None, "elf", None).unwrap();
         let got = diff(&left, &right);
         assert_eq!(got.only_left, vec!["mach-o".to_string()]);
         assert_eq!(got.only_right, vec!["elf".to_string()]);
@@ -477,8 +539,8 @@ mod tests {
         let bin = dir.join("fixture.elf");
         std::fs::write(&bin, elf_fixture()).unwrap();
         let session = open(&dir, bin.to_str().unwrap()).unwrap();
-        let session = record(&dir, &session.id, Some("info"), "identity").unwrap();
-        let session = record(&dir, &session.id, None, "noted").unwrap();
+        let session = record(&dir, &session.id, Some("info"), "identity", None).unwrap();
+        let session = record(&dir, &session.id, None, "noted", None).unwrap();
         let export = super::export_evidence(&session);
         assert_eq!(export.path, bin.to_str().unwrap().to_string());
         assert_eq!(export.identity.as_ref().unwrap().format, "elf");
@@ -488,7 +550,8 @@ mod tests {
         assert_eq!(export.records[0].session, session.id);
         assert_eq!(export.records[0].tool, "info");
         assert_eq!(export.records[0].arguments, None);
-        assert_eq!(export.records[0].timestamp, None);
+        // `record` stamps unix seconds from the clock; the export copies it.
+        assert!(export.records[0].timestamp.is_some());
         assert_eq!(export.records[0].output.as_ref().unwrap(), session.records[0].output.as_ref().unwrap());
         assert_eq!(export.records[1].tool, "");
         assert_eq!(export.records[1].output, None);
@@ -496,7 +559,7 @@ mod tests {
         let value = serde_json::to_value(&export).unwrap();
         let record = &value["records"][0];
         assert_eq!(record["arguments"], serde_json::Value::Null);
-        assert_eq!(record["timestamp"], serde_json::Value::Null);
+        assert!(record["timestamp"].is_u64());
         assert_eq!(value["session_handle"], serde_json::Value::Null);
         assert_eq!(value["live_mapping"], serde_json::Value::Null);
         assert_eq!(record["session"], session.id);
@@ -515,12 +578,87 @@ mod tests {
         bytes.extend(std::iter::repeat(b'A').take(EMBED_CAP * 2));
         std::fs::write(&bin, bytes).unwrap();
         let session = open(&dir, bin.to_str().unwrap()).unwrap();
-        let session = record(&dir, &session.id, Some("strings"), "big run").unwrap();
+        let session = record(&dir, &session.id, Some("strings"), "big run", None).unwrap();
         assert!(session.records[0].output.as_ref().unwrap().ends_with("[truncated]"));
         let export = super::export_evidence(&session);
         let output = export.records[0].output.as_ref().unwrap();
         assert_eq!(output.len(), EMBED_CAP);
         assert!(output.ends_with("[truncated]"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn record_stores_a_fixed_timestamp_and_argument_text() {
+        let dir = scratch();
+        let session = open(&dir, "a.bin").unwrap();
+        // The helper takes the timestamp as an explicit u64; the clock is not read.
+        let session = record_at(&dir, &session.id, None, "noted", Some("--flag value"), 1_700_000_000)
+            .unwrap();
+        assert_eq!(session.records[0].timestamp, Some(1_700_000_000));
+        assert_eq!(session.records[0].arguments.as_deref(), Some("--flag value"));
+        // The export copies both as stored.
+        let export = super::export_evidence(&session);
+        assert_eq!(export.records[0].timestamp, Some(1_700_000_000));
+        assert_eq!(
+            export.records[0].arguments,
+            Some(serde_json::Value::String("--flag value".to_string()))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn record_from_the_clock_stamps_unix_seconds() {
+        let dir = scratch();
+        let session = open(&dir, "a.bin").unwrap();
+        let session = record(&dir, &session.id, None, "noted", None).unwrap();
+        let stamp = session.records[0].timestamp.unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(now >= stamp && now - stamp < 60, "{stamp} vs {now}");
+        assert!(session.records[0].arguments.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn argument_text_is_capped_at_1024_bytes() {
+        let dir = scratch();
+        let session = open(&dir, "a.bin").unwrap();
+        // 700 two-byte characters: the cap falls back to a character boundary.
+        let long = "é".repeat(700);
+        let session = record_at(&dir, &session.id, None, "noted", Some(&long), 1)
+            .unwrap();
+        let stored = session.records[0].arguments.as_ref().unwrap();
+        assert_eq!(stored.len(), ARGUMENTS_CAP);
+        assert!(stored.chars().all(|c| c == 'é'));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_session_file_without_the_new_fields_still_loads() {
+        let dir = scratch();
+        std::fs::create_dir_all(&dir).unwrap();
+        // A record written before the timestamp and arguments fields existed.
+        let raw = br#"{
+  "id": "1",
+  "path": "a.bin",
+  "records": [
+    { "tool": "", "summary": "mach-o" }
+  ]
+}"#;
+        std::fs::write(dir.join("1.json"), raw).unwrap();
+        let session = super::load(&dir, "1").unwrap();
+        assert_eq!(session.records[0].summary, "mach-o");
+        assert_eq!(session.records[0].timestamp, None);
+        assert_eq!(session.records[0].arguments, None);
+        // The export leaves both fields null rather than fabricating them.
+        let export = super::export_evidence(&session);
+        assert_eq!(export.records[0].timestamp, None);
+        assert_eq!(export.records[0].arguments, None);
+        let value = serde_json::to_value(&export).unwrap();
+        assert_eq!(value["records"][0]["timestamp"], serde_json::Value::Null);
+        assert_eq!(value["records"][0]["arguments"], serde_json::Value::Null);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

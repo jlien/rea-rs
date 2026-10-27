@@ -404,7 +404,7 @@ fn session_call(args: &Value) -> Result<Value, String> {
             let tool = args.get("tool").and_then(Value::as_str);
             let summary = args.get("summary").and_then(Value::as_str).unwrap_or("");
             serde_json::to_value(
-                rea_core::session::record(dir, id, tool, summary).map_err(|e| e.to_string())?,
+                rea_core::session::record(dir, id, tool, summary, None).map_err(|e| e.to_string())?,
             )
             .map_err(|e| e.to_string())?
         }
