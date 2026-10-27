@@ -273,7 +273,8 @@ pub fn inspect(bytes: &[u8]) -> Result<WasmModule> {
 }
 
 /// Run one exported function. Only i32 locals and `i32.const`, `i32.add`,
-/// `i32.sub`, `i32.mul`, `local.get`, `local.set`, `drop`, `call`, and `end`
+/// `i32.sub`, `i32.mul`, `i32.eqz`, `i32.eq`, `i32.ne`, `i32.and`, `i32.or`,
+/// `i32.xor`, `local.get`, `local.set`, `drop`, `call`, and `end`
 /// are executed. The step cap is 4096. A host import is named (`module.name`)
 /// and not called; any other undecoded opcode is an error.
 pub fn execute(bytes: &[u8], name: &str, args: &[i32]) -> Result<Vec<i32>> {
@@ -738,6 +739,12 @@ enum Op {
     Add,
     Sub,
     Mul,
+    Eqz,
+    Eq,
+    Ne,
+    And,
+    Or,
+    Xor,
     LocalGet(u32),
     LocalSet(u32),
     Drop,
@@ -834,6 +841,12 @@ fn decode_ops(r: &mut Reader<'_>) -> Result<Vec<Op>> {
             0x6a => Op::Add,
             0x6b => Op::Sub,
             0x6c => Op::Mul,
+            0x45 => Op::Eqz,
+            0x46 => Op::Eq,
+            0x47 => Op::Ne,
+            0x71 => Op::And,
+            0x72 => Op::Or,
+            0x73 => Op::Xor,
             other => Op::Other(other),
         };
         let done = matches!(decoded, Op::End);
@@ -851,6 +864,12 @@ fn op_text(op: &Op) -> String {
         Op::Add => "i32.add".into(),
         Op::Sub => "i32.sub".into(),
         Op::Mul => "i32.mul".into(),
+        Op::Eqz => "i32.eqz".into(),
+        Op::Eq => "i32.eq".into(),
+        Op::Ne => "i32.ne".into(),
+        Op::And => "i32.and".into(),
+        Op::Or => "i32.or".into(),
+        Op::Xor => "i32.xor".into(),
         Op::LocalGet(n) => format!("local.get {n}"),
         Op::LocalSet(n) => format!("local.set {n}"),
         Op::Drop => "drop".into(),
@@ -959,6 +978,35 @@ fn interpret_depth(
                 let b = pop(&mut stack)?;
                 let a = pop(&mut stack)?;
                 stack.push(a.wrapping_mul(b));
+            }
+            Op::Eqz => {
+                let a = pop(&mut stack)?;
+                stack.push((a == 0) as i32);
+            }
+            Op::Eq => {
+                let b = pop(&mut stack)?;
+                let a = pop(&mut stack)?;
+                stack.push((a == b) as i32);
+            }
+            Op::Ne => {
+                let b = pop(&mut stack)?;
+                let a = pop(&mut stack)?;
+                stack.push((a != b) as i32);
+            }
+            Op::And => {
+                let b = pop(&mut stack)?;
+                let a = pop(&mut stack)?;
+                stack.push(a & b);
+            }
+            Op::Or => {
+                let b = pop(&mut stack)?;
+                let a = pop(&mut stack)?;
+                stack.push(a | b);
+            }
+            Op::Xor => {
+                let b = pop(&mut stack)?;
+                let a = pop(&mut stack)?;
+                stack.push(a ^ b);
             }
             Op::LocalGet(n) => {
                 let value = locals.get(*n as usize).copied().ok_or_else(|| {
@@ -1614,6 +1662,100 @@ mod tests {
         let module = inspect(&bytes).unwrap();
         assert_eq!(module.bodies[0].ops, vec!["i32.const 42".to_string(), "end".to_string()]);
         assert_eq!(execute(&bytes, "f", &[]).unwrap(), vec![42]);
+    }
+
+    /// A module with one `() -> i32` function exported as "f" whose body is
+    /// the given opcodes (hex, no trailing `end`).
+    fn module_with_ops(ops_hex: &str) -> Vec<u8> {
+        let mut body = hex("00");
+        body.extend(hex(ops_hex));
+        body.push(0x0b);
+        let mut out = hex("0061736d01000000");
+        out.extend(hex("0105016000017f"));
+        out.extend(hex("03020100"));
+        out.extend(hex("07050101660000"));
+        out.push(0x0a);
+        out.push((body.len() + 2) as u8);
+        out.push(0x01);
+        out.push(body.len() as u8);
+        out.extend(body);
+        out
+    }
+
+    #[test]
+    fn execute_i32_comparisons_push_zero_or_one() {
+        // 0 eqz -> 1; 5 eqz -> 0.
+        let bytes = module_with_ops("410045");
+        let m = inspect(&bytes).unwrap();
+        assert_eq!(
+            m.bodies[0].ops,
+            vec!["i32.const 0".to_string(), "i32.eqz".to_string(), "end".to_string()]
+        );
+        assert_eq!(execute(&bytes, "f", &[]).unwrap(), vec![1]);
+        let bytes = module_with_ops("410545");
+        assert_eq!(execute(&bytes, "f", &[]).unwrap(), vec![0]);
+        // 42 eq 42 -> 1; 42 eq 43 -> 0; 42 ne 43 -> 1.
+        let bytes = module_with_ops("412a412a46");
+        assert_eq!(execute(&bytes, "f", &[]).unwrap(), vec![1]);
+        let bytes = module_with_ops("412a412b46");
+        assert_eq!(execute(&bytes, "f", &[]).unwrap(), vec![0]);
+        let bytes = module_with_ops("412a412b47");
+        assert_eq!(execute(&bytes, "f", &[]).unwrap(), vec![1]);
+    }
+
+    #[test]
+    fn execute_i32_bitwise_ops_wrap() {
+        // 12 and 10 -> 8; 12 or 2 -> 14; 12 xor 7 -> 11.
+        let bytes = module_with_ops("410c410a71");
+        assert_eq!(execute(&bytes, "f", &[]).unwrap(), vec![8]);
+        let bytes = module_with_ops("410c410272");
+        assert_eq!(execute(&bytes, "f", &[]).unwrap(), vec![14]);
+        let bytes = module_with_ops("410c410773");
+        assert_eq!(execute(&bytes, "f", &[]).unwrap(), vec![11]);
+        // -1 and -1 -> -1: the i32 wraps in two's complement.
+        let bytes = module_with_ops("417f417f71");
+        assert_eq!(execute(&bytes, "f", &[]).unwrap(), vec![-1]);
+    }
+
+    #[test]
+    fn wat_prints_the_new_mnemonics_instead_of_opcode_markers() {
+        // Decode all six: const 0, eqz, eq, ne, and, or, xor. The interpreter is
+        // never run, so the unbalanced stack does not matter to the listing.
+        let bytes = module_with_ops("4100454647717273");
+        let m = inspect(&bytes).unwrap();
+        assert_eq!(
+            m.bodies[0].ops,
+            vec![
+                "i32.const 0".to_string(),
+                "i32.eqz".to_string(),
+                "i32.eq".to_string(),
+                "i32.ne".to_string(),
+                "i32.and".to_string(),
+                "i32.or".to_string(),
+                "i32.xor".to_string(),
+                "end".to_string(),
+            ]
+        );
+        for text in [wat(&m), wat_full(&m)] {
+            assert!(text.contains("\n    i32.eqz\n"));
+            assert!(text.contains("\n    i32.eq\n"));
+            assert!(text.contains("\n    i32.ne\n"));
+            assert!(text.contains("\n    i32.and\n"));
+            assert!(text.contains("\n    i32.or\n"));
+            assert!(text.contains("\n    i32.xor\n"));
+            assert!(!text.contains("opcode 0x"));
+        }
+        assert!(parens_balanced(&wat_full(&m)));
+    }
+
+    #[test]
+    fn execute_still_errors_on_an_opcode_outside_the_map() {
+        let bytes = module_with_ops("412a28");
+        let err = execute(&bytes, "f", &[]).unwrap_err();
+        assert!(
+            matches!(err, Error::Parse(msg)
+                if msg == "wasm: opcode 0x28 is not executed")
+        );
     }
 
     #[test]
