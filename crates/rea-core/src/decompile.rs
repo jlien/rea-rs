@@ -897,20 +897,19 @@ fn slot_key_of(mem: &str, arch: Arch) -> Option<SlotKey> {
         Arch::Arm64 => {
             // Capstone prints pre-indexed forms with the writeback marker
             // outside the brackets ("[sp, #-0x10]!"); strip it so the
-            // displacement parses. Post-index ("[sp], #8") has no comma
-            // inside the brackets and still fails the slot check below.
+            // displacement parses. A bare "[sp]" (a post-index writeback left
+            // the base plain, or a literal [sp] operand) is NOT a plain slot
+            // either way: a post-index store wrote the old sp then moved it,
+            // so the offset that keys the slot is unknowable from the
+            // operand. Only "[sp, #N]" names a slot.
             let inner = inner.strip_suffix('!').unwrap_or(inner);
             let mut parts = inner.splitn(2, ',');
             if parts.next()?.trim() != "sp" {
                 return None;
             }
-            match parts.next() {
-                None => Some((2, 0)),
-                Some(off) => {
-                    let off = off.trim().strip_prefix('#')?.trim();
-                    Some((2, parse_disp(off)?))
-                }
-            }
+            let off = parts.next()?;
+            let off = off.trim().strip_prefix('#')?.trim();
+            Some((2, parse_disp(off)?))
         }
         _ => None,
     }
@@ -926,7 +925,9 @@ fn slot_store_key(insn: &disasm::Instruction, arch: Arch) -> Option<SlotKey> {
             let (dst, _) = split_first(ops)?;
             slot_key_of(dst, arch)
         }
-        Arch::Arm64 if matches!(m, "str" | "strb" | "strh") => {
+        Arch::Arm64
+            if matches!(m, "str" | "strb" | "strh" | "stur" | "sturb" | "sturh") =>
+        {
             let (_, src) = split_first(ops)?;
             slot_key_of(src, arch)
         }
@@ -943,7 +944,9 @@ fn slot_store_source(insn: &disasm::Instruction, arch: Arch) -> Option<String> {
             let (_, src) = split_first(ops)?;
             canonical_of(arch, src)
         }
-        Arch::Arm64 if matches!(m, "str" | "strb" | "strh") => {
+        Arch::Arm64
+            if matches!(m, "str" | "strb" | "strh" | "stur" | "sturb" | "sturh") =>
+        {
             let (dst, _) = split_first(ops)?;
             canonical_of(arch, dst)
         }
@@ -1773,9 +1776,17 @@ mod tests {
             addr: 0,
             size: 4,
             mnemonic: "strh".into(),
-            operands: "w5, [sp]".into(),
+            operands: "w5, [sp, #0]".into(),
         };
         assert_eq!(slot_store_key(&strh, Arch::Arm64), Some((2, 0)));
+        // A bare "[sp]" (post-index or plain) names no slot.
+        let post = disasm::Instruction {
+            addr: 0,
+            size: 4,
+            mnemonic: "str".into(),
+            operands: "x0, [sp], #0x10".into(),
+        };
+        assert_eq!(slot_store_key(&post, Arch::Arm64), None);
         let ldurb = disasm::Instruction {
             addr: 0,
             size: 4,
@@ -1783,6 +1794,26 @@ mod tests {
             operands: "w6, [sp, #0xc]".into(),
         };
         assert_eq!(slot_load_key(&ldurb, Arch::Arm64), Some((2, 12)));
+    }
+
+    #[test]
+    fn arm64_an_unscaled_store_and_load_reuse_types() {
+        // Capstone prints a negative stack offset without writeback as the
+        // unscaled form: stur x0, [sp, #-0x10] — the same slot the pre-index
+        // str writes. The load reuses the stored type.
+        let code = [
+            0x60, 0x00, 0x00, 0x90, // adrp x0, 0
+            0x00, 0x00, 0x00, 0x91, // add x0, x0, #0
+            0xe0, 0x03, 0x1f, 0xf8, // stur x0, [sp, #-0x10]
+            0xe2, 0x03, 0x5f, 0xf8, // ldur x2, [sp, #-0x10]
+            0xc0, 0x03, 0x5f, 0xd6, // ret
+        ];
+        let text = decompile(&target(Arch::Arm64, 64, &code), 0x1000, 64).unwrap();
+        assert!(text.contains("void* v1;"), "{text}");
+        // The unscaled load reuses the slot's type — a second void* local,
+        // not a raw ldur line.
+        assert!(text.contains("void* v2;"), "{text}");
+        assert!(!text.contains("ldur x2"), "{text}");
     }
 
     #[test]
