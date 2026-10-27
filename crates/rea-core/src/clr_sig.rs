@@ -165,6 +165,8 @@ fn opcode(op: u8) -> Option<&'static str> {
         0x09 => "ldloc.3",
         0x0a => "stloc.0",
         0x0b => "stloc.1",
+        0x0c => "stloc.2",
+        0x0d => "stloc.3",
         0x0e => "ldarg.s",
         0x11 => "ldloc.s",
         0x13 => "stloc.s",
@@ -182,6 +184,9 @@ fn opcode(op: u8) -> Option<&'static str> {
         0x20 => "ldc.i4.s",
         0x21 => "ldc.i4",
         0x2a => "ret",
+        0x25 => "dup",
+        0x26 => "pop",
+        0x4a => "ldind.i4",
         0x58 => "add",
         0x59 => "sub",
         0x5a => "mul",
@@ -189,8 +194,12 @@ fn opcode(op: u8) -> Option<&'static str> {
         0x5f => "and",
         0x60 => "or",
         0x61 => "xor",
+        0x65 => "neg",
+        0x66 => "not",
+        0x69 => "conv.i4",
         // ECMA-335: ckfinite is the one-byte opcode 0xC3, not a 0xFE prefix.
         0xc3 => "ckfinite",
+        0x7a => "throw",
         _ => return None,
     })
 }
@@ -308,6 +317,36 @@ mod tests {
         assert_eq!(il_ops(&[0x06, 0xc3]), vec!["ckfinite".to_string()]);
         // A truncated prefix stops silently.
         assert!(il_ops(&[0x0a, 0xfe]).is_empty());
+    }
+
+    #[test]
+    fn operand_free_one_byte_opcodes_join_the_listing() {
+        // Each opcode is pinned by a tiny body of exactly that one byte
+        // (header 0x06 = tiny, codesize 1).
+        for (byte, name) in [
+            (0x0cu8, "stloc.2"),
+            (0x0d, "stloc.3"),
+            (0x25, "dup"),
+            (0x26, "pop"),
+            (0x65, "neg"),
+            (0x66, "not"),
+            (0x69, "conv.i4"),
+            (0x4a, "ldind.i4"),
+            (0x7a, "throw"),
+        ] {
+            assert_eq!(il_ops(&[0x06, byte]), vec![name.to_string()]);
+        }
+        // The one-byte names walk on inside a longer body: dup, pop, ret.
+        assert_eq!(
+            il_ops(&[0x0e, 0x25, 0x26, 0x2a]),
+            vec!["dup".to_string(), "pop".to_string(), "ret".to_string()]
+        );
+        // An opcode outside the combined set still stops the listing:
+        // 0x27 (no operand-free name) stays the marker, `throw` does not stop
+        // the walk the way `ret` does — bytes after it in a malformed body
+        // keep being walked under the same rules.
+        assert_eq!(il_ops(&[0x06, 0x27]), vec!["op-27".to_string()]);
+        assert_eq!(il_ops(&[0x0a, 0xfe, 0x06]), vec!["op-fe-06".to_string()]);
     }
 
     #[test]
