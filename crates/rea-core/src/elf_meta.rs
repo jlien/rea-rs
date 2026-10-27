@@ -24,8 +24,8 @@ pub struct NoteFact {
 /// One GNU property (type, datasz, data) from a `NT_GNU_PROPERTY_TYPE_0` note.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct GnuProperty {
-    /// `x86 feature 1` (IBT and SHSTK), `x86 ISA needed` (baseline, v2, v3,
-    /// v4), or `0x…` for unknown property types.
+    /// `x86 feature 1` (IBT and SHSTK), `x86 ISA needed` and `x86 ISA used`
+    /// (baseline, v2, v3, v4), or `0x…` for unknown property types.
     pub type_: String,
     /// Named bit list for the x86 property types; decimal `data` for others.
     pub data: String,
@@ -214,9 +214,12 @@ fn parse_gnu_properties(desc: &[u8], is_64: bool) -> Vec<GnuProperty> {
                     });
                 }
             }
-            0xc000_8002 => {
-                // GNU_PROPERTY_X86_ISA_1_NEEDED: baseline (1<<0), v2 (1<<1),
-                // v3 (1<<2), v4 (1<<3).
+            0xc000_8002 | 0xc001_0002 => {
+                // GNU_PROPERTY_X86_ISA_1_NEEDED (0xc0008002) and
+                // GNU_PROPERTY_X86_ISA_1_USED (0xc0010002): baseline (1<<0),
+                // v2 (1<<1), v3 (1<<2), v4 (1<<3). The pre-correction
+                // 0xc0000000 is the AArch64 feature type, not the used half,
+                // and stays hex.
                 const ISA: [&str; 4] = ["baseline", "v2", "v3", "v4"];
                 let bits = data.first().copied().unwrap_or(0) as u32
                     | u32::from(data.get(1).copied().unwrap_or(0)) << 8
@@ -229,8 +232,13 @@ fn parse_gnu_properties(desc: &[u8], is_64: bool) -> Vec<GnuProperty> {
                     .map(|(_, name)| *name)
                     .collect();
                 if !names.is_empty() {
+                    let type_ = if ty == 0xc000_8002 {
+                        "x86 ISA needed"
+                    } else {
+                        "x86 ISA used"
+                    };
                     out.push(GnuProperty {
-                        type_: "x86 ISA needed".to_string(),
+                        type_: type_.to_string(),
                         data: names.join(", "),
                     });
                 }
@@ -322,6 +330,14 @@ mod tests {
                     data: "baseline".into()
                 },
                 GnuProperty {
+                    type_: "x86 ISA used".into(),
+                    data: "v2, v4".into()
+                },
+                GnuProperty {
+                    type_: "0xc0000000".into(),
+                    data: "0x3".into()
+                },
+                GnuProperty {
                     type_: "0xc0000004".into(),
                     data: "0xdeadbeef".into()
                 },
@@ -372,11 +388,12 @@ mod tests {
         file.extend_from_slice(b"GNU\0");
         file.extend_from_slice(&[0x01, 0x02, 0x03, 0x04]);
         // GNU property note: an x86 feature-1 entry (IBT|SHSTK), an ISA-needed
-        // entry (baseline), and an unknown property type that renders as hex.
-        // Records pad to 8 bytes on ELF64.
+        // entry (baseline), an ISA-used entry (v2, v4), the AArch64 feature
+        // type that is not the x86 used half, and an unknown property type
+        // that renders as hex. Records pad to 8 bytes on ELF64.
         let mut prop = Vec::new();
         prop.extend_from_slice(&4u32.to_le_bytes()); // namesz
-        prop.extend_from_slice(&144u32.to_le_bytes()); // descsz: 9 records × 16
+        prop.extend_from_slice(&176u32.to_le_bytes()); // descsz: 11 records × 16
         prop.extend_from_slice(&5u32.to_le_bytes()); // NT_GNU_PROPERTY_TYPE_0
         prop.extend_from_slice(b"GNU\0");
         prop.extend_from_slice(&0xc000_0002u32.to_le_bytes()); // x86 feature 1
@@ -386,6 +403,14 @@ mod tests {
         prop.extend_from_slice(&0xc000_8002u32.to_le_bytes()); // x86 ISA needed
         prop.extend_from_slice(&4u32.to_le_bytes());
         prop.extend_from_slice(&1u32.to_le_bytes()); // baseline
+        prop.extend_from_slice(&[0; 4]); // record pads to 8
+        prop.extend_from_slice(&0xc001_0002u32.to_le_bytes()); // x86 ISA used
+        prop.extend_from_slice(&4u32.to_le_bytes());
+        prop.extend_from_slice(&0xau32.to_le_bytes()); // v2 | v4
+        prop.extend_from_slice(&[0; 4]); // record pads to 8
+        prop.extend_from_slice(&0xc000_0000u32.to_le_bytes()); // AArch64 feature type
+        prop.extend_from_slice(&4u32.to_le_bytes());
+        prop.extend_from_slice(&0x3u32.to_le_bytes()); // BTI | PAC, but stays hex
         prop.extend_from_slice(&[0; 4]); // record pads to 8
         prop.extend_from_slice(&0xc000_0004u32.to_le_bytes()); // unknown
         prop.extend_from_slice(&4u32.to_le_bytes());

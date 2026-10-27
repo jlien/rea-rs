@@ -114,9 +114,9 @@ pub struct ClrBlob {
     pub hex: String,
 }
 
-/// Version numbers, name, culture, and public-key blob from one `Assembly` or `AssemblyRef` row.
+/// Version numbers, name, culture, public-key blob, hash-algorithm id, flags word, and hash-value blob from one `Assembly` or `AssemblyRef` row.
 ///
-/// On `Assembly` the blob is the public key; on `AssemblyRef` it is the public-key-or-token. The hash-algorithm id and the flags word are not reported, and no strong-name check runs.
+/// On `Assembly` the blob is the public key and the hash-algorithm id is present; on `AssemblyRef` it is the public-key-or-token, the hash-value blob is present, and the hash-algorithm id is not. No strong-name check runs.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ClrAssembly {
     pub major_version: u16,
@@ -130,6 +130,14 @@ pub struct ClrAssembly {
     /// Blob length plus hex of at most the first 32 bytes. `None` when the blob index is 0 or the blob does not fit.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub public_key: Option<ClrBlob>,
+    /// Hash-algorithm id from an `Assembly` row, as stored. Absent on `AssemblyRef`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hash_alg_id: Option<u32>,
+    /// Flags word, as stored.
+    pub flags: u32,
+    /// `HashValue` blob from an `AssemblyRef` row: length plus hex of at most the first 32 bytes. `None` on `Assembly`, or when the blob index is 0 or the blob does not fit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hash_value: Option<ClrBlob>,
 }
 
 /// A type or module name from the metadata tables.
@@ -712,7 +720,7 @@ impl MetaRead {
 
 /// `Module`, `TypeRef`, and `TypeDef` names, plus `Field` and `MethodDef` names on each `TypeDef`, `Param` names on each method, `MemberRef` names, and `InterfaceImpl` names on each `TypeDef`.
 ///
-/// `FieldPtr`, `MethodPtr`, and `ParamPtr` rows are read by row size and reorder the `Field`, `MethodDef`, and `Param` names through their one index per row; a pointer table shorter than its list, or an index past the list, leaves the row order in place and does not fail the parse. `InterfaceImpl` rows are read, which keeps later tables aligned the same way a skip does. String, blob, and coded-index widths follow the `#~` heap-size byte and the row counts. A row that does not fit ends the list and keeps the names already read. Each `MemberRef` row also records its `MemberRefParent` coded index resolved against the name lists; a parent that does not resolve leaves the field empty. `Assembly` and `AssemblyRef` rows carry their version numbers, culture, and public-key blob through `enrich_metadata`. Signatures, RVAs, and IL are not read.
+/// `FieldPtr`, `MethodPtr`, and `ParamPtr` rows are read by row size and reorder the `Field`, `MethodDef`, and `Param` names through their one index per row; a pointer table shorter than its list, or an index past the list, leaves the row order in place and does not fail the parse. `InterfaceImpl` rows are read, which keeps later tables aligned the same way a skip does. String, blob, and coded-index widths follow the `#~` heap-size byte and the row counts. A row that does not fit ends the list and keeps the names already read. Each `MemberRef` row also records its `MemberRefParent` coded index resolved against the name lists; a parent that does not resolve leaves the field empty. `Assembly` and `AssemblyRef` rows carry their version numbers, culture, public-key blob, and flags word through `enrich_metadata`; `Assembly` rows also carry the hash-algorithm id, and `AssemblyRef` rows also carry the `HashValue` blob, rendered length-plus-hex. Signatures, RVAs, and IL are not read.
 fn read_metadata_names(
     file: &[u8],
     metadata_off: Option<usize>,
@@ -1312,11 +1320,19 @@ fn enrich_metadata(
                         name: heap_string(strings, read_index(row, 16 + blob_w, str_w)),
                         culture: heap_string(strings, read_index(row, 16 + blob_w + str_w, str_w)),
                         public_key,
+                        hash_alg_id: Some(u32::from_le_bytes([row[0], row[1], row[2], row[3]])),
+                        flags: u32::from_le_bytes([row[12], row[13], row[14], row[15]]),
+                        hash_value: None,
                     });
                 }
                 35 => {
                     let public_key = blobs
                         .and_then(|heap| heap_blob(heap, read_index(row, 12, blob_w)))
+                        .map(render_blob);
+                    let hash_value = blobs
+                        .and_then(|heap| {
+                            heap_blob(heap, read_index(row, 12 + blob_w + str_w * 2, blob_w))
+                        })
                         .map(render_blob);
                     assembly_refs.push(ClrAssembly {
                         major_version: u16::from_le_bytes([row[0], row[1]]),
@@ -1326,6 +1342,9 @@ fn enrich_metadata(
                         name: heap_string(strings, read_index(row, 12 + blob_w, str_w)),
                         culture: heap_string(strings, read_index(row, 12 + blob_w + str_w, str_w)),
                         public_key,
+                        hash_alg_id: None,
+                        flags: u32::from_le_bytes([row[8], row[9], row[10], row[11]]),
+                        hash_value,
                     });
                 }
                 _ => {}
@@ -3081,6 +3100,9 @@ mod tests {
                 name: "Demo".into(),
                 culture: String::new(),
                 public_key: None,
+                hash_alg_id: Some(0),
+                flags: 0,
+                hash_value: None,
             }]
         );
 
@@ -3102,6 +3124,9 @@ mod tests {
                 name: "Demo".into(),
                 culture: String::new(),
                 public_key: None,
+                hash_alg_id: None,
+                flags: 0,
+                hash_value: None,
             }]
         );
 
@@ -3433,6 +3458,9 @@ mod tests {
                     len: 4,
                     hex: "deadbeef".into(),
                 }),
+                hash_alg_id: Some(0),
+                flags: 0,
+                hash_value: None,
             }]
         );
     }
@@ -3475,6 +3503,70 @@ mod tests {
         assert_eq!(key.hex.len(), 64);
         assert!(key.hex.starts_with("0001020304"));
         assert!(key.hex.ends_with("1f"));
+        assert_eq!(reference.flags, 0);
+        assert_eq!(reference.hash_alg_id, None);
+        assert_eq!(reference.hash_value, None);
+    }
+
+    #[test]
+    fn clr_assembly_row_carries_hash_id_and_flags() {
+        // Hash-algorithm id 0x2404, 1.2.3.4, flags 1, no public key, name, culture.
+        let mut assembly = tilde_header(1u64 << 32, &[1]);
+        assembly.extend_from_slice(&0x2404u32.to_le_bytes());
+        assembly.extend_from_slice(&1u16.to_le_bytes());
+        assembly.extend_from_slice(&2u16.to_le_bytes());
+        assembly.extend_from_slice(&3u16.to_le_bytes());
+        assembly.extend_from_slice(&4u16.to_le_bytes());
+        assembly.extend_from_slice(&1u32.to_le_bytes());
+        assembly.extend_from_slice(&0u16.to_le_bytes());
+        assembly.extend_from_slice(&1u16.to_le_bytes());
+        assembly.extend_from_slice(&0u16.to_le_bytes());
+        let mut names = vec![0u8];
+        names.extend_from_slice(b"Demo\0");
+        let (file, streams) = with_strings(&assembly, &names);
+        let meta = read_metadata_names(&file, Some(0), &streams);
+        let row = &meta.assemblies[0];
+        assert_eq!(row.hash_alg_id, Some(0x2404));
+        assert_eq!(row.flags, 1);
+        assert_eq!(row.public_key, None);
+        assert_eq!(row.hash_value, None);
+    }
+
+    #[test]
+    fn clr_assembly_ref_row_carries_flags_and_hash_value() {
+        // Two AssemblyRef rows: flags 0x200, name, and a HashValue blob index 1 on the
+        // first; a HashValue blob index 0 on the second.
+        let mut assembly_ref = tilde_header(1u64 << 35, &[2]);
+        for hash_index in [1u16, 0] {
+            assembly_ref.extend_from_slice(&1u16.to_le_bytes());
+            assembly_ref.extend_from_slice(&2u16.to_le_bytes());
+            assembly_ref.extend_from_slice(&3u16.to_le_bytes());
+            assembly_ref.extend_from_slice(&4u16.to_le_bytes());
+            assembly_ref.extend_from_slice(&0x200u32.to_le_bytes());
+            assembly_ref.extend_from_slice(&0u16.to_le_bytes());
+            assembly_ref.extend_from_slice(&1u16.to_le_bytes());
+            assembly_ref.extend_from_slice(&0u16.to_le_bytes());
+            assembly_ref.extend_from_slice(&hash_index.to_le_bytes());
+        }
+        let mut names = vec![0u8];
+        names.extend_from_slice(b"Demo\0");
+        let mut blobs = vec![0u8];
+        blobs.extend_from_slice(&[2, 0xAA, 0xBB]);
+        let (file, streams) = with_blobs(&assembly_ref, &names, &blobs);
+        let meta = read_metadata_names(&file, Some(0), &streams);
+        assert_eq!(meta.assembly_refs.len(), 2);
+        let first = &meta.assembly_refs[0];
+        assert_eq!(first.flags, 0x200);
+        assert_eq!(first.hash_alg_id, None);
+        assert_eq!(
+            first.hash_value,
+            Some(ClrBlob {
+                len: 2,
+                hex: "aabb".into(),
+            })
+        );
+        assert_eq!(meta.assembly_refs[1].hash_value, None);
+        assert_eq!(meta.assembly_refs[1].name, "Demo");
     }
 
     #[test]
