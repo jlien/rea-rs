@@ -528,7 +528,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "rea_macho",
-            "description": "Mach-O dylibs, UUID, build version, rpaths, code-directory identifier, hash type, team id, hash-slot digests, the special-slot count, exec-segment offset, size, and flags, the CMS blob, cms_verified when the hash type is sha1 or sha256, entitlements keys and capped XML, the DER entitlements slot size, an embedded Info.plist, an overlay, fat architectures, and rpath file hits. cms_verified is a digest window, not an Apple trust decision. A missing blob does not fail the parse.",
+            "description": "Mach-O dylibs, UUID, build version, rpaths, code-directory identifier, hash type, team id, hash-slot digests, the special-slot count, exec-segment offset, size, and flags, the CMS blob, cms_verified when the hash type is sha1 or sha256, entitlements keys and capped XML, the DER entitlements slot size and its top-level DER keys, an embedded Info.plist, an overlay, fat architectures, and rpath file hits. cms_verified is a digest window, not an Apple trust decision. A missing blob does not fail the parse.",
             "inputSchema": schema(true, json!({}), &[]),
         }),
         json!({
