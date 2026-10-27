@@ -89,10 +89,13 @@ pub struct MachoBlob {
     pub bytes: Vec<u8>,
 }
 
-/// One entitlement key with its immediate plist value.
+/// One entitlement key with its value. A top-level `<key>` carries its immediate `<string>` or boolean
+/// value; a nested `<dict>` or `<array>` carries its own key with no value and is followed by one level of
+/// entries inside it: `parent.child` for a dict child, `parent[0]`, `parent[1]`, ... for array items,
+/// capped at 32 with a trailing `... N more` marker.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct MachoEntitlement {
-    /// Top-level `<key>` name.
+    /// The top-level `<key>` name, or the derived `parent.child` / `parent[i]` form for a nested entry.
     pub key: String,
     /// The immediate `<string>` text, or `true`/`false` for `<true/>`/`<false/>`. `None` for every other value kind
     /// (array, dict, data, date, integer, real) and for a key with no readable value.
@@ -102,8 +105,9 @@ pub struct MachoEntitlement {
 /// The entitlements slot (`0x10005`) of a CMS superblob. This is a read of stored bytes, not an Apple trust decision.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct MachoEntitlements {
-    /// Top-level keys with their immediate string or boolean values, in file order. Keys inside nested dicts and
-    /// arrays are not listed.
+    /// Top-level keys with their immediate string or boolean values, in file order. A nested dict or array keeps
+    /// its own key with no value and contributes one level of entries inside it (`parent.child`, `parent[i]`),
+    /// capped at 32 with a `... N more` marker; a deeper dict or array is skipped.
     pub entries: Vec<MachoEntitlement>,
     /// The XML payload capped at 8 KiB with an appended `…` marker. A payload that is not XML is the lowercase hex
     /// of its first 8 KiB, with the same marker when truncated.
@@ -336,6 +340,7 @@ const EXEC_SEG_END: usize = 88;
 const EXEC_SEG_VERSION: u32 = 0x20400;
 const BLOB_BYTE_CAP: usize = 4096;
 const ENTITLEMENTS_XML_CAP: usize = 8192;
+const NESTED_ENTITLEMENTS_CAP: usize = 32;
 
 /// Code directory, CMS blob, and entitlement slots from `LC_CODE_SIGNATURE`.
 ///
@@ -426,8 +431,11 @@ fn entitlements_slot(blob: &[u8]) -> Option<MachoEntitlements> {
     Some(MachoEntitlements { entries, payload })
 }
 
-/// Top-level `<key>` names with their immediate `<string>` or boolean value. Content inside a nested `<dict>` or
-/// `<array>` is skipped, so its keys are not listed. A truncated payload keeps the keys that parsed.
+/// Top-level `<key>` names with their immediate `<string>` or boolean value. A nested `<dict>` or `<array>`
+/// keeps its own entry with no value and also contributes one level of entries inside it: a dict child of
+/// string or boolean type becomes `parent.child`, and an array item becomes `parent[0]`, `parent[1]`, ..., in
+/// order, capped at [`NESTED_ENTITLEMENTS_CAP`] entries with a trailing `... N more` marker. A deeper dict or
+/// array is skipped the way the top level skips one. A truncated payload keeps the keys that parsed.
 fn entitlement_entries(text: &str) -> Vec<MachoEntitlement> {
     let mut out = Vec::new();
     let mut at = match text.find("<dict") {
@@ -441,20 +449,133 @@ fn entitlement_entries(text: &str) -> Vec<MachoEntitlement> {
         };
         let key = text[key_at..key_at + key_end].trim().to_string();
         let after_key = key_at + key_end + "</key>".len();
-        at = match immediate_value(text, after_key) {
-            Some((value, next)) => {
-                out.push(MachoEntitlement { key, value });
-                next
-            }
-            None => after_key,
+        let Some(tag_at) = text[after_key..].find('<').map(|i| after_key + i) else {
+            at = after_key;
+            continue;
         };
+        if text[tag_at..].starts_with("<dict") || text[tag_at..].starts_with("<array") {
+            out.push(MachoEntitlement { key: key.clone(), value: None });
+            let (nested, next) = nested_entries(text, tag_at, &key);
+            out.extend(nested);
+            at = next;
+        } else {
+            at = match immediate_value(text, after_key) {
+                Some((value, next)) => {
+                    out.push(MachoEntitlement { key, value });
+                    next
+                }
+                None => after_key,
+            };
+        }
     }
     out
 }
 
+/// One level inside the `<dict>` or `<array>` whose tag starts at `tag_at`, under the top-level key
+/// `parent`. A dict child of string or boolean type becomes `parent.child`; any other child element keeps
+/// the derived key with no value. An array item becomes `parent[0]`, `parent[1]`, ...; a non-string,
+/// non-boolean item keeps the index with no value. Entries past [`NESTED_ENTITLEMENTS_CAP`] are counted,
+/// not stored, and leave a trailing `... N more` marker. Returns the entries and the offset past the
+/// element's close tag; a payload that never closes stops at the end of `text`.
+fn nested_entries(text: &str, tag_at: usize, parent: &str) -> (Vec<MachoEntitlement>, usize) {
+    let mut out = Vec::new();
+    let mut more = 0usize;
+    let Some(name_end) = text[tag_at..].find(['>', ' ']) else {
+        return (out, tag_at);
+    };
+    let name = text[tag_at + 1..tag_at + name_end].trim_end_matches('/').to_string();
+    let Some(gt) = text[tag_at..].find('>') else {
+        return (out, tag_at);
+    };
+    let tag_end = tag_at + gt + 1;
+    if text[..tag_end].ends_with("/>") {
+        return (out, tag_end);
+    }
+    let close = format!("</{name}>");
+    let is_dict = name == "dict";
+    let mut at = tag_end;
+    let mut index = 0usize;
+    loop {
+        let Some(next) = text[at..].find('<') else {
+            return (marker(out, parent, more), text.len());
+        };
+        let pos = at + next;
+        if text[pos..].starts_with(&close) {
+            return (marker(out, parent, more), pos + close.len());
+        }
+        let (full_key, value_at) = if is_dict {
+            if !text[pos..].starts_with("<key>") {
+                at = pos + 1;
+                continue;
+            }
+            let body = &text[pos + "<key>".len()..];
+            let Some(key_end) = body.find("</key>") else {
+                return (marker(out, parent, more), text.len());
+            };
+            let child = body[..key_end].trim();
+            let after_key = pos + "<key>".len() + key_end + "</key>".len();
+            let Some(vtag) = text[after_key..].find('<').map(|i| after_key + i) else {
+                return (marker(out, parent, more), text.len());
+            };
+            (format!("{parent}.{child}"), vtag)
+        } else {
+            (format!("{parent}[{index}]"), pos)
+        };
+        let (value, next) = nested_value(text, value_at);
+        if out.len() < NESTED_ENTITLEMENTS_CAP {
+            out.push(MachoEntitlement { key: full_key, value });
+        } else {
+            more += 1;
+        }
+        index += 1;
+        at = next;
+    }
+}
+
+/// The trailing `... N more` marker for the nested entries of `parent` past the cap.
+fn marker(out: Vec<MachoEntitlement>, parent: &str, more: usize) -> Vec<MachoEntitlement> {
+    if more == 0 {
+        return out;
+    }
+    let mut out = out;
+    out.push(MachoEntitlement { key: parent.to_string(), value: Some(format!("... {more} more")) });
+    out
+}
+
+/// The value of one nested entry: `Some(value)` for a `<string>`, `<true/>`, or `<false/>`, `None` for any
+/// other element, which is skipped whole. Returns the offset past the element; an element that never closes
+/// stops at the end of `text`.
+fn nested_value(text: &str, at: usize) -> (Option<String>, usize) {
+    let Some(name_end) = text[at..].find(['>', ' ']) else {
+        return (None, at);
+    };
+    let name = &text[at + 1..at + name_end];
+    if name.is_empty() || name.starts_with(['/', '!', '?']) {
+        return (None, at + 1);
+    }
+    if text[at..].starts_with("<string>") {
+        let rest = &text[at + "<string>".len()..];
+        let Some(end) = rest.find("</string>") else {
+            return (None, text.len());
+        };
+        let value = rest[..end].trim();
+        let value = (!value.is_empty()).then(|| value.to_string());
+        return (value, at + "<string>".len() + end + "</string>".len());
+    }
+    for (tag, value) in [("<true/>", "true"), ("<false/>", "false")] {
+        if text[at..].starts_with(tag) {
+            return (Some(value.to_string()), at + tag.len());
+        }
+    }
+    let name = name.trim_end_matches('/');
+    let next = skip_element(text, at, name).unwrap_or(text.len());
+    (None, next)
+}
+
 /// The value element right after a `</key>`: `Some((value, offset past it))` for a `<string>`, `<true/>`, or
-/// `<false/>`, and `Some((None, offset past it))` for any other complete element that is skipped. `None` when no
-/// element starts there.
+/// `<false/>`, and `Some((None, offset past it))` for any other complete element that is skipped. `None` when
+/// no element starts there. A nested `<dict>` or `<array>` is handled by [`entitlement_entries`] before this
+/// is called.
 fn immediate_value(text: &str, at: usize) -> Option<(Option<String>, usize)> {
     let tag_at = at + text[at..].find('<')?;
     if text[tag_at..].starts_with("<string>") {
@@ -468,15 +589,6 @@ fn immediate_value(text: &str, at: usize) -> Option<(Option<String>, usize)> {
         if text[tag_at..].starts_with(tag) {
             return Some((Some(value.to_string()), tag_at + tag.len()));
         }
-    }
-    if text[tag_at..].starts_with("<dict") || text[tag_at..].starts_with("<array") {
-        let name_end = text[tag_at..].find(['>', ' '])?;
-        let mut name = text[tag_at + 1..tag_at + name_end].to_string();
-        if name.ends_with('/') {
-            name.pop();
-        }
-        let next = skip_element(text, tag_at, &name)?;
-        return Some((None, next));
     }
     None
 }
@@ -1262,7 +1374,95 @@ mod tests {
                 MachoEntitlement { key: "get-task-allow".into(), value: Some("true".into()) },
                 MachoEntitlement { key: "com.apple.private.skip-library-validation".into(), value: Some("false".into()) },
                 MachoEntitlement { key: "com.apple.security.application-groups".into(), value: None },
+                MachoEntitlement { key: "com.apple.security.application-groups[0]".into(), value: Some("group.inner".into()) },
                 MachoEntitlement { key: "platform-application".into(), value: Some("yes".into()) },
+            ]
+        );
+    }
+
+    #[test]
+    fn nested_dict_children_become_parent_dot_keys() {
+        let xml = b"<?xml version=\"1.0\"?><plist><dict>\
+            <key>com.apple.security.assets</key><dict>\
+            <key>team</key><string>abc</string>\
+            <key>flag</key><true/>\
+            <key>off</key><false/>\
+            <key>deep</key><dict><key>inner</key><string>x</string></dict>\
+            <key>arr</key><array><string>y</string></array>\
+            <key>num</key><integer>5</integer>\
+            </dict>\
+            <key>after</key><string>z</string>\
+            </dict></plist>";
+        let got = facts(&entitled_macho(xml, None)).unwrap();
+        assert_eq!(
+            got.entitlements.expect("entitlements").entries,
+            vec![
+                MachoEntitlement { key: "com.apple.security.assets".into(), value: None },
+                MachoEntitlement { key: "com.apple.security.assets.team".into(), value: Some("abc".into()) },
+                MachoEntitlement { key: "com.apple.security.assets.flag".into(), value: Some("true".into()) },
+                MachoEntitlement { key: "com.apple.security.assets.off".into(), value: Some("false".into()) },
+                // A deeper dict or array is skipped the way the top level skips one: the key stays, no value.
+                MachoEntitlement { key: "com.apple.security.assets.deep".into(), value: None },
+                MachoEntitlement { key: "com.apple.security.assets.arr".into(), value: None },
+                MachoEntitlement { key: "com.apple.security.assets.num".into(), value: None },
+                MachoEntitlement { key: "after".into(), value: Some("z".into()) },
+            ]
+        );
+    }
+
+    #[test]
+    fn nested_array_items_are_indexed_in_order() {
+        let mut xml = String::from("<?xml version=\"1.0\"?><plist><dict><key>groups</key><array>");
+        for name in ["a", "b", "c"] {
+            xml.push_str(&format!("<string>{name}</string>"));
+        }
+        xml.push_str("</array><key>tail</key><string>t</string></dict></plist>");
+        let got = facts(&entitled_macho(xml.as_bytes(), None)).unwrap();
+        assert_eq!(
+            got.entitlements.expect("entitlements").entries,
+            vec![
+                MachoEntitlement { key: "groups".into(), value: None },
+                MachoEntitlement { key: "groups[0]".into(), value: Some("a".into()) },
+                MachoEntitlement { key: "groups[1]".into(), value: Some("b".into()) },
+                MachoEntitlement { key: "groups[2]".into(), value: Some("c".into()) },
+                MachoEntitlement { key: "tail".into(), value: Some("t".into()) },
+            ]
+        );
+    }
+
+    #[test]
+    fn nested_entries_cap_at_32_with_a_more_marker() {
+        let mut xml = String::from("<?xml version=\"1.0\"?><plist><dict><key>many</key><array>");
+        for i in 0..35 {
+            xml.push_str(&format!("<string>{i}</string>"));
+        }
+        xml.push_str("</array></dict></plist>");
+        let got = facts(&entitled_macho(xml.as_bytes(), None)).unwrap();
+        let entries = got.entitlements.expect("entitlements").entries;
+        assert_eq!(entries.len(), 2 + NESTED_ENTITLEMENTS_CAP);
+        assert_eq!(entries[0].key, "many");
+        assert_eq!(entries[0].value, None);
+        assert_eq!(entries[1].key, "many[0]");
+        assert_eq!(entries[1].value, Some("0".into()));
+        assert_eq!(entries[32].key, "many[31]");
+        assert_eq!(entries[32].value, Some("31".into()));
+        assert_eq!(entries[33].key, "many");
+        assert_eq!(entries[33].value, Some("... 3 more".into()));
+    }
+
+    #[test]
+    fn truncated_nested_payload_keeps_the_keys_that_parsed() {
+        let xml = b"<?xml version=\"1.0\"?><plist><dict>\
+            <key>outer</key><dict>\
+            <key>one</key><string>1</string>\
+            <key>two</key><string>2";
+        let got = facts(&entitled_macho(xml, None)).unwrap();
+        assert_eq!(
+            got.entitlements.expect("entitlements").entries,
+            vec![
+                MachoEntitlement { key: "outer".into(), value: None },
+                MachoEntitlement { key: "outer.one".into(), value: Some("1".into()) },
+                MachoEntitlement { key: "outer.two".into(), value: None },
             ]
         );
     }
