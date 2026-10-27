@@ -769,8 +769,9 @@ fn ref_name(byte: u8) -> String {
 
 /// Reads the global section. A global whose valtype is `i32` and whose
 /// initializer is `i32.const N end` is stored with its constant. A global
-/// with any other valtype or initializer form is skipped; once an initializer
-/// of unknown length is met the rest of the section is left unread. A
+/// with any other valtype or initializer form is skipped but still occupies
+/// its position, which `WasmGlobal::index` counts; once an initializer of
+/// unknown length is met the rest of the section is left unread. A
 /// truncated section yields what parsed so far.
 fn decode_globals(payload: &[u8]) -> Result<Vec<WasmGlobal>> {
     let mut r = Reader::new(payload);
