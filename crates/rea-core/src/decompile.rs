@@ -20,7 +20,9 @@
 //! conditional join, a type carries only when every incoming path agrees on
 //! it — an unsound join drops the type instead of guessing. A store of a
 //! typed register to a stack slot (`[rbp±N]` / `[rsp±N]` on x86_64,
-//! `[sp, #N]` on arm64; N decimal or Capstone's hex) and a later load from that same slot reuse the type:
+//! `[sp, #N]` or `[sp, #N]!` on arm64; N decimal or Capstone's hex; stores via
+//! `str`/`strb`/`strh`, loads via `ldr`/`ldur` and their byte/halfword/sized
+//! variants) and a later load from that same slot reuse the type:
 //! the slot itself never becomes a synthetic local, so reloading into the
 //! register that typed the slot stays one local, and a slot written with two
 //! different types — or with unknown data — becomes untyped. Heap addresses,
