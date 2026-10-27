@@ -153,16 +153,18 @@ enum Command {
 enum SessionCmd {
     /// Create a session file for a path. A loadable binary is mapped once for its identity summary; a path that does not load still opens.
     Open { path: String },
-    /// Append a record. `--tool` names a rea command (`info`, `sections`, `symbols`, `strings`, `funcs`, `disasm`) whose output is re-run against the session's binary and embedded, capped at 16 KiB.
+    /// Append a record. `--tool` names a rea command (`info`, `sections`, `symbols`, `strings`, `funcs`, `disasm`) whose output is re-run against the session's binary and embedded, capped at 16 KiB. Optional `--arguments` text is stored with the record, capped at 1024 bytes; omitted, it stays null.
     Record {
         id: String,
         #[arg(long)]
         tool: Option<String>,
+        #[arg(long)]
+        arguments: Option<String>,
         summary: String,
     },
     /// Compare two session ids in `--dir`.
     Diff { left: String, right: String },
-    /// Print a session file. `--format evidence` maps it to the upstream-morphic Evidence shape instead: per record the tool name, an arguments echo, the capped embedded output, a timestamp, and the session id. Fields the native store does not capture (argument echoes, timestamps, the upstream session handle, a live mapping) are explicit nulls. CLI-only; the MCP surface is unchanged.
+    /// Print a session file. `--format evidence` maps it to the upstream-morphic Evidence shape instead: per record the tool name, the stored arguments echo and unix-seconds timestamp (null when the record carries neither), the capped embedded output, and the session id. The upstream session handle and a live mapping stay explicit nulls. CLI-only; the MCP surface is unchanged.
     Export {
         id: String,
         #[arg(long, value_enum, default_value_t = ExportFormat::Native)]
@@ -313,8 +315,8 @@ fn main() -> anyhow::Result<()> {
                 SessionCmd::Open { path } => serde_json::to_value(
                     rea_core::session::open(dir, path).map_err(|e| anyhow::anyhow!("{e}"))?,
                 )?,
-                SessionCmd::Record { id, tool, summary } => serde_json::to_value(
-                    rea_core::session::record(dir, id, tool.as_deref(), summary)
+                SessionCmd::Record { id, tool, arguments, summary } => serde_json::to_value(
+                    rea_core::session::record(dir, id, tool.as_deref(), summary, arguments.as_deref())
                         .map_err(|e| anyhow::anyhow!("{e}"))?,
                 )?,
                 SessionCmd::Diff { left, right } => {

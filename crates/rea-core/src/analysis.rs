@@ -816,11 +816,12 @@ pub fn strings_with_xrefs(target: &Target, min_len: usize) -> Vec<AnnotatedStrin
         };
         let vaddr = sec.addr.saturating_add(hit.offset - sec.file_offset);
         // UTF-16 runs decode one char per code unit but occupy two bytes each;
-        // UTF-32 runs occupy four.
+        // UTF-32 runs occupy four. UTF-8 and ASCII hits are their own byte
+        // length.
         let len = match hit.encoding {
             Some("utf-32le") | Some("utf-32be") => (hit.value.len() as u64) * 4,
+            Some("utf-8") | None => hit.value.len() as u64,
             Some(_) => (hit.value.len() as u64) * 2,
-            None => hit.value.len() as u64,
         };
         let lo = vaddr.saturating_sub(16);
         let hi = vaddr.saturating_add(len);
