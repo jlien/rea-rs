@@ -46,10 +46,13 @@ fn string_after_key(text: &str, key: &str) -> Option<String> {
 }
 
 /// The object kinds the binary identity walk needs. Everything else is
-/// `Skip`: dates, UIDs, data, numbers, arrays, and keyed archives stay
-/// unread and do not fail the parse.
+/// `Skip`: UIDs, data, numbers, arrays, and keyed archives stay unread
+/// and do not fail the parse. A date (`0x33`) carries its whole seconds
+/// of the Apple absolute time.
 enum Obj {
     Str(String),
+    /// Whole seconds since 2001-01-01 from a `0x33` marker.
+    Date(i64),
     Dict { keys: Vec<u64>, values: Vec<u64> },
     Skip,
 }
@@ -83,7 +86,7 @@ fn identify_binary(bytes: &[u8]) -> Option<PlistInfo> {
     };
     let mut info = PlistInfo { bundle_id: None, bundle_name: None, bundle_version: None };
     for (k, v) in keys.iter().zip(values.iter()) {
-        let (Some(Obj::Str(key)), Some(Obj::Str(value))) = (bp.object(*k), bp.object(*v)) else {
+        let Some(Obj::Str(key)) = bp.object(*k) else {
             continue;
         };
         let field = match key.as_str() {
@@ -92,8 +95,10 @@ fn identify_binary(bytes: &[u8]) -> Option<PlistInfo> {
             "CFBundleVersion" => &mut info.bundle_version,
             _ => continue,
         };
-        if !value.is_empty() {
-            *field = Some(value);
+        match bp.object(*v) {
+            Some(Obj::Str(value)) if !value.is_empty() => *field = Some(value),
+            Some(Obj::Date(secs)) => *field = Some(secs.to_string()),
+            _ => continue,
         }
     }
     if info.bundle_id.is_none() && info.bundle_name.is_none() && info.bundle_version.is_none() {
@@ -133,6 +138,21 @@ impl BpList<'_> {
                 let units: Vec<u16> =
                     raw.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
                 Some(Obj::Str(String::from_utf16(&units).ok()?))
+            }
+            0x3 => {
+                // Only the 8-byte date marker `0x33` decodes. A truncated
+                // payload, a non-finite value, or a fraction that is not
+                // zero returns `None`, which leaves the field unread and
+                // does not fail the parse.
+                if marker != 0x33 {
+                    return Some(Obj::Skip);
+                }
+                let raw: [u8; 8] = self.bytes.get(off + 1..off + 9)?.try_into().ok()?;
+                let secs = f64::from_be_bytes(raw);
+                if !secs.is_finite() || secs.fract() != 0.0 || secs.abs() >= 9.3e18 {
+                    return None;
+                }
+                Some(Obj::Date(secs as i64))
             }
             0xD => {
                 let (count, at) = self.length(off)?;
@@ -217,6 +237,14 @@ mod tests {
         for u in units {
             obj.extend_from_slice(&u.to_be_bytes());
         }
+        obj
+    }
+
+    /// One `0x33` date object: 8-byte big-endian IEEE-754 seconds since
+    /// 2001-01-01.
+    fn date_obj(secs: f64) -> Vec<u8> {
+        let mut obj = vec![0x33];
+        obj.extend_from_slice(&secs.to_be_bytes());
         obj
     }
 
@@ -317,5 +345,61 @@ mod tests {
         let n = bad_ref.len();
         bad_ref[n - 32 + 7] = 0;
         assert!(identify(&bad_ref).is_none());
+    }
+
+    #[test]
+    fn reads_binary_plist_date_values_as_whole_seconds() {
+        // 700_000_000 seconds after 2001-01-01 is early 2023.
+        let file = bplist(&[
+            ("CFBundleIdentifier", date_obj(700_000_000.0)),
+            ("CFBundleName", ascii_obj("Example")),
+            ("CFBundleVersion", date_obj(-42.0)),
+        ]);
+        let got = identify(&file).unwrap();
+        assert_eq!(got.bundle_id.as_deref(), Some("700000000"));
+        assert_eq!(got.bundle_name.as_deref(), Some("Example"));
+        assert_eq!(got.bundle_version.as_deref(), Some("-42"));
+    }
+
+    #[test]
+    fn binary_plist_dates_that_do_not_decode_leave_the_field_unread() {
+        // A fraction that is not zero.
+        let file = bplist(&[("CFBundleName", date_obj(700_000_000.5))]);
+        assert!(identify(&file).is_none());
+        // A non-finite value.
+        let file = bplist(&[("CFBundleName", date_obj(f64::NAN))]);
+        assert!(identify(&file).is_none());
+        let file = bplist(&[("CFBundleName", date_obj(f64::INFINITY))]);
+        assert!(identify(&file).is_none());
+        // A truncated payload: marker plus 6 of 8 bytes, with a valid
+        // offset table and trailer after it.
+        let mut file = b"bplist00".to_vec();
+        let dict = vec![0xD1, 1, 2];
+        let key = ascii_obj("CFBundleName");
+        let mut date = vec![0x33];
+        date.extend_from_slice(&700_000_000.0f64.to_be_bytes()[..6]);
+        let objects = [dict, key, date];
+        let mut offsets = Vec::new();
+        for obj in &objects {
+            offsets.push(file.len() as u8);
+            file.extend_from_slice(obj);
+        }
+        let table_at = file.len() as u64;
+        file.extend_from_slice(&offsets);
+        file.extend_from_slice(&[0u8; 5]);
+        file.push(0);
+        file.push(1);
+        file.push(1);
+        file.extend_from_slice(&(objects.len() as u64).to_be_bytes());
+        file.extend_from_slice(&0u64.to_be_bytes());
+        file.extend_from_slice(&table_at.to_be_bytes());
+        assert!(identify(&file).is_none());
+        // A float marker (`0x30`) stays unread and does not fail the parse.
+        let mut float_obj = vec![0x30];
+        float_obj.extend_from_slice(&1.0f32.to_be_bytes());
+        let file = bplist(&[("CFBundleName", float_obj), ("CFBundleVersion", ascii_obj("1"))]);
+        let got = identify(&file).unwrap();
+        assert_eq!(got.bundle_name, None);
+        assert_eq!(got.bundle_version.as_deref(), Some("1"));
     }
 }
