@@ -59,7 +59,10 @@ pub fn extract(bytes: &[u8], min_len: usize) -> Vec<StringHit> {
         .into_iter()
         .chain(utf32_runs(bytes, min_len, false))
     {
-        if !hits.iter().any(|h| overlaps(&u, h) && byte_len(h) > byte_len(&u)) {
+        if !hits
+            .iter()
+            .any(|h| overlaps(&u, h) && byte_len(h) >= byte_len(&u))
+        {
             hits.push(u);
         }
     }
@@ -324,6 +327,26 @@ mod tests {
         assert!(hits.iter().all(|h| !h.encoding.unwrap_or("").starts_with("utf-32")));
         let ascii = hits.iter().find(|h| h.encoding.is_none()).unwrap();
         assert_eq!(ascii.value, "abcdaa");
+    }
+
+    #[test]
+    fn an_overlapping_utf32_run_of_the_other_endianness_is_dropped() {
+        // 13 bytes: LE reads "abc" at 0 (three printable low bytes, 12 bytes
+        // long). The same bytes are also a 3-unit BE run "bcd" at 1 (each BE
+        // unit is 00 00 00 X): 12 bytes, overlapping, equal length. The
+        // longer-or-equal rule keeps the run the scan saw first and drops the
+        // other-endian twin, so the bytes yield one UTF-32 hit, not two.
+        let data = [
+            0x61, 0x00, 0x00, 0x00, 0x62, 0x00, 0x00, 0x00, 0x63, 0x00, 0x00, 0x00, 0x64,
+        ];
+        let hits = extract(&data, 2);
+        let utf32: Vec<_> = hits
+            .iter()
+            .filter(|h| h.encoding.unwrap_or("").starts_with("utf-32"))
+            .collect();
+        assert_eq!(utf32.len(), 1, "{hits:?}");
+        assert_eq!(utf32[0].encoding, Some("utf-32le"));
+        assert_eq!(utf32[0].value, "abc");
     }
 
     #[test]
