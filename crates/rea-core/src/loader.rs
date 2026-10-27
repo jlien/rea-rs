@@ -108,7 +108,10 @@ fn load_le(bytes: Vec<u8>, path: String) -> Result<Target> {
     let sections = img.sections();
     // Apply internal fixups so analysis sees relocated pointers (the file
     // stores unrelocated values; DOS/4GW patches them at load time).
+    // Iterated pages expand first so fixup sites on them patch page bytes,
+    // not the records; the identity pages and the fixup pass are unchanged.
     let mut patched = bytes;
+    img.expand_iterated(&mut patched)?;
     img.apply_fixups(&mut patched)?;
     let page_map = img.pages;
     Ok(Target {
@@ -689,9 +692,12 @@ mod tests {
             .find(|s| s.name == "$s4main9")
             .expect("broken");
         assert_eq!(broken.demangled, None);
-        // Headers still omit Swift names until task 6.1.
+        // Headers print a Swift demangle as a comment (`/* main.foo */`),
+        // never a declaration; the failed demangle stays absent.
         let header = crate::headers::emit(&target);
-        assert!(!header.contains("main.foo"), "{header}");
+        assert!(header.contains("/* main.foo */"), "{header}");
+        assert!(!header.contains("extern void $s4main3fooyyF"), "{header}");
+        assert!(!header.contains("$s4main9"), "{header}");
     }
 
     fn macho_with_clang_itanium() -> Vec<u8> {
@@ -941,5 +947,26 @@ mod tests {
 
     fn put_le64(file: &mut [u8], at: usize, v: u64) {
         file[at..at + 8].copy_from_slice(&v.to_le_bytes());
+    }
+
+    #[test]
+    fn iterated_pages_expand_through_the_real_load_path() {
+        // The fixture rides load_arch, not just LeImage::parse: the loader
+        // expands the iterated page before fixups, so `translate` serves
+        // the reconstituted page bytes and the fixup pass sees them.
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("rea-le-iter-{}.exe", std::process::id()));
+        std::fs::write(&path, crate::le::tests::iterated()).unwrap();
+        let target = super::load_arch(&path, None).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        let off = target.vaddr_to_offset(0x400000).unwrap() as usize;
+        assert_eq!(off, 0x140);
+        // 8 iterations of [A5], then 4 of [5A B4]: the expanded page.
+        assert_eq!(&target.bytes[off..off + 8], &[0xA5u8; 8][..]);
+        assert_eq!(
+            &target.bytes[off + 8..off + 16],
+            &[0x5Au8, 0xB4u8, 0x5Au8, 0xB4u8, 0x5Au8, 0xB4u8, 0x5Au8, 0xB4u8][..]
+        );
     }
 }

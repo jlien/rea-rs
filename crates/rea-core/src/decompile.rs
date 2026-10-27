@@ -18,14 +18,36 @@
 //! flows through a followed join while the register state is trivially
 //! carried (same physical register, no writes in the skipped gap); across a
 //! conditional join, a type carries only when every incoming path agrees on
-//! it — an unsound join drops the type instead of guessing. It is still not a
-//! type-recovering decompiler: memory objects keep no types, and struct
-//! recovery and cross-function dataflow stay out of scope. A short or
-//! unmapped body returns an error from disassembly and does not invent
-//! instructions.
+//! it — an unsound join drops the type instead of guessing. A store of a
+//! typed register to a stack slot (`[rbp±N]` / `[rsp±N]` on x86_64,
+//! `[sp, #N]` — with or without the pre-index `!` — on arm64; N decimal or
+//! Capstone's hex; stores via `str`/`stur` and their byte/halfword forms,
+//! loads via `ldr`/`ldur` and their byte/halfword/sized variants; a bare
+//! `[sp]` names no slot) and a later load from that same slot reuse the type:
+//! the slot itself never becomes a synthetic local, so reloading into the
+//! register that typed the slot stays one local, and a slot written with two
+//! different types — or with unknown data — becomes untyped. Heap addresses,
+//! struct fields, and cross-function stack layouts keep no types. It is
+//! still not a type-recovering decompiler: struct recovery and
+//! cross-function dataflow stay out of scope. A short or unmapped body
+//! returns an error from disassembly and does not invent instructions.
 
 use crate::{analysis, disasm, Arch, Error, Result, Target};
 use std::collections::{HashMap, HashSet};
+
+/// A stack slot: `(base, displacement)` — base `0` is `rbp`, `1` is `rsp`
+/// (x86_64), `2` is `sp` (arm64); displacement in bytes, signed.
+type SlotKey = (u8, i64);
+
+/// A slot's recorded type and the window index of the store that set it.
+#[derive(Clone, Copy)]
+struct SlotSnap {
+    ty: Option<&'static str>,
+    at: usize,
+    /// A slot that saw two different types is poisoned: it stays untyped
+    /// even when a later typed store arrives.
+    poisoned: bool,
+}
 
 /// Unconditional-jump hops the window follows within one function.
 const MAX_HOPS: u32 = 8;
@@ -60,7 +82,7 @@ pub fn decompile(target: &Target, addr: u64, limit: usize) -> Result<String> {
     if insns.is_empty() {
         return Err(Error::Parse("decompile: no instructions".into()));
     }
-    let typed = plan_types(&insns, target.arch);
+    let typed = plan_types(&insns, target.arch, &gaps, &joins);
     let (declared, kills) = carry_types(&typed, &gaps, &joins, target.arch);
     let mut names = Names::new(target.arch);
     let mut next = 0usize;
@@ -305,23 +327,16 @@ fn written_reg(insn: &disasm::Instruction, arch: Arch) -> Option<String> {
     canonical_of(arch, dst)
 }
 
-/// Resolve which typed registers survive the followed joins. A register keeps
-/// its type across an unconditional hop when the skipped gap holds no write
-/// to it (same physical register, no intervening writes); an undecodable gap
-/// drops every type carried into the join. Across a followed conditional's
-/// join, the incoming paths are the fall-through block and the direct entry
-/// at the target: a type carries only when every incoming path agrees on it —
-/// a register first typed inside the fall-through block is untyped on the
-/// direct path, and a block write that leaves a different type (or no
-/// inferable type) kills the carried type. Returns the declared registers
-/// with their synthetic-local numbers, and the window index after which each
-/// type dies.
-fn carry_types<'a>(
-    typed: &'a [TypedReg],
+/// Where each typed register's type dies: the index after which the renderer
+/// drops it. A skipped gap that writes the register (or that does not decode)
+/// kills it at the join; a followed conditional kills it when the incoming
+/// paths disagree.
+fn register_deaths(
+    typed: &[TypedReg],
     gaps: &[Gap],
     joins: &[CondJoin],
     arch: Arch,
-) -> (Vec<(&'a TypedReg, usize)>, Vec<(usize, String)>) {
+) -> HashMap<String, usize> {
     let mut kill: HashMap<String, usize> = HashMap::new();
     for gap in gaps {
         let dead: Vec<String> = match &gap.insns {
@@ -374,8 +389,37 @@ fn carry_types<'a>(
             }
         }
     }
-    let declared: Vec<(&TypedReg, usize)> =
-        typed.iter().enumerate().map(|(n, r)| (r, n + 1)).collect();
+    kill
+}
+
+/// Resolve which typed registers survive the followed joins. A register keeps
+/// its type across an unconditional hop when the skipped gap holds no write
+/// to it (same physical register, no intervening writes); an undecodable gap
+/// drops every type carried into the join. Across a followed conditional's
+/// join, the incoming paths are the fall-through block and the direct entry
+/// at the target: a type carries only when every incoming path agrees on it —
+/// a register first typed inside the fall-through block is untyped on the
+/// direct path, and a block write that leaves a different type (or no
+/// inferable type) kills the carried type. Returns the declared registers
+/// with their synthetic-local numbers, and the window index after which each
+/// type dies.
+fn carry_types<'a>(
+    typed: &'a [TypedReg],
+    gaps: &[Gap],
+    joins: &[CondJoin],
+    arch: Arch,
+) -> (Vec<(&'a TypedReg, usize)>, Vec<(usize, String)>) {
+    let kill = register_deaths(typed, gaps, joins, arch);
+    // Slot loads push their destination after later instructions were
+    // already typed; activation walks `declared` in order, so sort by the
+    // typing index.
+    let mut numbered: Vec<(usize, &TypedReg)> =
+        typed.iter().enumerate().map(|(n, r)| (n, r)).collect();
+    numbered.sort_by_key(|(n, r)| (r.first, *n));
+    let declared: Vec<(&TypedReg, usize)> = numbered
+        .into_iter()
+        .map(|(n, r)| (r, n + 1))
+        .collect();
     let mut kills: Vec<(usize, String)> = typed
         .iter()
         .filter_map(|r| {
@@ -632,9 +676,166 @@ impl Names {
     }
 }
 
-/// Width inference over the straight-line window: one entry per register the
-/// first time a typing instruction names it, in window order.
-fn plan_types(insns: &[disasm::Instruction], arch: Arch) -> Vec<TypedReg> {
+/// Width inference over the flow-ordered window: one entry per register the
+/// first time a typing instruction names it, in window order. A store of a
+/// typed register to a stack slot — `[rbp±N]` / `[rsp±N]` on x86_64,
+/// `[sp, #N]` on arm64 — records the slot's type at the store's window
+/// index; a later load from that slot reuses it (and re-activates or first
+/// types the destination register at the load), so the synthetic local stays
+/// one local. A slot stored a second, different type — or written with
+/// unknown data — becomes untyped from then on, and a store inside a
+/// followed conditional's fall-through block reaches only loads inside that
+/// same block: the other path never executed it.
+fn plan_types(
+    insns: &[disasm::Instruction],
+    arch: Arch,
+    gaps: &[Gap],
+    joins: &[CondJoin],
+) -> Vec<TypedReg> {
+    // Pass 1: register-only inference, so slot stores know which source
+    // registers are typed without circular reasoning.
+    let reg_typed = plan_register_types(insns, arch);
+    let deaths = register_deaths(&reg_typed, gaps, joins, arch);
+
+    let mut typed = reg_typed;
+    let mut types: HashMap<String, &'static str> =
+        typed.iter().map(|r| (r.aliases[0].clone(), r.ty)).collect();
+    let mut slots: HashMap<SlotKey, SlotSnap> = HashMap::new();
+
+    // Skipped gaps the walk decoded may overwrite slots behind a jump; a gap
+    // that did not decode makes every recorded slot suspect.
+    let mut gap_invalidations: Vec<(usize, Vec<Option<SlotKey>>)> = gaps
+        .iter()
+        .map(|gap| {
+            let keys = match &gap.insns {
+                Some(insns) => insns
+                    .iter()
+                    .filter_map(|i| slot_store_key(i, arch))
+                    .map(Some)
+                    .collect(),
+                None => vec![None],
+            };
+            (gap.after, keys)
+        })
+        .collect();
+    gap_invalidations.sort_by_key(|(after, _)| *after);
+    let mut next_gap = 0usize;
+
+    for (i, insn) in insns.iter().enumerate() {
+        while next_gap < gap_invalidations.len() && gap_invalidations[next_gap].0 <= i {
+            let (after, keys) = &gap_invalidations[next_gap];
+            if keys.iter().any(Option::is_none) {
+                for snap in slots.values_mut() {
+                    snap.poisoned = true;
+                    snap.ty = None;
+                }
+            } else {
+                for k in keys.iter().flatten() {
+                    // The gap's store is unknown data landing in this slot:
+                    // record a poisoned snap even when the walked path has
+                    // not stored here yet, so no later typed store re-types
+                    // the slot.
+                    let snap = slots.entry(*k).or_insert(SlotSnap {
+                        ty: None,
+                        at: *after,
+                        poisoned: false,
+                    });
+                    snap.poisoned = true;
+                    snap.ty = None;
+                    snap.at = *after;
+                }
+            }
+            next_gap += 1;
+        }
+
+        // A store of a typed register to a slot records the slot's type; a
+        // second, different type — or a store of an untyped value — makes
+        // the slot untyped.
+        if let Some(key) = slot_store_key(insn, arch) {
+            let src = slot_store_source(insn, arch);
+            // A register whose type died at a join holds path-dependent
+            // data; a store of it writes unknown data.
+            let ty = src
+                .filter(|c| deaths.get(c).map_or(true, |k| *k > i))
+                .and_then(|c| types.get(&c).copied());
+            let snap = slots
+                .entry(key)
+                .or_insert(SlotSnap { ty: None, at: i, poisoned: false });
+            // A store poisons the slot when it conflicts with the recorded
+            // type (or carries no type at all); a poisoned slot never
+            // recovers — mixed data landed there for the whole window.
+            let poisoned = snap.poisoned
+                || match (snap.ty, ty) {
+                    (Some(old), Some(new)) => old != new,
+                    (Some(_), None) | (None, None) => true,
+                    (None, Some(_)) => false,
+                };
+            if poisoned {
+                snap.poisoned = true;
+                snap.ty = None;
+                snap.at = i;
+            } else {
+                snap.ty = ty;
+                snap.at = i;
+            }
+        }
+
+        // A load from a typed, unpoisoned slot types (or re-types) its
+        // destination register at this index.
+        if let Some(key) = slot_load_key(insn, arch) {
+            if let Some(snap) = slots.get(&key) {
+                if let Some(ty) = snap.ty {
+                    if !snap.poisoned && slot_reaches(i, snap.at, joins) {
+                        let dst = slot_load_dest(insn, arch);
+                        if let Some(canon) = dst {
+                            if types.get(&canon) != Some(&ty) {
+                                types.insert(canon.clone(), ty);
+                                if let Some(entry) =
+                                    typed.iter_mut().find(|r| r.aliases[0] == canon)
+                                {
+                                    entry.ty = ty;
+                                    entry.first = i;
+                                } else {
+                                    typed.push(TypedReg {
+                                        aliases: aliases_of(&canon),
+                                        ty,
+                                        first: i,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some((canon, ty)) = infer_insn(insn, arch, &types) {
+            if types.contains_key(&canon) {
+                continue;
+            }
+            types.insert(canon.clone(), ty);
+            typed.push(TypedReg {
+                aliases: aliases_of(&canon),
+                ty,
+                first: i,
+            });
+        }
+    }
+    typed
+}
+
+/// Whether a slot type recorded at `store_at` may reach a load at `load_at`:
+/// a store strictly inside a followed conditional's fall-through block
+/// (`branch < store < after`) executed only on that path, so it reaches only
+/// loads inside the same block.
+fn slot_reaches(load_at: usize, store_at: usize, joins: &[CondJoin]) -> bool {
+    joins.iter().all(|j| {
+        !(j.branch < store_at && store_at < j.after && load_at >= j.after)
+    })
+}
+
+/// Register-only width inference: the original pass, without slots.
+fn plan_register_types(insns: &[disasm::Instruction], arch: Arch) -> Vec<TypedReg> {
     let mut typed: Vec<TypedReg> = Vec::new();
     let mut types: HashMap<String, &'static str> = HashMap::new();
     for (i, insn) in insns.iter().enumerate() {
@@ -651,6 +852,141 @@ fn plan_types(insns: &[disasm::Instruction], arch: Arch) -> Vec<TypedReg> {
         }
     }
     typed
+}
+
+/// A stack slot a memory operand names: `(base, disp)` with base `rbp` (0)
+/// or `rsp` (1) on x86_64, or `sp` (2) with a `#N` displacement on arm64.
+/// Anything else — another base, an index register, a scale, a
+/// post-index — is not a plain slot and returns `None`.
+fn slot_key_of(mem: &str, arch: Arch) -> Option<SlotKey> {
+    // x86_64 memory operands may carry a size keyword ("dword ptr [rbp - 8]").
+    let open = mem.find('[')?;
+    let close = mem.rfind(']')?;
+    let inner = mem[open + 1..close].trim();
+    // Capstone prints displacements in decimal up to |9| and in hex beyond
+    // (0xc, 0x10, ...), so accept either radix.
+    let parse_disp = |s: &str| -> Option<i64> {
+        let s = s.trim();
+        let (neg, digits) = match s.strip_prefix('-') {
+            Some(rest) => (true, rest),
+            None => (false, s),
+        };
+        let n = if let Some(hex) = digits.strip_prefix("0x").or_else(|| digits.strip_prefix("0X")) {
+            i64::from_str_radix(hex, 16).ok()?
+        } else {
+            digits.parse::<i64>().ok()?
+        };
+        Some(if neg { -n } else { n })
+    };
+    match arch {
+        Arch::X86_64 => {
+            let flat: String = inner.chars().filter(|c| !c.is_whitespace()).collect();
+            let (base, disp) = match flat.find(['+', '-']) {
+                Some(p) => {
+                    let n = parse_disp(&flat[p + 1..])?;
+                    let disp = if flat[p..].starts_with('-') { -n } else { n };
+                    (&flat[..p], disp)
+                }
+                None => (flat.as_str(), 0),
+            };
+            match base {
+                "rbp" => Some((0, disp)),
+                "rsp" => Some((1, disp)),
+                _ => None,
+            }
+        }
+        Arch::Arm64 => {
+            // Capstone prints pre-indexed forms with the writeback marker
+            // outside the brackets ("[sp, #-0x10]!"); strip it so the
+            // displacement parses. A bare "[sp]" (a post-index writeback left
+            // the base plain, or a literal [sp] operand) is NOT a plain slot
+            // either way: a post-index store wrote the old sp then moved it,
+            // so the offset that keys the slot is unknowable from the
+            // operand. Only "[sp, #N]" names a slot.
+            let inner = inner.strip_suffix('!').unwrap_or(inner);
+            let mut parts = inner.splitn(2, ',');
+            if parts.next()?.trim() != "sp" {
+                return None;
+            }
+            let off = parts.next()?;
+            let off = off.trim().strip_prefix('#')?.trim();
+            Some((2, parse_disp(off)?))
+        }
+        _ => None,
+    }
+}
+
+/// The slot a store instruction writes, when it stores to a plain stack
+/// slot: `mov [slot], reg` on x86_64, `str reg, [slot]` on arm64.
+fn slot_store_key(insn: &disasm::Instruction, arch: Arch) -> Option<SlotKey> {
+    let m = insn.mnemonic.as_str();
+    let ops = insn.operands.as_str();
+    match arch {
+        Arch::X86_64 if m == "mov" => {
+            let (dst, _) = split_first(ops)?;
+            slot_key_of(dst, arch)
+        }
+        Arch::Arm64
+            if matches!(m, "str" | "strb" | "strh" | "stur" | "sturb" | "sturh") =>
+        {
+            let (_, src) = split_first(ops)?;
+            slot_key_of(src, arch)
+        }
+        _ => None,
+    }
+}
+
+/// The canonical source register of a slot store, if it stores a register.
+fn slot_store_source(insn: &disasm::Instruction, arch: Arch) -> Option<String> {
+    let m = insn.mnemonic.as_str();
+    let ops = insn.operands.as_str();
+    match arch {
+        Arch::X86_64 if m == "mov" => {
+            let (_, src) = split_first(ops)?;
+            canonical_of(arch, src)
+        }
+        Arch::Arm64
+            if matches!(m, "str" | "strb" | "strh" | "stur" | "sturb" | "sturh") =>
+        {
+            let (dst, _) = split_first(ops)?;
+            canonical_of(arch, dst)
+        }
+        _ => None,
+    }
+}
+
+/// The slot a load instruction reads, when it loads from a plain stack slot:
+/// `mov reg, [slot]` on x86_64, `ldr reg, [slot]` on arm64.
+fn slot_load_key(insn: &disasm::Instruction, arch: Arch) -> Option<SlotKey> {
+    let m = insn.mnemonic.as_str();
+    let ops = insn.operands.as_str();
+    match arch {
+        Arch::X86_64 if m == "mov" => {
+            let (dst, src) = split_first(ops)?;
+            if dst.starts_with('[') {
+                return None;
+            }
+            slot_key_of(src, arch)
+        }
+        Arch::Arm64
+            if matches!(
+                m,
+                "ldr" | "ldur" | "ldrb" | "ldurh" | "ldrh" | "ldurb" | "ldursb" | "ldursh"
+                    | "ldursw" | "ldrsw" | "ldrsh" | "ldrsb"
+            ) =>
+        {
+            let (_, src) = split_first(ops)?;
+            slot_key_of(src, arch)
+        }
+        _ => None,
+    }
+}
+
+/// The canonical destination register of a slot load.
+fn slot_load_dest(insn: &disasm::Instruction, arch: Arch) -> Option<String> {
+    let ops = insn.operands.as_str();
+    let (dst, _) = split_first(ops)?;
+    canonical_of(arch, dst)
 }
 
 /// Width inference for one instruction: `(canonical register, C type)`.
@@ -820,6 +1156,8 @@ fn canonical_of(arch: Arch, reg: &str) -> Option<String> {
 #[cfg(all(test, feature = "disasm"))]
 mod tests {
     use super::decompile;
+    use crate::disasm;
+    use super::{slot_load_key, slot_store_key};
     use crate::{Arch, Format, Section, Target};
 
     fn target(arch: Arch, bits: u8, code: &[u8]) -> Target {
@@ -1222,5 +1560,274 @@ mod tests {
         let t = target(Arch::X86_64, 64, &[0xc3]);
         let out = decompile(&t, 0xffff_ffff_fffe_0000, 4);
         assert!(out.is_err(), "expected Err, got {out:?}");
+    }
+
+    #[test]
+    fn x86_64_store_then_load_shares_one_typed_local() {
+        // lea rdi, [rip + 0]; mov [rbp - 8], rdi; mov rdx, qword ptr [rbp - 8]; ret
+        let code = [
+            0x48, 0x8d, 0x3d, 0x00, 0x00, 0x00, 0x00, 0x48, 0x89, 0x7d, 0xf8, 0x48, 0x8b, 0x55,
+            0xf8, 0xc3,
+        ];
+        let text = decompile(&target(Arch::X86_64, 64, &code), 0x1000, 8).unwrap();
+        assert!(text.contains("void* v1;"), "{text}");
+        assert!(text.contains("void* v2;"), "{text}");
+        assert!(text.contains("v2 = qword ptr [rbp - 8]"), "{text}");
+    }
+
+    #[test]
+    fn x86_64_slot_reload_into_the_same_register_stays_one_local() {
+        // lea rdi, [rip + 0]; mov [rbp - 8], rdi; mov rdi, qword ptr [rbp - 8]; ret
+        let code = [
+            0x48, 0x8d, 0x3d, 0x00, 0x00, 0x00, 0x00, 0x48, 0x89, 0x7d, 0xf8, 0x48, 0x8b, 0x7d,
+            0xf8, 0xc3,
+        ];
+        let text = decompile(&target(Arch::X86_64, 64, &code), 0x1000, 8).unwrap();
+        assert!(text.contains("void* v1;"), "{text}");
+        assert!(!text.contains("v2"), "{text}");
+        assert!(text.contains("v1 = qword ptr [rbp - 8]"), "{text}");
+    }
+
+    #[test]
+    fn x86_64_two_slot_types_poison_the_slot() {
+        // movsxd rax (int); mov [rbp - 8], rax; movzx edx (uint8_t);
+        // mov [rbp - 8], rdx; mov rbx, qword ptr [rbp - 8]; ret
+        let code = [
+            0x48, 0x63, 0x05, 0x00, 0x00, 0x00, 0x00, 0x48, 0x89, 0x45, 0xf8, 0x0f, 0xb6, 0x15,
+            0x00, 0x00, 0x00, 0x00, 0x48, 0x89, 0x55, 0xf8, 0x48, 0x8b, 0x5d, 0xf8, 0xc3,
+        ];
+        let text = decompile(&target(Arch::X86_64, 64, &code), 0x1000, 16).unwrap();
+        assert!(text.contains("int v1;"), "{text}");
+        assert!(text.contains("uint8_t v2;"), "{text}");
+        // The slot is untyped: rbx gets no synthetic local.
+        assert!(!text.contains("v3"), "{text}");
+        assert!(text.contains("rbx = qword ptr [rbp - 8]"), "{text}");
+    }
+
+    #[test]
+    fn x86_64_an_untyped_store_poisons_the_slot() {
+        // mov [rbp - 8], rdx (untyped); movsxd rax (int);
+        // mov [rbp - 8], rax; mov rbx, qword ptr [rbp - 8]; ret.
+        // The untyped store poisons the slot, so the later int store must
+        // not re-type it and the load stays untyped.
+        let code = [
+            0x48, 0x89, 0x55, 0xf8, 0x48, 0x63, 0x05, 0x00, 0x00, 0x00, 0x00, 0x48, 0x89, 0x45,
+            0xf8, 0x48, 0x8b, 0x5d, 0xf8, 0xc3,
+        ];
+        let text = decompile(&target(Arch::X86_64, 64, &code), 0x1000, 20).unwrap();
+        assert!(text.contains("int v1;"), "{text}");
+        assert!(!text.contains("v2;"), "{text}");
+        assert!(!text.contains("v2 "), "{text}");
+        assert!(text.contains("rbx = qword ptr [rbp - 8]"), "{text}");
+    }
+
+    #[test]
+    fn x86_64_a_gap_store_to_a_fresh_slot_poisons_it() {
+        // movsxd rax; jmp over the gap store mov [rbp - 8], rax (the first
+        // write the walked path sees is inside the gap); then movzx edx
+        // (uint8_t); mov [rbp - 8], rdx; mov rbx, [rbp - 8]; ret. The gap's
+        // store poisons the slot even though the walked path never stored to
+        // it before the jump, so the uint8_t store cannot type the load.
+        let code = [
+            0x48, 0x63, 0x05, 0x00, 0x00, 0x00, 0x00, 0xeb, 0x04, 0x48, 0x89, 0x45, 0xf8, 0x0f,
+            0xb6, 0x15, 0x00, 0x00, 0x00, 0x00, 0x48, 0x89, 0x55, 0xf8, 0x48, 0x8b, 0x5d, 0xf8,
+            0xc3,
+        ];
+        let text = decompile(&target(Arch::X86_64, 64, &code), 0x1000, 29).unwrap();
+        assert!(text.contains("int v1;"), "{text}");
+        assert!(text.contains("uint8_t v2;"), "{text}");
+        assert!(!text.contains("v3"), "{text}");
+        assert!(text.contains("rbx = qword ptr [rbp - 8]"), "{text}");
+    }
+
+    #[test]
+    fn x86_64_a_typed_store_after_poison_keeps_the_slot_untyped() {
+        // movsxd rax (int); mov [rbp - 8], rax; movzx edx (uint8_t);
+        // mov [rbp - 8], rdx; movsxd rsi (int); mov [rbp - 8], rsi;
+        // mov rbx, qword ptr [rbp - 8]; ret
+        // The slot saw int then uint8_t; the later int store does not
+        // resurrect it — the slot holds mixed data for the whole window.
+        let code = [
+            0x48, 0x63, 0x05, 0x00, 0x00, 0x00, 0x00, 0x48, 0x89, 0x45, 0xf8, 0x0f, 0xb6, 0x15,
+            0x00, 0x00, 0x00, 0x00, 0x48, 0x89, 0x55, 0xf8, 0x48, 0x63, 0x35, 0x00, 0x00, 0x00,
+            0x00, 0x48, 0x89, 0x75, 0xf8, 0x48, 0x8b, 0x5d, 0xf8, 0xc3,
+        ];
+        let text = decompile(&target(Arch::X86_64, 64, &code), 0x1000, 32).unwrap();
+        assert!(text.contains("int v1;"), "{text}");
+        assert!(text.contains("uint8_t v2;"), "{text}");
+        // rsi is typed int by its own movsxd (v3), but rbx must stay untyped:
+        // the poisoned slot does not re-type it even though the last store
+        // carried an int.
+        assert!(!text.contains("v4"), "{text}");
+        assert!(text.contains("rbx = qword ptr [rbp - 8]"), "{text}");
+    }
+
+    #[test]
+    fn x86_64_slot_store_before_the_branch_reaches_the_join() {
+        // movsxd rax; mov [rbp - 8], rax; je 0x1012; nop; mov rbx, [rbp - 8]; ret
+        let code = [
+            0x48, 0x63, 0x05, 0x00, 0x00, 0x00, 0x00, 0x48, 0x89, 0x45, 0xf8, 0x74, 0x05, 0x90,
+            0x48, 0x8b, 0x5d, 0xf8, 0xc3,
+        ];
+        let text = decompile(&target(Arch::X86_64, 64, &code), 0x1000, 16).unwrap();
+        assert!(text.contains("int v1;"), "{text}");
+        assert!(text.contains("int v2;"), "{text}");
+        assert!(text.contains("v2 = qword ptr [rbp - 8]"), "{text}");
+    }
+
+    #[test]
+    fn x86_64_slot_store_inside_the_fallthrough_block_stops_at_the_join() {
+        // movsxd rax; je 0x100d; mov [rbp - 8], rax (inside the block);
+        // mov rbx, [rbp - 8]; ret
+        let code = [
+            0x48, 0x63, 0x05, 0x00, 0x00, 0x00, 0x00, 0x74, 0x04, 0x48, 0x89, 0x45, 0xf8, 0x48,
+            0x8b, 0x5d, 0xf8, 0xc3,
+        ];
+        let text = decompile(&target(Arch::X86_64, 64, &code), 0x1000, 16).unwrap();
+        assert!(text.contains("int v1;"), "{text}");
+        // The other path never executed the store: rbx stays untyped.
+        assert!(!text.contains("v2;"), "{text}");
+        assert!(!text.contains("v2 "), "{text}");
+        assert!(text.contains("rbx = qword ptr [rbp - 8]"), "{text}");
+    }
+
+    #[test]
+    fn x86_64_slot_store_in_a_skipped_gap_poisons_the_slot() {
+        // movsxd rax; mov [rbp - 8], rax; jmp 0x1011;
+        // gap: mov [rbp - 8], rdx (untyped); mov rbx, [rbp - 8]; ret
+        let code = [
+            0x48, 0x63, 0x05, 0x00, 0x00, 0x00, 0x00, 0x48, 0x89, 0x45, 0xf8, 0xeb, 0x04, 0x48,
+            0x89, 0x55, 0xf8, 0x48, 0x8b, 0x5d, 0xf8, 0xc3,
+        ];
+        let text = decompile(&target(Arch::X86_64, 64, &code), 0x1000, 16).unwrap();
+        assert!(text.contains("int v1;"), "{text}");
+        assert!(!text.contains("v2;"), "{text}");
+        assert!(text.contains("rbx = qword ptr [rbp - 8]"), "{text}");
+    }
+
+    #[test]
+    fn x86_64_a_typed_store_after_the_gap_keeps_the_slot_poisoned() {
+        // movsxd rax; mov [rbp - 8], rax (int); jmp over the gap store
+        // mov [rbp - 8], rdx (untyped); then movsxd rsi (int);
+        // mov [rbp - 8], rsi; mov rbx, [rbp - 8]; ret. The gap store wrote
+        // unknown data to the slot, so the later int store must not re-type
+        // it and the load stays untyped.
+        let code = [
+            0x48, 0x63, 0x05, 0x00, 0x00, 0x00, 0x00, 0x48, 0x89, 0x45, 0xf8, 0xeb, 0x04, 0x48,
+            0x89, 0x55, 0xf8, 0x48, 0x63, 0x35, 0x00, 0x00, 0x00, 0x00, 0x48, 0x89, 0x75, 0xf8,
+            0x48, 0x8b, 0x5d, 0xf8, 0xc3,
+        ];
+        let text = decompile(&target(Arch::X86_64, 64, &code), 0x1000, 33).unwrap();
+        assert!(text.contains("int v1;"), "{text}");
+        // movsxd rsi still types its own register local (int v2), but the
+        // poisoned slot must not re-type the load's destination.
+        assert!(!text.contains("v2 = qword ptr [rbp - 8]"), "{text}");
+        assert!(text.contains("rbx = qword ptr [rbp - 8]"), "{text}");
+    }
+
+    #[test]
+    fn x86_64_a_hex_displacement_is_a_slot() {
+        // movsxd rax (int); mov [rbp - 0x10], rax (Capstone prints this
+        // displacement in hex); mov rbx, qword ptr [rbp - 0x10]; ret.
+        // The slot must type through in hex exactly as it does in decimal.
+        let code = [
+            0x48, 0x63, 0x05, 0x00, 0x00, 0x00, 0x00, 0x48, 0x89, 0x45, 0xf0, 0x48, 0x8b, 0x5d,
+            0xf0, 0xc3,
+        ];
+        let text = decompile(&target(Arch::X86_64, 64, &code), 0x1000, 16).unwrap();
+        assert!(text.contains("int v1;"), "{text}");
+        // rbx reuses the slot's int local instead of staying raw; the
+        // load line is spelled with Capstone's hex displacement.
+        assert!(text.contains("v2 = qword ptr [rbp - 0x10]"), "{text}");
+    }
+
+    #[test]
+    fn arm64_a_preindexed_hex_slot_and_strb_reuse_types() {
+        // adrp x0; add x0, x0, #0 (void*); str x0, [sp, #-0x10]! (pre-index,
+        // Capstone prints the displacement in hex with '!' outside the
+        // brackets); ldr x2, [sp, #-0x10]! reuses the slot's type; then
+        // strb w5, [sp, #0xc]! (byte store, unknown data) poisons the slot
+        // and ldurb w6 cannot re-type it.
+        let code = [
+            0x60, 0x00, 0x00, 0x90, // adrp x0, 0
+            0x00, 0x00, 0x00, 0x91, // add x0, x0, #0
+            0xe0, 0x0f, 0x1f, 0xf8, // str x0, [sp, #-0x10]!
+            0xe2, 0x0f, 0x5f, 0xf8, // ldr x2, [sp, #-0x10]!
+            0xe5, 0xcf, 0x00, 0x38, // strb w5, [sp, #0xc]!
+            0xe6, 0xc3, 0x40, 0x38, // ldurb w6, [sp, #0xc]
+            0xc0, 0x03, 0x5f, 0xd6, // ret
+        ];
+        let text = decompile(&target(Arch::Arm64, 64, &code), 0x1000, 64).unwrap();
+        assert!(text.contains("void* v1;"), "{text}");
+        assert!(text.contains("v1 = &0xd000"), "{text}");
+        // The pre-index load reuses the slot's type — one local, no v2.
+        assert!(text.contains("v3 = [sp, #-0x10]!"), "{text}");
+        assert!(text.contains("void* v3;"), "{text}");
+        assert!(!text.contains("v3 = qword ptr [sp"), "{text}");
+        // The byte and halfword store mnemonics name slots too, with or
+        // without the writeback marker; ldurb is a slot load.
+        let strb = disasm::Instruction {
+            addr: 0,
+            size: 4,
+            mnemonic: "strb".into(),
+            operands: "w5, [sp, #0xc]!".into(),
+        };
+        assert_eq!(slot_store_key(&strb, Arch::Arm64), Some((2, 12)));
+        let strh = disasm::Instruction {
+            addr: 0,
+            size: 4,
+            mnemonic: "strh".into(),
+            operands: "w5, [sp, #0]".into(),
+        };
+        assert_eq!(slot_store_key(&strh, Arch::Arm64), Some((2, 0)));
+        // A bare "[sp]" (post-index or plain) names no slot.
+        let post = disasm::Instruction {
+            addr: 0,
+            size: 4,
+            mnemonic: "str".into(),
+            operands: "x0, [sp], #0x10".into(),
+        };
+        assert_eq!(slot_store_key(&post, Arch::Arm64), None);
+        let ldurb = disasm::Instruction {
+            addr: 0,
+            size: 4,
+            mnemonic: "ldurb".into(),
+            operands: "w6, [sp, #0xc]".into(),
+        };
+        assert_eq!(slot_load_key(&ldurb, Arch::Arm64), Some((2, 12)));
+    }
+
+    #[test]
+    fn arm64_an_unscaled_store_and_load_reuse_types() {
+        // Capstone prints a negative stack offset without writeback as the
+        // unscaled form: stur x0, [sp, #-0x10] — the same slot the pre-index
+        // str writes. The load reuses the stored type.
+        let code = [
+            0x60, 0x00, 0x00, 0x90, // adrp x0, 0
+            0x00, 0x00, 0x00, 0x91, // add x0, x0, #0
+            0xe0, 0x03, 0x1f, 0xf8, // stur x0, [sp, #-0x10]
+            0xe2, 0x03, 0x5f, 0xf8, // ldur x2, [sp, #-0x10]
+            0xc0, 0x03, 0x5f, 0xd6, // ret
+        ];
+        let text = decompile(&target(Arch::Arm64, 64, &code), 0x1000, 64).unwrap();
+        assert!(text.contains("void* v1;"), "{text}");
+        // The unscaled load reuses the slot's type — a second void* local,
+        // not a raw ldur line.
+        assert!(text.contains("void* v2;"), "{text}");
+        assert!(!text.contains("ldur x2"), "{text}");
+    }
+
+    #[test]
+    fn arm64_store_then_load_shares_one_typed_local() {
+        // adrp x0; add x0, x0, #0; str x0, [sp, #8]; ldr x2, [sp, #8]; ret
+        let code = [
+            0x00, 0x00, 0x00, 0x90, 0x00, 0x00, 0x00, 0x91, 0xe0, 0x07, 0x00, 0xf9, 0xe2, 0x07,
+            0x40, 0xf9, 0xc0, 0x03, 0x5f, 0xd6,
+        ];
+        let text = decompile(&target(Arch::Arm64, 64, &code), 0x1000, 8).unwrap();
+        assert!(text.contains("void* v1;"), "{text}");
+        assert!(text.contains("void* v2;"), "{text}");
+        assert!(text.contains("v2 = [sp, #8]"), "{text}");
+        assert!(text.contains("str v1, [sp, #8]"), "{text}");
     }
 }

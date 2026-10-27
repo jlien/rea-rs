@@ -47,7 +47,7 @@ fn serve_internal(input: impl BufRead, mut output: impl Write) -> std::io::Resul
                 "serverInfo": { "name": SERVER_NAME, "version": SERVER_VERSION },
             })),
             "tools/list" => Ok(json!({ "tools": tool_definitions() })),
-            "tools/call" => handle_tool_call(&msg),
+            "tools/call" => handle_tool_call(&msg, &mut output),
             _ => Err(format!("method not found: {method}")),
         };
 
@@ -81,10 +81,54 @@ fn text_result(text: impl Into<String>) -> Value {
     json!({ "content": [ { "type": "text", "text": text.into() } ] })
 }
 
-fn handle_tool_call(msg: &Value) -> Result<Value, String> {
+/// Tools that report staged progress, and their stage count: stage 1 is the
+/// load, the later stages are the sweep steps in the match below. A call
+/// without a `_meta` progressToken, and `rea_strings` without xrefs, emits
+/// nothing.
+fn progress_total(name: &str, args: &Value) -> Option<u64> {
+    match name {
+        "rea_funcs" | "rea_strings" => Some(2),
+        "rea_call_graph" => Some(3),
+        _ => None,
+    }
+    .filter(|_| {
+        name != "rea_strings" || args.get("xrefs").and_then(Value::as_bool).unwrap_or(false)
+    })
+}
+
+fn write_progress(
+    output: &mut dyn Write,
+    token: &Value,
+    progress: u64,
+    total: u64,
+) -> std::io::Result<()> {
+    let note = json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/progress",
+        "params": { "progressToken": token, "progress": progress, "total": total },
+    });
+    writeln!(output, "{note}")
+}
+
+fn handle_tool_call(msg: &Value, output: &mut dyn Write) -> Result<Value, String> {
     let params = msg.get("params").cloned().unwrap_or(json!({}));
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
+
+    let progress_token = params
+        .get("_meta")
+        .and_then(|m| m.get("progressToken"))
+        .filter(|v| !v.is_null())
+        .cloned();
+    let total = if progress_token.is_some() {
+        progress_total(name, &args)
+    } else {
+        None
+    };
+    if let (Some(token), Some(total)) = (&progress_token, total) {
+        // Progress is best-effort; a write failure drops the notification.
+        let _ = write_progress(output, token, 0, total);
+    }
 
     if name == "rea_session" {
         return session_call(&args);
@@ -156,6 +200,14 @@ fn handle_tool_call(msg: &Value) -> Result<Value, String> {
         } else {
             loader::load(path).map_err(|e| e.to_string())?
         };
+        let mut notify = |stage: u64| {
+            if let (Some(token), Some(total)) = (&progress_token, total) {
+                let _ = write_progress(output, token, stage, total);
+            }
+        };
+        if total.is_some() {
+            notify(1);
+        }
         // Native-code commands do not read a WASM target; the deep view is
         // `rea_wasm`.
         if matches!(
@@ -224,6 +276,7 @@ fn handle_tool_call(msg: &Value) -> Result<Value, String> {
                 let with_xrefs = args.get("xrefs").and_then(Value::as_bool).unwrap_or(false);
                 if with_xrefs {
                     let hits = analysis::strings_with_xrefs(&target, min);
+                    notify(2);
                     json!({ "count": hits.len(), "strings": hits })
                 } else {
                     let hits = strings::extract(&target.bytes, min);
@@ -262,6 +315,7 @@ fn handle_tool_call(msg: &Value) -> Result<Value, String> {
             }
             "rea_funcs" => {
                 let funcs = analysis::discover_functions(&target);
+                notify(2);
                 json!({ "count": funcs.len(), "functions": funcs })
             }
             "rea_xrefs" => {
@@ -274,7 +328,9 @@ fn handle_tool_call(msg: &Value) -> Result<Value, String> {
             }
             "rea_call_graph" => {
                 let functions = analysis::discover_functions(&target);
+                notify(2);
                 let graph = analysis::call_graph(&functions);
+                notify(3);
                 json!({
                     "functions": functions.len(),
                     "edges": graph.edges.len(),
@@ -425,7 +481,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "rea_strings",
-            "description": "Extract printable ASCII strings with file offsets. Set xrefs to annotate each string with code references.",
+            "description": "Extract printable ASCII strings with file offsets. Set xrefs to annotate each string with code references. With xrefs and a _meta progressToken, emits notifications/progress for the start, the load, and the sweep.",
             "inputSchema": schema(false, json!({
                 "min_length": { "type": "integer", "description": "Minimum string length (default 4)" },
                 "xrefs": { "type": "boolean", "description": "Annotate each string with code references (default false)" }
@@ -442,7 +498,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "rea_funcs",
-            "description": "Discover functions from the entry point, direct call targets, and prologue scan.",
+            "description": "Discover functions from the entry point, direct call targets, and prologue scan. With a _meta progressToken, emits notifications/progress for the start, the load, and the sweep.",
             "inputSchema": schema(true, json!({}), &[]),
         }),
         json!({
@@ -454,7 +510,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "rea_call_graph",
-            "description": "Direct call graph over discovered functions. Calls to unknown addresses are dropped.",
+            "description": "Direct call graph over discovered functions. Calls to unknown addresses are dropped. With a _meta progressToken, emits notifications/progress for the start, the load, the sweep, and the graph.",
             "inputSchema": schema(true, json!({}), &[]),
         }),
         json!({
@@ -496,12 +552,12 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "rea_headers",
-            "description": "A C header of recovered local and export names. An Itanium or MSVC demangle becomes a declaration, keeping its return type. A demangled path with :: but no parameter list (a Rust path) becomes a comment line, never a declaration. Imports are omitted, as are Swift names.",
+            "description": "A C header of recovered local and export names. An Itanium or MSVC demangle becomes a declaration, keeping its return type. A demangled path with :: but no parameter list (a Rust path) becomes a comment line, never a declaration. A Swift demangle (module.name) becomes the same comment form. Imports are omitted.",
             "inputSchema": schema(true, json!({}), &[]),
         }),
         json!({
             "name": "rea_decompile",
-            "description": "Bounded pseudo-C at a virtual address: assignments, calls, gotos, and returns, following unconditional jumps and one forward conditional (jcc / b.cond) inside the enclosing function (up to 64 instructions, 8 hops). Width-based types on x86_64 and arm64: typed synthetic locals, casts at call arguments and returns; types cross a followed join only when every incoming path agrees. No memory-object or struct types, no cross-function dataflow. Optional arch selects a Mach-O slice.",
+            "description": "Bounded pseudo-C at a virtual address: assignments, calls, gotos, and returns, following unconditional jumps and one forward conditional (jcc / b.cond) inside the enclosing function (up to 64 instructions, 8 hops). Width-based types on x86_64 and arm64: typed synthetic locals, casts at call arguments and returns; types cross a followed join only when every incoming path agrees. Typed stack slots ([rbp±N] / [rsp±N] on x86_64, [sp, #N] with or without the pre-index ! on arm64; N decimal or hex; stores via str/stur and their byte/halfword forms, loads via ldr/ldur and their byte/halfword/sized variants; a bare [sp] names no slot) carry their type from store to load inside the window; a slot written with two different types (or unknown data) stays untyped. Struct types and cross-function dataflow are not recovered. Optional arch selects a Mach-O slice.",
             "inputSchema": schema(false, json!({
                 "address": { "type": "integer", "description": "Virtual address. Default is the entry point." },
                 "count": { "type": "integer", "description": "Maximum instructions (default 32, cap 64)." },
@@ -596,7 +652,7 @@ mod tests {
                 "arguments": { "path": exe.to_str().unwrap() }
             }
         });
-        let result = handle_tool_call(&msg).unwrap();
+        let result = handle_tool_call(&msg, &mut Vec::new()).unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.starts_with("#ifndef REA_RECOVERED_H\n"), "{text}");
         assert!(text.ends_with("#endif\n"), "{text}");
@@ -655,7 +711,7 @@ mod tests {
                 "arguments": { "path": path.to_str().unwrap() }
             }
         });
-        let result = handle_tool_call(&msg).unwrap();
+        let result = handle_tool_call(&msg, &mut Vec::new()).unwrap();
         let v: Value =
             serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(v["format"], "wasm");
@@ -680,7 +736,7 @@ mod tests {
                 "arguments": { "path": path.to_str().unwrap() }
             }
         });
-        let result = handle_tool_call(&msg).unwrap();
+        let result = handle_tool_call(&msg, &mut Vec::new()).unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("no native code view"), "{text}");
         let _ = std::fs::remove_file(&path);
@@ -729,7 +785,7 @@ mod tests {
                 "arguments": { "path": path.to_str().unwrap() }
             }
         });
-        let result = handle_tool_call(&msg).unwrap();
+        let result = handle_tool_call(&msg, &mut Vec::new()).unwrap();
         let v: Value =
             serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(v["format"], "sqlite");
@@ -753,9 +809,207 @@ mod tests {
                 "arguments": { "path": path.to_str().unwrap() }
             }
         });
-        let result = handle_tool_call(&msg).unwrap();
+        let result = handle_tool_call(&msg, &mut Vec::new()).unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("no native code view"), "{text}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A tiny ELF64: one PROGBITS `.text` section with six x86_64 bytes, so a
+    /// native-code tool loads and sweeps quickly.
+    fn tiny_elf() -> Vec<u8> {
+        let code: [u8; 6] = [0x55, 0x48, 0x89, 0xE5, 0x5D, 0xC3];
+        let code_off = 64u64;
+        let shstr = b"\0.text\0.shstrtab\0";
+        let shstr_off = code_off + code.len() as u64;
+        let shoff = shstr_off + shstr.len() as u64;
+        let mut file = vec![0u8; shoff as usize + 3 * 64];
+        file[0..4].copy_from_slice(b"\x7fELF");
+        file[4] = 2;
+        file[5] = 1;
+        file[6] = 1;
+        file[16..18].copy_from_slice(&1u16.to_le_bytes());
+        file[18..20].copy_from_slice(&62u16.to_le_bytes());
+        file[20..24].copy_from_slice(&1u32.to_le_bytes());
+        file[40..48].copy_from_slice(&shoff.to_le_bytes());
+        file[52..54].copy_from_slice(&64u16.to_le_bytes());
+        file[58..60].copy_from_slice(&64u16.to_le_bytes());
+        file[60..62].copy_from_slice(&3u16.to_le_bytes());
+        file[62..64].copy_from_slice(&2u16.to_le_bytes());
+        file[code_off as usize..code_off as usize + code.len()].copy_from_slice(&code);
+        file[shstr_off as usize..shstr_off as usize + shstr.len()].copy_from_slice(shstr);
+        write_mcp_shdr(&mut file, shoff, 0, 0, 0, 0, 0, 0, 0);
+        write_mcp_shdr(&mut file, shoff, 1, 1, 1, 0x6, 0x1000, code_off, code.len() as u64);
+        write_mcp_shdr(&mut file, shoff, 2, 7, 3, 0, 0, shstr_off, shstr.len() as u64);
+        file
+    }
+
+    fn write_mcp_shdr(
+        buf: &mut [u8],
+        shoff: u64,
+        index: usize,
+        name: u32,
+        ty: u32,
+        flags: u64,
+        addr: u64,
+        off: u64,
+        size: u64,
+    ) {
+        let at = shoff as usize + index * 64;
+        buf[at..at + 4].copy_from_slice(&name.to_le_bytes());
+        buf[at + 4..at + 8].copy_from_slice(&ty.to_le_bytes());
+        buf[at + 8..at + 16].copy_from_slice(&flags.to_le_bytes());
+        buf[at + 16..at + 24].copy_from_slice(&addr.to_le_bytes());
+        buf[at + 24..at + 32].copy_from_slice(&off.to_le_bytes());
+        buf[at + 32..at + 40].copy_from_slice(&size.to_le_bytes());
+        buf[at + 48..at + 56].copy_from_slice(&1u64.to_le_bytes());
+    }
+
+    fn tiny_elf_path(tag: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "rea-mcp-progress-{}-{}.elf",
+            tag,
+            std::process::id()
+        ));
+        std::fs::write(&path, tiny_elf()).unwrap();
+        path
+    }
+
+    #[test]
+    fn rea_funcs_with_a_token_emits_start_load_and_sweep_progress() {
+        let path = tiny_elf_path("funcs");
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": 31,
+            "method": "tools/call",
+            "params": {
+                "name": "rea_funcs",
+                "arguments": { "path": path.to_str().unwrap() },
+                "_meta": { "progressToken": "tok-funcs" }
+            }
+        });
+        let mut sink: Vec<u8> = Vec::new();
+        handle_tool_call(&msg, &mut sink).unwrap();
+        let text = String::from_utf8_lossy(&sink).into_owned();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "{text}");
+        for (stage, line) in lines.iter().enumerate() {
+            let v: Value = serde_json::from_str(line).unwrap();
+            assert_eq!(v["method"], "notifications/progress", "{line}");
+            assert_eq!(v["params"]["progressToken"], "tok-funcs", "{line}");
+            assert_eq!(v["params"]["progress"], stage as u64, "{line}");
+            assert_eq!(v["params"]["total"], 2, "{line}");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rea_call_graph_with_a_token_emits_four_progress_lines() {
+        let path = tiny_elf_path("graph");
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": 32,
+            "method": "tools/call",
+            "params": {
+                "name": "rea_call_graph",
+                "arguments": { "path": path.to_str().unwrap() },
+                "_meta": { "progressToken": 7 }
+            }
+        });
+        let mut sink: Vec<u8> = Vec::new();
+        handle_tool_call(&msg, &mut sink).unwrap();
+        let text = String::from_utf8_lossy(&sink).into_owned();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 4, "{text}");
+        for (stage, line) in lines.iter().enumerate() {
+            let v: Value = serde_json::from_str(line).unwrap();
+            assert_eq!(v["method"], "notifications/progress", "{line}");
+            assert_eq!(v["params"]["progressToken"], 7, "{line}");
+            assert_eq!(v["params"]["progress"], stage as u64, "{line}");
+            assert_eq!(v["params"]["total"], 3, "{line}");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rea_strings_progress_needs_xrefs_and_a_token() {
+        let path = tiny_elf_path("strings");
+        // Token but no xrefs: nothing is emitted.
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": 33,
+            "method": "tools/call",
+            "params": {
+                "name": "rea_strings",
+                "arguments": { "path": path.to_str().unwrap() },
+                "_meta": { "progressToken": "tok-s" }
+            }
+        });
+        let mut sink: Vec<u8> = Vec::new();
+        handle_tool_call(&msg, &mut sink).unwrap();
+        assert!(sink.is_empty(), "{sink:?}");
+
+        // xrefs with a token: start, load, sweep.
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": 34,
+            "method": "tools/call",
+            "params": {
+                "name": "rea_strings",
+                "arguments": { "path": path.to_str().unwrap(), "xrefs": true },
+                "_meta": { "progressToken": "tok-s" }
+            }
+        });
+        let mut sink: Vec<u8> = Vec::new();
+        handle_tool_call(&msg, &mut sink).unwrap();
+        let text = String::from_utf8_lossy(&sink).into_owned();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "{text}");
+        for (stage, line) in lines.iter().enumerate() {
+            let v: Value = serde_json::from_str(line).unwrap();
+            assert_eq!(v["params"]["progress"], stage as u64, "{line}");
+            assert_eq!(v["params"]["total"], 2, "{line}");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn tool_calls_without_a_token_emit_no_notifications() {
+        let path = tiny_elf_path("notoken");
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": 35,
+            "method": "tools/call",
+            "params": {
+                "name": "rea_call_graph",
+                "arguments": { "path": path.to_str().unwrap() }
+            }
+        });
+        let mut sink: Vec<u8> = Vec::new();
+        handle_tool_call(&msg, &mut sink).unwrap();
+        assert!(sink.is_empty(), "{sink:?}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn progress_lines_precede_the_result_on_the_stream() {
+        let path = tiny_elf_path("stream");
+        let input = format!(
+            r#"{{"jsonrpc":"2.0","id":36,"method":"tools/call","params":{{"name":"rea_funcs","arguments":{{"path":"{}"}},"_meta":{{"progressToken":"tok-stream"}}}}}}"#,
+            path.to_str().unwrap()
+        );
+        let (lines, handled) = exchange(&input);
+        assert_eq!(handled, 1);
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        for (stage, line) in lines.iter().take(3).enumerate() {
+            let v: Value = serde_json::from_str(line).unwrap();
+            assert_eq!(v["method"], "notifications/progress", "{line}");
+            assert_eq!(v["params"]["progressToken"], "tok-stream", "{line}");
+            assert_eq!(v["params"]["progress"], stage as u64, "{line}");
+        }
+        let last: Value = serde_json::from_str(&lines[3]).unwrap();
+        assert_eq!(last["id"], 36);
+        assert!(last["result"]["content"][0]["text"].is_string(), "{last}");
         let _ = std::fs::remove_file(&path);
     }
 }

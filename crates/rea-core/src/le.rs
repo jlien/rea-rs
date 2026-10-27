@@ -6,8 +6,9 @@
 //! Scope: object table, page map, entry table (bundle types 0-3; forwarder
 //! and unrecognized bundle flags are counted and skipped), entry point,
 //! internal fixups, and page-granular vaddr→file-offset translation (enough
-//! for info/sections/disasm). Iterated (compressed) pages are not yet
-//! handled.
+//! for info/sections/disasm). Iterated pages are expanded into the load
+//! image at load time; other page types (invalid, zero-filled) carry no
+//! bytes and translate to None.
 
 use crate::{Arch, Error, Result, Section};
 
@@ -55,12 +56,17 @@ pub struct LePages {
     objects: Vec<LeObject>,
     /// Page numbers (1-based) from the object page table.
     pages: Vec<u16>,
+    /// Page-type flags (low u16 of each page-map entry): 0 identity-mapped,
+    /// 1 iterated, higher values (invalid, zero-filled) carry no bytes here.
+    flags: Vec<u16>,
 }
 
 impl LePages {
     /// Map a virtual address to a file offset. Returns `None` for addresses
     /// outside any object, beyond an object's mapped pages, or in page types
-    /// we cannot expand (iterated/compressed).
+    /// that carry no bytes here (invalid, zero-filled). An iterated page
+    /// translates once [`LeImage::expand_iterated`] has expanded its
+    /// records into the image buffer.
     pub fn translate(&self, vaddr: u64) -> Option<u64> {
         let pagesize = u64::from(self.pagesize);
         let obj = self.objects.iter().find(|o| {
@@ -71,7 +77,14 @@ impl LePages {
         if idx >= obj.mapsize as usize || obj.pagemap == 0 {
             return None;
         }
-        let page = u64::from(*self.pages.get(obj.pagemap as usize - 1 + idx)?);
+        let slot = obj.pagemap as usize - 1 + idx;
+        // Flag 0 maps its page bytes directly; flag 1 is an iterated page,
+        // whose records expand over their own slot. Any other flag value
+        // (invalid, zero-filled) names no bytes here.
+        if *self.flags.get(slot)? > 1 {
+            return None;
+        }
+        let page = u64::from(*self.pages.get(slot)?);
         if page == 0 {
             return None;
         }
@@ -355,12 +368,14 @@ impl LeImage {
         }
 
         let mut pages = Vec::with_capacity(mpages as usize);
+        let mut flags = Vec::with_capacity(mpages as usize);
         for i in 0..mpages as usize {
             // 4-byte page-map entries: low u16 = page type flags, high u16 =
             // 1-based page number (empirically confirmed; the OS/2 8-byte
             // o32_map variant does not match DOS/4GW files).
             let e = u32_at(bytes, header_off + objmap + i * 4)?;
             pages.push((e >> 16) as u16);
+            flags.push(e as u16);
         }
 
         let (entries, skipped_bundles) = parse_entry_table(bytes, header_off, entrytab)?;
@@ -379,6 +394,7 @@ impl LeImage {
                 datapage,
                 objects,
                 pages,
+                flags,
             },
             entry,
             cpu,
@@ -388,6 +404,91 @@ impl LeImage {
             entries,
             skipped_bundles,
         })
+    }
+
+    /// Expand iterated pages (page-map flag 1) into `bytes`, the load-image
+    /// copy the loader owns. An iterated page's slot holds a sequence of
+    /// iteration records — ITERATIONS `u16`, DATA LENGTH `u16`, then that
+    /// many pattern bytes, records packed back-to-back — that reconstitute
+    /// the page by repeating each pattern ITERATIONS times. The expanded
+    /// page is written over its own slot, so [`LePages::translate`]
+    /// afterwards serves the page bytes; identity-mapped pages and the
+    /// fixup pass are untouched. The last page of an object expands to the
+    /// object's remainder, a record stream that ends early is written as
+    /// far as it expanded, and other page types are never expanded.
+    /// Returns the number of pages expanded.
+    pub fn expand_iterated(&self, bytes: &mut Vec<u8>) -> Result<usize> {
+        let pagesize = self.pages.pagesize as usize;
+        let area = self.pages.header_off + self.pages.datapage as usize;
+        let mut writes: Vec<(usize, Vec<u8>)> = Vec::new();
+        for o in &self.pages.objects {
+            let Some(pagemap) = o.pagemap.checked_sub(1) else {
+                continue;
+            };
+            for idx in 0..o.mapsize as usize {
+                let slot = pagemap as usize + idx;
+                if *self.pages.flags.get(slot).unwrap_or(&0) != 1 {
+                    continue;
+                }
+                let page = *self.pages.pages.get(slot).ok_or_else(|| {
+                    Error::Parse("le: object page map out of range".into())
+                })? as usize;
+                if page == 0 {
+                    continue;
+                }
+                // The object's last page may be shorter than the page size;
+                // its records only fill that remainder.
+                let target = (((o.size as u64)
+                    .saturating_sub(idx as u64 * pagesize as u64)) as usize)
+                    .min(pagesize);
+                if target == 0 {
+                    continue;
+                }
+                let start = area + (page - 1) * pagesize;
+                let slot_end = start + pagesize;
+                let mut off = start;
+                let mut out: Vec<u8> = Vec::with_capacity(target);
+                while out.len() < target {
+                    // A record has to sit whole inside the page slot and
+                    // inside the file.
+                    if off + 4 > slot_end || off + 4 > bytes.len() {
+                        break;
+                    }
+                    let iterations =
+                        u16::from_le_bytes([bytes[off], bytes[off + 1]]) as usize;
+                    let len =
+                        u16::from_le_bytes([bytes[off + 2], bytes[off + 3]]) as usize;
+                    if off + 4 + len > slot_end || off + 4 + len > bytes.len() {
+                        break;
+                    }
+                    let pattern = &bytes[off + 4..off + 4 + len];
+                    let mut reps = iterations;
+                    let mut left = target - out.len();
+                    while reps > 0 && left > 0 {
+                        let n = len.min(left);
+                        out.extend_from_slice(&pattern[..n]);
+                        left -= n;
+                        reps -= 1;
+                    }
+                    off += 4 + len;
+                }
+                if !out.is_empty() {
+                    writes.push((start, out));
+                }
+            }
+        }
+        // Every record is read before the first write: a page whose records
+        // are shorter than the page size would otherwise clobber the next
+        // page's records mid-pass.
+        let mut expanded = 0usize;
+        for (at, data) in writes {
+            if at + data.len() > bytes.len() {
+                bytes.resize(at + data.len(), 0);
+            }
+            bytes[at..at + data.len()].copy_from_slice(&data);
+            expanded += 1;
+        }
+        Ok(expanded)
     }
 
     /// Apply internal fixups to a mutable copy of the file bytes.
@@ -697,12 +798,15 @@ impl LeImage {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Build a minimal synthetic LE image: 1 object at base 0x400000 with a
-    /// single 4096-byte page stored right after the header.
-    fn synthetic() -> Vec<u8> {
+    /// single 4096-byte page stored right after the header. Test-only, shared
+    /// with the loader tests so the iterated-page fixture can ride the real
+    /// load path.
+    #[cfg(test)]
+    pub(crate) fn synthetic() -> Vec<u8> {
         let mut b = vec![0u8; 0x240];
         b[0..2].copy_from_slice(b"MZ");
         b[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());
@@ -987,5 +1091,93 @@ mod tests {
         b[le + 0x6c..le + 0x70].copy_from_slice(&1u32.to_le_bytes());
         let img = LeImage::parse(&b).unwrap();
         assert!(img.apply_fixups(&mut b).is_err());
+    }
+
+    /// Rewrite the synthetic image so page 1 is iterated (page-map flag 1)
+    /// and its slot at le+0x100 holds two iteration records in the IBM
+    /// exe386 layout: ITERATIONS u16, DATA LENGTH u16, pattern bytes.
+    /// Record 1: 8 iterations of [A5]; record 2: 4 iterations of [5A B4].
+    /// 8*1 + 4*2 = 16 bytes, exactly the object's 16-byte virtual size.
+    pub(crate) fn iterated() -> Vec<u8> {
+        let mut b = synthetic();
+        let le = 0x40usize;
+        let map = le + 0xD8;
+        b[map..map + 4].copy_from_slice(&((1u32 << 16) | 1).to_le_bytes());
+        let slot = le + 0x100;
+        let mut off = slot;
+        for (iterations, pattern) in [(8u16, vec![0xA5u8]), (4u16, vec![0x5Au8, 0xB4u8])] {
+            b[off..off + 2].copy_from_slice(&iterations.to_le_bytes());
+            b[off + 2..off + 4].copy_from_slice(&(pattern.len() as u16).to_le_bytes());
+            b[off + 4..off + 4 + pattern.len()].copy_from_slice(&pattern);
+            off += 4 + pattern.len();
+        }
+        assert_eq!(off, slot + 11);
+        b
+    }
+
+    #[test]
+    fn an_iterated_page_translates_to_its_record_slot() {
+        // Flag 1 maps like any page number; the difference is the bytes at
+        // the slot are iteration records until expand_iterated rewrites
+        // them. The loader test proves the expansion; this pins the
+        // translate path for flag 1.
+        let b = iterated();
+        let img = LeImage::parse(&b).unwrap();
+        assert_eq!(img.pages.translate(0x400000), Some(0x140));
+        assert_eq!(img.pages.translate(0x40000f), Some(0x14f));
+    }
+
+    #[test]
+    fn expand_iterated_rewrites_the_page_slot_with_the_expanded_page() {
+        let mut b = iterated();
+        let img = LeImage::parse(&b).unwrap();
+        assert_eq!(img.expand_iterated(&mut b).unwrap(), 1);
+        // 8 iterations of [A5], then 4 of [5A B4]: 16 bytes, the object's
+        // whole virtual size.
+        let want: Vec<u8> = [vec![0xA5u8; 8], vec![0x5Au8, 0xB4u8].repeat(4)].concat();
+        assert_eq!(want.len(), 16);
+        assert_eq!(&b[0x140..0x140 + 16], &want[..]);
+        // The slot past the expanded bytes keeps the record tail (records
+        // expand only as far as they reach); the page is read through
+        // translate, which now maps.
+        assert_eq!(img.pages.translate(0x400000), Some(0x140));
+        assert_eq!(img.pages.translate(0x40000f), Some(0x14f));
+        assert_eq!(b[0x140], 0xA5);
+        assert_eq!(b[0x148], 0x5A);
+    }
+
+    #[test]
+    fn a_truncated_record_stops_the_expansion_at_its_last_whole_record() {
+        // The file ends inside the second record's header: the first record
+        // still expands, nothing panics, and the truncated record's tail
+        // keeps the slot from being served as page bytes past the pattern.
+        let mut b = iterated();
+        b.truncate(0x147);
+        let img = LeImage::parse(&b).unwrap();
+        assert_eq!(img.expand_iterated(&mut b).unwrap(), 1);
+        assert_eq!(&b[0x140..0x148], &[0xA5u8; 8][..]);
+        assert_eq!(img.pages.translate(0x400000), Some(0x140));
+    }
+
+    #[test]
+    fn identity_pages_are_not_expanded_and_still_translate() {
+        // The synthetic image's own page is flag 0: expand_iterated is a
+        // no-op on it and translate keeps working.
+        let mut b = synthetic();
+        let img = LeImage::parse(&b).unwrap();
+        assert_eq!(img.expand_iterated(&mut b).unwrap(), 0);
+        assert_eq!(img.pages.translate(0x400000), Some(0x140));
+        assert_eq!(&b[0x140..0x144], &[0x55, 0x89, 0xe5, 0xc3]);
+    }
+
+    #[test]
+    fn a_zero_filled_page_flag_does_not_translate() {
+        // Flag 3 (zero-filled) carries no bytes in the file: translate
+        // refuses it instead of computing a bogus offset.
+        let mut b = synthetic();
+        let map = 0x40 + 0xD8;
+        b[map..map + 4].copy_from_slice(&((1u32 << 16) | 3).to_le_bytes());
+        let img = LeImage::parse(&b).unwrap();
+        assert_eq!(img.pages.translate(0x400000), None);
     }
 }
