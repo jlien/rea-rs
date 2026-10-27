@@ -69,9 +69,10 @@ pub fn property_sig(heap: &[u8], index: u32) -> Option<String> {
 }
 
 /// Opcode names from a tiny or fat method body. At most 48 instructions.
-/// Two-byte `0xFE` opcodes that take no operand are named; any other unknown
-/// byte, including an unmapped `0xFE` second byte, stops the listing.
-/// An unmapped or truncated body is empty.
+/// Two-byte `0xFE` opcodes that take no operand are named, and `0xFE`
+/// second bytes `0x09`–`0x0E` take a little-endian `u16` immediate; any
+/// other unknown byte, including an unmapped `0xFE` second byte, stops the
+/// listing. An unmapped or truncated body is empty.
 pub fn il_ops(bytes: &[u8]) -> Vec<String> {
     let Some((code, _size)) = il_code(bytes) else {
         return Vec::new();
@@ -82,9 +83,10 @@ pub fn il_ops(bytes: &[u8]) -> Vec<String> {
         let op = code[at];
         at += 1;
         if op == 0xFE {
-            // Second byte of a two-byte opcode. Only operand-free names are
-            // walked; a `0xFE` outside that set stops the listing like any
-            // other unknown byte. Token operands and `u16` immediates stay
+            // Second byte of a two-byte opcode. Operand-free names and the
+            // `0x09`–`0x0E` local/argument opcodes with a little-endian
+            // `u16` immediate are walked; a `0xFE` outside those sets stops
+            // the listing like any other unknown byte. Token operands stay
             // unread, so no width is invented for them.
             let Some(second) = code.get(at).copied() else {
                 break;
@@ -95,6 +97,12 @@ pub fn il_ops(bytes: &[u8]) -> Vec<String> {
                 0x03 => "cgt.un",
                 0x04 => "clt",
                 0x05 => "clt.un",
+                0x09 => "ldarg",
+                0x0a => "ldarga",
+                0x0b => "starg",
+                0x0c => "ldloc",
+                0x0d => "ldloca",
+                0x0e => "stloc",
                 0x0f => "localloc",
                 0x11 => "endfilter",
                 _ => {
@@ -103,6 +111,15 @@ pub fn il_ops(bytes: &[u8]) -> Vec<String> {
                 }
             };
             at += 1;
+            if matches!(second, 0x09..=0x0e) {
+                if at + 2 > code.len() {
+                    break;
+                }
+                let value = u16::from_le_bytes([code[at], code[at + 1]]);
+                at += 2;
+                out.push(format!("{name} {value}"));
+                continue;
+            }
             out.push(name.to_string());
             continue;
         }
@@ -317,6 +334,37 @@ mod tests {
         assert_eq!(il_ops(&[0x06, 0xc3]), vec!["ckfinite".to_string()]);
         // A truncated prefix stops silently.
         assert!(il_ops(&[0x0a, 0xfe]).is_empty());
+    }
+
+    #[test]
+    fn u16_immediate_prefix_opcodes_join_the_listing() {
+        // Each `0xFE` second byte 0x09..0x0E takes a little-endian `u16`
+        // and keeps walking. codesize 4: 0xFE 0x09 0x03 0x00 -> `ldarg 3`,
+        // then the remaining bytes are walked.
+        for (second, name) in [
+            (0x09u8, "ldarg"),
+            (0x0a, "ldarga"),
+            (0x0b, "starg"),
+            (0x0c, "ldloc"),
+            (0x0d, "ldloca"),
+            (0x0e, "stloc"),
+        ] {
+            assert_eq!(
+                il_ops(&[0x12, 0xfe, second, 0x03, 0x00]),
+                vec![format!("{name} 3")]
+            );
+        }
+        // A 300 index renders as its decimal value; walking continues.
+        assert_eq!(
+            il_ops(&[0x16, 0xfe, 0x0e, 0x2c, 0x01, 0x2a]),
+            vec!["stloc 300".to_string(), "ret".to_string()]
+        );
+        // A truncated immediate stops the listing the way a truncated
+        // `ldc.i4` does: nothing after it, no partial operand.
+        assert!(il_ops(&[0x07, 0xfe, 0x0c, 0x05]).is_empty());
+        // `ldftn` (0x06) still has a token operand, which stays unread, so
+        // it still stops at the marker.
+        assert_eq!(il_ops(&[0x0a, 0xfe, 0x06]), vec!["op-fe-06".to_string()]);
     }
 
     #[test]
