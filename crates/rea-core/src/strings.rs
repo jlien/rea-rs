@@ -19,9 +19,11 @@ pub struct StringHit {
 ///
 /// A BE-shaped byte pattern (`00 61 00 62`) also parses as a nested LE run one
 /// unit shorter, and an LE pattern nests a BE run the same way. Where the two
-/// passes overlap, only the longer (matching-endian) run is kept. A UTF-32
-/// run that overlaps a longer ASCII or UTF-16 hit (in bytes) is dropped; the
-/// hit the ASCII and UTF-16 scans already keep stays.
+/// passes overlap, a run is dropped only when a hit the scan already keeps is
+/// at least as long in bytes — so a later opposite-endian run that is strictly
+/// longer stays beside the shorter earlier hit. A UTF-32 run that overlaps a
+/// longer ASCII or UTF-16 hit (in bytes) is dropped; the hit the ASCII and
+/// UTF-16 scans already keep stays.
 pub fn extract(bytes: &[u8], min_len: usize) -> Vec<StringHit> {
     fn byte_len(h: &StringHit) -> u64 {
         match h.encoding {
