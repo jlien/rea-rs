@@ -360,8 +360,17 @@ mod tests {
             vec!["stloc 300".to_string(), "ret".to_string()]
         );
         // A truncated immediate stops the listing the way a truncated
-        // `ldc.i4` does: nothing after it, no partial operand.
-        assert!(il_ops(&[0x07, 0xfe, 0x0c, 0x05]).is_empty());
+        // `ldc.i4` does: nothing after it, no partial operand. The body
+        // must END inside the immediate — codesize 2 holding only
+        // `FE 0C` — for the stop to be reached; a longer body keeps the
+        // `ldloc`.
+        assert!(il_ops(&[0x08, 0xfe, 0x0c]).is_empty());
+        assert!(il_ops(&[0x0e, 0xfe, 0x0c, 0x05]).is_empty());
+        // The same shape with the full immediate keeps the `ldloc`.
+        assert_eq!(
+            il_ops(&[0x12, 0xfe, 0x0c, 0x05, 0x00]),
+            vec!["ldloc 5".to_string()]
+        );
         // `ldftn` (0x06) still has a token operand, which stays unread, so
         // it still stops at the marker.
         assert_eq!(il_ops(&[0x0a, 0xfe, 0x06]), vec!["op-fe-06".to_string()]);

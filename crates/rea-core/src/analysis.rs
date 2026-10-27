@@ -1281,11 +1281,12 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].from, 0x1000);
 
-        // Unaligned: not a hit.
+        // Unaligned: the 4-byte needle 08 10 00 00 sits at offset 1 (VA
+        // 0x1001, not 4-aligned), so the alignment check rejects it.
         let unaligned = pointer_target(
             Arch::Arm64,
             64,
-            &[0x00, 0x00, 0x08, 0x10, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00],
+            &[0x00, 0x08, 0x10, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff],
         );
         assert!(data_xrefs(&unaligned, 0x1008).is_empty());
 

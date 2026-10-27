@@ -97,6 +97,11 @@ pub struct WasmGlobal {
     pub mutable: bool,
     /// The `i32.const` initializer value.
     pub init: i32,
+    /// This global's position within the global section: it counts every
+    /// global in the section, including ones this parser skips. Its index
+    /// in the module's global index space is this plus the imported-global
+    /// count.
+    pub index: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -550,10 +555,12 @@ pub fn wat_full(module: &WasmModule) -> String {
                 }
             }
             6 => {
-                // Global index space starts with the imported globals.
+                // Global index space starts with the imported globals; each
+                // stored global carries its position in the section (which
+                // counts skipped globals too), offset by the import count.
                 let base = module.imported_globals.len() as u32;
-                for (i, g) in module.globals.iter().enumerate() {
-                    let index = base + i as u32;
+                for g in &module.globals {
+                    let index = base + g.index;
                     let ty = if g.mutable {
                         format!("(mut {})", g.valtype)
                     } else {
@@ -769,24 +776,38 @@ fn decode_globals(payload: &[u8]) -> Result<Vec<WasmGlobal>> {
     let mut r = Reader::new(payload);
     let count = r.read_u32_leb()?;
     let mut out = Vec::new();
-    for _ in 0..count {
-        let valtype = r.read_u8()?;
-        let mutable = r.read_u8()? == 1;
-        let op = r.read_u8()?;
-        if op != 0x41 {
-            break;
-        }
-        let init = r.read_i32_leb()?;
-        let end = r.read_u8()?;
-        if end != 0x0b {
-            break;
-        }
-        if valtype == 0x7f {
-            out.push(WasmGlobal {
-                valtype: "i32".to_string(),
-                mutable,
-                init,
-            });
+    for index in 0..count {
+        // Parse each global from its own sub-slice so a truncated or
+        // malformed initializer leaves the globals that already parsed
+        // intact instead of dropping them with `?`.
+        let parsed = (|| -> Option<Option<WasmGlobal>> {
+            let valtype = r.read_u8().ok()?;
+            let mutable = r.read_u8().ok()? == 1;
+            let op = r.read_u8().ok()?;
+            if op != 0x41 {
+                return Some(None);
+            }
+            let init = r.read_i32_leb().ok()?;
+            let end = r.read_u8().ok()?;
+            if end != 0x0b {
+                return Some(None);
+            }
+            if valtype == 0x7f {
+                return Some(Some(WasmGlobal {
+                    valtype: "i32".to_string(),
+                    mutable,
+                    init,
+                    index,
+                }));
+            }
+            // A complete but non-i32 global: skipped, but the section
+            // continues and the index it occupies is counted.
+            Some(None)
+        })();
+        match parsed {
+            Some(Some(g)) => out.push(g),
+            Some(None) => continue,
+            None => break,
         }
     }
     Ok(out)
@@ -1881,6 +1902,32 @@ mod tests {
     }
 
     #[test]
+    fn a_skipped_global_still_occupies_its_wasm_index() {
+        // Import one global (mutable i32), then define two: an f32 (skipped —
+        // only i32 initializers are stored) and a mutable i32. The stored
+        // global is index 2: imports occupy 0–1, and the skipped f32 still
+        // counts. The old numbering (import count + position in the stored
+        // vec) printed $1.
+        let m = inspect(&hex(concat!(
+            "0061736d01000000", // header
+            "02080101650167037f01", // section 2: one global import, (mut i32)
+            "060b027d0041030b7f0141090b", // section 6: f32 skipped, mutable i32 stored
+        )))
+        .unwrap();
+        assert_eq!(
+            m.globals,
+            vec![WasmGlobal {
+                valtype: "i32".into(),
+                mutable: true,
+                init: 9,
+                index: 1,
+            }]
+        );
+        let text = wat_full(&m);
+        assert!(text.contains("  (global $2 (mut i32) (i32.const 9))\n"), "{text}");
+    }
+
+    #[test]
     fn defined_global_stores_valtype_mutability_and_initializer() {
         // One mutable i32 global, i32.const 42 end.
         let m = inspect(&hex("0061736d010000000606017f01412a0b")).unwrap();
@@ -1891,6 +1938,7 @@ mod tests {
                 valtype: "i32".into(),
                 mutable: true,
                 init: 42,
+                index: 0,
             }]
         );
         // A const (non-mut) global prints without `mut`, after the imports.
@@ -1934,11 +1982,31 @@ mod tests {
 
     #[test]
     fn a_truncated_global_section_yields_what_parsed() {
-        // Count 2; the second global's initializer is truncated, so the whole
-        // section is dropped the way a truncated element section is.
+        // Count 2; the second global's initializer is truncated mid-immediate.
+        // The complete first global stays: a truncated section yields what
+        // parsed so far, and a wrong end byte keeps earlier globals too.
         let m = inspect(&hex("0061736d010000000609027f00410b0b7f0041")).unwrap();
         assert_eq!(m.sections, vec![6]);
-        assert!(m.globals.is_empty());
+        assert_eq!(
+            m.globals,
+            vec![WasmGlobal {
+                valtype: "i32".into(),
+                mutable: false,
+                init: 11,
+                index: 0,
+            }]
+        );
+        // A wrong end byte after a complete global: the earlier global stays.
+        let m = inspect(&hex("0061736d01000000060b027f00410b0b7f00410b0a")).unwrap();
+        assert_eq!(
+            m.globals,
+            vec![WasmGlobal {
+                valtype: "i32".into(),
+                mutable: false,
+                init: 11,
+                index: 0,
+            }]
+        );
     }
 
     #[test]
