@@ -149,7 +149,16 @@ impl BpList<'_> {
                 }
                 let raw: [u8; 8] = self.bytes.get(off + 1..off + 9)?.try_into().ok()?;
                 let secs = f64::from_be_bytes(raw);
-                if !secs.is_finite() || secs.fract() != 0.0 || secs.abs() >= 9.3e18 {
+                // Only a finite whole number inside `i64` range is the
+                // seconds the payload holds. `as i64` saturates at the `i64`
+                // ends, so anything at or past `2^63` in magnitude (or below
+                // `i64::MIN`, the next f64 down) is not representable and
+                // stays unread instead of becoming a different integer.
+                if !secs.is_finite()
+                    || secs.fract() != 0.0
+                    || secs < -9.223372036854776e18
+                    || secs >= 9.223372036854776e18
+                {
                     return None;
                 }
                 Some(Obj::Date(secs as i64))
@@ -401,5 +410,27 @@ mod tests {
         let got = identify(&file).unwrap();
         assert_eq!(got.bundle_name, None);
         assert_eq!(got.bundle_version.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn a_date_past_the_i64_range_is_not_a_saturated_integer() {
+        // `2^63` passes a magnitude guard written as `9.3e18`, and `as i64`
+        // saturates it to `i64::MAX`: the field would hold a different
+        // integer than the payload. It must stay unread.
+        let file = bplist(&[
+            ("CFBundleVersion", date_obj(9223372036854775808.0)),
+            ("CFBundleName", ascii_obj("Example")),
+        ]);
+        let got = identify(&file).unwrap();
+        assert_eq!(got.bundle_version, None);
+        assert_eq!(got.bundle_name.as_deref(), Some("Example"));
+        // The next f64 below `-i64::MIN` also saturates (to `i64::MIN`).
+        let file = bplist(&[("CFBundleVersion", date_obj(-9223372036854777856.0))]);
+        assert!(identify(&file).is_none());
+        // A magnitude just inside the range still decodes. The largest
+        // whole f64 below `2^63` is `2^63 - 1024`.
+        let file = bplist(&[("CFBundleVersion", date_obj(9223372036854774784.0))]);
+        let got = identify(&file).unwrap();
+        assert_eq!(got.bundle_version.as_deref(), Some("9223372036854774784"));
     }
 }
