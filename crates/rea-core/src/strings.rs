@@ -225,21 +225,32 @@ fn utf8_runs(bytes: &[u8], min_len: usize) -> Vec<StringHit> {
     /// when the sequence is invalid or truncated.
     fn scalar(bytes: &[u8], i: usize) -> Option<(u32, usize)> {
         let b0 = *bytes.get(i)?;
-        let (cp, width, cont_min, cont_max) = match b0 {
-            0x00..=0x7f => (b0 as u32, 1, 0, 0),
-            0xc2..=0xdf => ((b0 as u32) & 0x1f, 2, 0x80, 0xbf),
-            0xe0 => ((b0 as u32) & 0x0f, 3, 0xa0, 0xbf),
-            0xe1..=0xec | 0xee..=0xef => ((b0 as u32) & 0x0f, 3, 0x80, 0xbf),
-            0xed => ((b0 as u32) & 0x0f, 3, 0x80, 0x9f),
-            0xf0 => ((b0 as u32) & 0x07, 4, 0x90, 0xbf),
-            0xf1..=0xf3 => ((b0 as u32) & 0x07, 4, 0x80, 0xbf),
-            0xf4 => ((b0 as u32) & 0x07, 4, 0x80, 0x8f),
+        let (cp, width) = match b0 {
+            0x00..=0x7f => (b0 as u32, 1),
+            0xc2..=0xdf => ((b0 as u32) & 0x1f, 2),
+            0xe0 => ((b0 as u32) & 0x0f, 3),
+            0xe1..=0xec | 0xee..=0xef => ((b0 as u32) & 0x0f, 3),
+            0xed => ((b0 as u32) & 0x0f, 3),
+            0xf0 => ((b0 as u32) & 0x07, 4),
+            0xf1..=0xf3 => ((b0 as u32) & 0x07, 4),
+            0xf4 => ((b0 as u32) & 0x07, 4),
             _ => return None,
+        };
+        // Each continuation position has its own window: the lead's window
+        // (overlong and surrogate exclusion) binds only the FIRST
+        // continuation; the rest take the plain `0x80..=0xbf`.
+        let (first_min, first_max) = match b0 {
+            0xe0 => (0xa0, 0xbf),
+            0xed => (0x80, 0x9f),
+            0xf0 => (0x90, 0xbf),
+            0xf4 => (0x80, 0x8f),
+            _ => (0x80, 0xbf),
         };
         let mut cp = cp;
         for k in 1..width {
             let b = *bytes.get(i + k)?;
-            if b < cont_min || b > cont_max {
+            let (lo, hi) = if k == 1 { (first_min, first_max) } else { (0x80, 0xbf) };
+            if b < lo || b > hi {
                 return None;
             }
             cp = (cp << 6) | (b as u32 & 0x3f);
@@ -397,6 +408,32 @@ mod tests {
         assert_eq!(json["encoding"], "utf-8");
         // One scalar, min 2: not reported.
         assert!(extract(&data[..2], 2).is_empty());
+    }
+
+    #[test]
+    fn utf8_continuation_windows_bind_per_position_not_per_lead() {
+        // The lead's window binds only the FIRST continuation; later
+        // continuations take the plain 0x80..=0xbf. Three- and four-byte
+        // scalars whose LAST continuation sits at 0x80 must decode.
+        for (hex, want) in [
+            (&b"\xe0\xa0\x80"[..], Some("\u{0800}")),   // U+0800, E0 lead
+            (&b"\xed\x9f\xbf"[..], Some("\u{D7FF}")),   // U+D7FF, ED lead
+            (&b"\xf0\x90\x80\x80"[..], Some("\u{10000}")), // U+10000, F0 lead
+            (&b"\xf4\x8f\xbf\xbf"[..], Some("\u{10FFFF}")), // U+10FFFF, F4 lead
+        ] {
+            let hits = extract(hex, 1);
+            assert_eq!(hits.len(), 1, "{hex:?}");
+            assert_eq!(hits[0].encoding, Some("utf-8"));
+            assert_eq!(hits[0].value, want.unwrap());
+        }
+        // Overlong, surrogate, and past-U+10FFFF stay unread.
+        for hex in [
+            &b"\xe0\x80\x80"[..],    // overlong
+            &b"\xed\xa0\x80"[..],    // surrogate
+            &b"\xf4\x90\x80\x80"[..], // past U+10FFFF
+        ] {
+            assert!(extract(hex, 1).is_empty(), "{hex:?}");
+        }
     }
 
     #[test]

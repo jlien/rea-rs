@@ -546,8 +546,11 @@ fn marker(out: Vec<MachoEntitlement>, parent: &str, more: usize) -> Vec<MachoEnt
 /// other element, which is skipped whole. Returns the offset past the element; an element that never closes
 /// stops at the end of `text`.
 fn nested_value(text: &str, at: usize) -> (Option<String>, usize) {
+    // A tag with no `>` or space before the end of `text` never closes; stop
+    // at `text.len()` so the caller's loop (which restarts at the returned
+    // offset) terminates instead of spinning on the same `<`.
     let Some(name_end) = text[at..].find(['>', ' ']) else {
-        return (None, at);
+        return (None, text.len());
     };
     let name = &text[at + 1..at + name_end];
     if name.is_empty() || name.starts_with(['/', '!', '?']) {
@@ -1463,6 +1466,51 @@ mod tests {
                 MachoEntitlement { key: "outer".into(), value: None },
                 MachoEntitlement { key: "outer.one".into(), value: Some("1".into()) },
                 MachoEntitlement { key: "outer.two".into(), value: None },
+            ]
+        );
+    }
+
+    #[test]
+    fn an_array_tag_cut_before_its_close_terminates_and_keeps_parsed_keys() {
+        // `<array><string` ends mid-tag: the `<string` has no `>` or space
+        // before the end of the payload. The array loop used to restart at
+        // that same `<` and spin forever. It must stop at the end of `text`
+        // and keep the keys that parsed before it.
+        for (cut, want) in [
+            (
+                "<array><string",
+                vec![
+                    MachoEntitlement { key: "g".into(), value: None },
+                    MachoEntitlement { key: "g[0]".into(), value: None },
+                ],
+            ),
+            (
+                "<array><",
+                vec![
+                    MachoEntitlement { key: "g".into(), value: None },
+                    MachoEntitlement { key: "g[0]".into(), value: None },
+                ],
+            ),
+        ] {
+            let xml = format!(
+                "<?xml version=\"1.0\"?><plist><dict>\
+                 <key>g</key>{}",
+                cut
+            );
+            let got = facts(&entitled_macho(xml.as_bytes(), None)).unwrap();
+            assert_eq!(got.entitlements.expect("entitlements").entries, want);
+        }
+        // A complete value after the array still parses.
+        let xml = b"<?xml version=\"1.0\"?><plist><dict>\
+            <key>g</key><array><string>a</string></array>\
+            <key>h</key><string>b</string></dict></plist>";
+        let got = facts(&entitled_macho(xml, None)).unwrap();
+        assert_eq!(
+            got.entitlements.expect("entitlements").entries,
+            vec![
+                MachoEntitlement { key: "g".into(), value: None },
+                MachoEntitlement { key: "g[0]".into(), value: Some("a".into()) },
+                MachoEntitlement { key: "h".into(), value: Some("b".into()) },
             ]
         );
     }
