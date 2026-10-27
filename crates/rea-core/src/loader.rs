@@ -656,8 +656,9 @@ mod tests {
     }
 
     /// Swift stores `_$s…` in the string table. One ABI underscore comes off,
-    /// the raw name stays `$s…`, and the demangled form is `module.name`. A
-    /// name that does not demangle keeps its raw name and no demangled form.
+    /// the raw name stays `$s…`, and the demangled form is `module.name` — or
+    /// `module.name()` when the unread tail is exactly `yyF`. A name that does
+    /// not demangle keeps its raw name and no demangled form.
     #[test]
     fn swift_symbol_is_demangled_through_load_macho() {
         let strs = b"\0_$s4main3fooyyF\0_$s4main9\0";
@@ -685,15 +686,16 @@ mod tests {
             .iter()
             .find(|s| s.name == "$s4main3fooyyF")
             .expect("raw name");
-        assert_eq!(sym.demangled.as_deref(), Some("main.foo"));
+        assert_eq!(sym.demangled.as_deref(), Some("main.foo()"));
         let broken = target
             .symbols
             .iter()
             .find(|s| s.name == "$s4main9")
             .expect("broken");
         assert_eq!(broken.demangled, None);
-        // Headers print a Swift demangle as a comment (`/* main.foo */`),
-        // never a declaration; the failed demangle stays absent.
+        // Headers print a Swift demangle as a comment (`/* main.foo */`), the
+        // two-identifier path without the `()`, never a declaration; the
+        // failed demangle stays absent.
         let header = crate::headers::emit(&target);
         assert!(header.contains("/* main.foo */"), "{header}");
         assert!(!header.contains("extern void $s4main3fooyyF"), "{header}");

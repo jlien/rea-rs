@@ -46,8 +46,9 @@ pub struct MachoFacts {
 pub struct ObjcString {
     /// The raw string as it appears in the section, or the `... N more` marker.
     pub text: String,
-    /// `module.name` from `crate::demangle::swift`, when the raw text demangles. Types,
-    /// generics, punycode, and labels stay unread; a rejected name stays raw.
+    /// `module.name` from `crate::demangle::swift`, without the `()` a
+    /// trailing `yyF` adds. Other type suffixes, generics, punycode, and
+    /// labels stay unread; a rejected name stays raw.
     pub module_name: Option<String>,
 }
 
@@ -301,7 +302,7 @@ fn objc_strings(mo: &goblin::mach::MachO) -> Vec<ObjcString> {
                     if let Some(s) = start.take() {
                         if i > s {
                             let text = String::from_utf8_lossy(&data[s..i]).into_owned();
-                            let module_name = crate::demangle::swift(&text);
+                            let module_name = crate::demangle::swift_path(&text);
                             hits.push(ObjcString { text, module_name });
                         }
                     }
