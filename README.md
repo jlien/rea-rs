@@ -44,6 +44,7 @@ rea disasm fat-binary --arch arm64 --address 0x1000 --count 1
 rea headers /bin/ls
 rea plist Info.plist
 rea plist binary-Info.plist  # a bplist00 binary plist reads the same three keys
+                             # (a 0x33 date value on a key reads as its whole seconds since 2001-01-01)
 rea crash report.crash
 rea artifact Example.app
 
