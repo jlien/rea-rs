@@ -1,5 +1,6 @@
 //! WebAssembly binary inspector. Parses imports, exports, type signatures, function
-//! bodies as opcode names, element and data segments, and a capped custom payload.
+//! bodies as opcode names, element and data segments, defined `i32` globals whose
+//! initializer is `i32.const`, and a capped custom payload.
 //! Memory limits carry the shared flag, and imported memories keep their limits.
 //! `execute` runs an exported function that stays inside i32 locals, with a step cap.
 //! `wat` prints a readability listing and `wat_full` prints a full WAT emission of
@@ -87,6 +88,17 @@ pub struct WasmGlobalImport {
     pub mutable: bool,
 }
 
+/// A defined global whose initializer is `i32.const`: valtype, mutable flag,
+/// and the constant. A global with another valtype or another initializer
+/// form is omitted.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct WasmGlobal {
+    pub valtype: String,
+    pub mutable: bool,
+    /// The `i32.const` initializer value.
+    pub init: i32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct WasmModule {
     pub version: u32,
@@ -118,6 +130,9 @@ pub struct WasmModule {
     pub imported_globals: Vec<WasmGlobalImport>,
     /// Tables declared in the table section. Imported tables stay on `imports`.
     pub tables: Vec<WasmTable>,
+    /// Defined globals whose valtype is `i32` and whose initializer is
+    /// `i32.const`. Imported globals stay on `imported_globals`.
+    pub globals: Vec<WasmGlobal>,
     /// Start function index, when the start section is present.
     pub start: Option<u32>,
     /// Value from the data-count section. Data segment bytes are on `data`.
@@ -154,6 +169,7 @@ pub fn inspect(bytes: &[u8]) -> Result<WasmModule> {
     let mut imported_tables = Vec::new();
     let mut imported_globals = Vec::new();
     let mut tables = Vec::new();
+    let mut globals = Vec::new();
     let mut start = None;
     let mut data_count = None;
     let mut customs = Vec::new();
@@ -162,6 +178,7 @@ pub fn inspect(bytes: &[u8]) -> Result<WasmModule> {
     let mut saw_functions = false;
     let mut saw_memories = false;
     let mut saw_tables = false;
+    let mut saw_globals = false;
     let mut saw_start = false;
     let mut saw_data_count = false;
 
@@ -214,6 +231,13 @@ pub fn inspect(bytes: &[u8]) -> Result<WasmModule> {
                 saw_memories = true;
                 memories = decode_memories(payload)?;
             }
+            6 => {
+                if saw_globals {
+                    return Err(Error::Parse("duplicate wasm global section".into()));
+                }
+                saw_globals = true;
+                globals = decode_globals(payload).unwrap_or_default();
+            }
             7 => exports.extend(decode_exports(payload)?),
             9 => {
                 if elements.is_empty() {
@@ -265,6 +289,7 @@ pub fn inspect(bytes: &[u8]) -> Result<WasmModule> {
         imported_tables,
         imported_globals,
         tables,
+        globals,
         start,
         data_count,
         customs,
@@ -436,11 +461,10 @@ pub fn wat(module: &WasmModule) -> String {
 /// and 256-byte caps are the same as `wat`; the difference is shape: types
 /// carry full param and result lists, imports carry their kind details,
 /// element and data segments carry their offsets, and function bodies are
-/// `(func $i ...)` with local groups and mnemonic instructions. An unknown
-/// opcode degrades to an inline `(; opcode 0xNN ;)` comment, so the nesting
-/// stays balanced. Still not a writer for undecoded things: globals beyond
-/// the import valtype, non-`i32.const` segment offsets, and memory-init
-/// forms stay unrecovered.
+/// `(func $i ...)` with local groups and mnemonic instructions. An unknown opcode degrades to an inline `(; opcode 0xNN ;)`
+/// comment, so the nesting stays balanced. Still not a writer for undecoded
+/// things: global initializers that are not `i32.const`, non-`i32.const`
+/// segment offsets, and memory-init forms stay unrecovered.
 pub fn wat_full(module: &WasmModule) -> String {
     let mut out = String::from("(module\n");
     let imported_funcs = module
@@ -523,6 +547,22 @@ pub fn wat_full(module: &WasmModule) -> String {
             5 => {
                 for memory in &module.memories {
                     out.push_str(&format!("  (memory {})\n", limit_text(memory)));
+                }
+            }
+            6 => {
+                // Global index space starts with the imported globals.
+                let base = module.imported_globals.len() as u32;
+                for (i, g) in module.globals.iter().enumerate() {
+                    let index = base + i as u32;
+                    let ty = if g.mutable {
+                        format!("(mut {})", g.valtype)
+                    } else {
+                        g.valtype.clone()
+                    };
+                    out.push_str(&format!(
+                        "  (global ${index} {ty} (i32.const {}))\n",
+                        g.init
+                    ));
                 }
             }
             7 => {
@@ -718,6 +758,38 @@ fn ref_name(byte: u8) -> String {
         0x6f => "externref".to_string(),
         n => format!("ref-{n}"),
     }
+}
+
+/// Reads the global section. A global whose valtype is `i32` and whose
+/// initializer is `i32.const N end` is stored with its constant. A global
+/// with any other valtype or initializer form is skipped; once an initializer
+/// of unknown length is met the rest of the section is left unread. A
+/// truncated section yields what parsed so far.
+fn decode_globals(payload: &[u8]) -> Result<Vec<WasmGlobal>> {
+    let mut r = Reader::new(payload);
+    let count = r.read_u32_leb()?;
+    let mut out = Vec::new();
+    for _ in 0..count {
+        let valtype = r.read_u8()?;
+        let mutable = r.read_u8()? == 1;
+        let op = r.read_u8()?;
+        if op != 0x41 {
+            break;
+        }
+        let init = r.read_i32_leb()?;
+        let end = r.read_u8()?;
+        if end != 0x0b {
+            break;
+        }
+        if valtype == 0x7f {
+            out.push(WasmGlobal {
+                valtype: "i32".to_string(),
+                mutable,
+                init,
+            });
+        }
+    }
+    Ok(out)
 }
 
 fn decode_func_types(payload: &[u8]) -> Result<Vec<u32>> {
@@ -1806,6 +1878,84 @@ mod tests {
     fn duplicate_table_is_an_error() {
         let err = inspect(&hex("0061736d01000000040401700000040401700001")).unwrap_err();
         assert!(matches!(err, Error::Parse(ref msg) if msg == "duplicate wasm table section"));
+    }
+
+    #[test]
+    fn defined_global_stores_valtype_mutability_and_initializer() {
+        // One mutable i32 global, i32.const 42 end.
+        let m = inspect(&hex("0061736d010000000606017f01412a0b")).unwrap();
+        assert_eq!(m.sections, vec![6]);
+        assert_eq!(
+            m.globals,
+            vec![WasmGlobal {
+                valtype: "i32".into(),
+                mutable: true,
+                init: 42,
+            }]
+        );
+        // A const (non-mut) global prints without `mut`, after the imports.
+        let text = wat_full(&m);
+        assert!(parens_balanced(&text));
+        assert!(text.contains("  (global $0 (mut i32) (i32.const 42))\n"));
+        let const_global = inspect(&hex("0061736d010000000606017f0041070b")).unwrap();
+        assert_eq!(const_global.globals[0].mutable, false);
+        assert_eq!(const_global.globals[0].init, 7);
+        assert!(wat_full(&const_global).contains("  (global $0 i32 (i32.const 7))\n"));
+    }
+
+    #[test]
+    fn defined_global_indexes_continue_after_imported_globals() {
+        // Import a mutable global (module e, name g), then define one.
+        let m = inspect(&hex(
+            "0061736d0100000002080101650167037f010606017f01410b0b",
+        ))
+        .unwrap();
+        assert_eq!(m.imported_globals.len(), 1);
+        assert_eq!(m.globals.len(), 1);
+        let text = wat_full(&m);
+        assert!(text.contains("  (import \"e\" \"g\" (global (mut i32)))\n"));
+        assert!(text.contains("  (global $1 (mut i32) (i32.const 11))\n"));
+    }
+
+    #[test]
+    fn a_global_beyond_i32_const_init_stores_nothing_and_does_not_fail() {
+        // Two globals: the first is i32 with a global.get initializer (0x23,
+        // index 0, end); the second is a plain i32.const. Neither the unknown
+        // form nor anything after it is stored, and the inspect succeeds.
+        let m = inspect(&hex("0061736d01000000060b027f0023000b7f0041050b")).unwrap();
+        assert_eq!(m.sections, vec![6]);
+        assert!(m.globals.is_empty());
+
+        // An i64 global with an i32.const initializer stores nothing; the
+        // valtype, not the initializer, is the gate.
+        let i64_global = inspect(&hex("0061736d010000000606017e0041050b")).unwrap();
+        assert!(i64_global.globals.is_empty());
+    }
+
+    #[test]
+    fn a_truncated_global_section_yields_what_parsed() {
+        // Count 2; the second global's initializer is truncated, so the whole
+        // section is dropped the way a truncated element section is.
+        let m = inspect(&hex("0061736d010000000609027f00410b0b7f0041")).unwrap();
+        assert_eq!(m.sections, vec![6]);
+        assert!(m.globals.is_empty());
+    }
+
+    #[test]
+    fn duplicate_global_is_an_error() {
+        let err = inspect(&hex("0061736d010000000606017f01412a0b0606017f01412a0b")).unwrap_err();
+        assert!(matches!(&err, Error::Parse(msg) if msg == "duplicate wasm global section"));
+    }
+
+    #[test]
+    fn execute_ignores_the_global_section() {
+        // A global section beside a trivial exported function; execute returns
+        // the function's result without reading the global.
+        let bytes =
+            hex("0061736d010000000606017f01412a0b0105016000017f03020100070501016600000a0601040041070b");
+        let m = inspect(&bytes).unwrap();
+        assert_eq!(m.globals[0].init, 42);
+        assert_eq!(execute(&bytes, "f", &[]).unwrap(), vec![7]);
     }
 
     #[test]
