@@ -7,8 +7,8 @@
 //! and unrecognized bundle flags are counted and skipped), entry point,
 //! internal fixups, and page-granular vaddr→file-offset translation (enough
 //! for info/sections/disasm). Iterated pages are expanded into the load
-//! image at load time; other page types (invalid, zero-filled) carry no
-//! bytes and translate to None.
+//! image at load time; zero-filled pages are filled with zeros there. Other
+//! page types (invalid) carry no bytes and translate to None.
 
 use crate::{Arch, Error, Result, Section};
 
@@ -57,14 +57,20 @@ pub struct LePages {
     /// Page numbers (1-based) from the object page table.
     pages: Vec<u16>,
     /// Page-type flags (low u16 of each page-map entry): 0 identity-mapped,
-    /// 1 iterated, higher values (invalid, zero-filled) carry no bytes here.
+    /// 1 iterated, 3 zero-filled, higher values invalid and carrying no
+    /// bytes here.
     flags: Vec<u16>,
+    /// Slots whose zero-filled pages (flag 3) have been expanded into the
+    /// load image by [`LeImage::expand_zero_filled`]; `translate` serves
+    /// those like page bytes.
+    zero_expanded: Vec<bool>,
 }
 
 impl LePages {
     /// Map a virtual address to a file offset. Returns `None` for addresses
     /// outside any object, beyond an object's mapped pages, or in page types
-    /// that carry no bytes here (invalid, zero-filled). An iterated page
+    /// that carry no bytes here (invalid, and zero-filled until
+    /// [`LeImage::expand_zero_filled`] has run). An iterated page
     /// translates once [`LeImage::expand_iterated`] has expanded its
     /// records into the image buffer.
     pub fn translate(&self, vaddr: u64) -> Option<u64> {
@@ -79,9 +85,11 @@ impl LePages {
         }
         let slot = obj.pagemap as usize - 1 + idx;
         // Flag 0 maps its page bytes directly; flag 1 is an iterated page,
-        // whose records expand over their own slot. Any other flag value
-        // (invalid, zero-filled) names no bytes here.
-        if *self.flags.get(slot)? > 1 {
+        // whose records expand over their own slot. A flag-3 page maps once
+        // its zeros have been written into the image. Any other flag value
+        // (invalid) names no bytes here.
+        let flag = *self.flags.get(slot)?;
+        if flag > 1 && !(flag == 3 && self.zero_expanded.get(slot).copied().unwrap_or(false)) {
             return None;
         }
         let page = u64::from(*self.pages.get(slot)?);
@@ -395,6 +403,7 @@ impl LeImage {
                 objects,
                 pages,
                 flags,
+                zero_expanded: vec![false; mpages as usize],
             },
             entry,
             cpu,
@@ -487,6 +496,57 @@ impl LeImage {
             }
             bytes[at..at + data.len()].copy_from_slice(&data);
             expanded += 1;
+        }
+        Ok(expanded)
+    }
+
+    /// Expand zero-filled pages (page-map flag 3) into `bytes`, the
+    /// load-image copy the loader owns. A zero-filled page carries no file
+    /// bytes; its range is filled with zeros over its own slot, the last
+    /// page of an object filling only the object's remainder, so
+    /// [`LePages::translate`] afterwards serves those zeros and the fixup
+    /// pass can patch sites on the page. Identity and iterated pages, page
+    /// number 0, and any other flag value are untouched. Marks each
+    /// expanded slot so `translate` maps it. Returns the number of pages
+    /// expanded.
+    pub fn expand_zero_filled(&mut self, bytes: &mut Vec<u8>) -> Result<usize> {
+        let pagesize = self.pages.pagesize as usize;
+        let area = self.pages.header_off + self.pages.datapage as usize;
+        let mut expanded = 0usize;
+        for o in &self.pages.objects {
+            let Some(pagemap) = o.pagemap.checked_sub(1) else {
+                continue;
+            };
+            for idx in 0..o.mapsize as usize {
+                let slot = pagemap as usize + idx;
+                if *self.pages.flags.get(slot).unwrap_or(&0) != 3 {
+                    continue;
+                }
+                let page = *self.pages.pages.get(slot).ok_or_else(|| {
+                    Error::Parse("le: object page map out of range".into())
+                })? as usize;
+                if page == 0 {
+                    continue;
+                }
+                // The object's last page may be shorter than the page size;
+                // only that remainder is filled.
+                let target = (((o.size as u64)
+                    .saturating_sub(idx as u64 * pagesize as u64)) as usize)
+                    .min(pagesize);
+                if target == 0 {
+                    continue;
+                }
+                let Some(mark) = self.pages.zero_expanded.get_mut(slot) else {
+                    continue;
+                };
+                let start = area + (page - 1) * pagesize;
+                if start + target > bytes.len() {
+                    bytes.resize(start + target, 0);
+                }
+                bytes[start..start + target].fill(0);
+                *mark = true;
+                expanded += 1;
+            }
         }
         Ok(expanded)
     }
@@ -991,7 +1051,12 @@ pub(crate) mod tests {
 
     /// Fixup page table + records in the gap between the page map and the data page.
     fn with_fixup_records(records: &[u8]) -> Vec<u8> {
-        let mut b = synthetic();
+        with_fixup_records_on(synthetic(), records)
+    }
+
+    /// The same plumbing over a caller-supplied base image, so the
+    /// zero-filled fixture can carry a fixup record too.
+    fn with_fixup_records_on(mut b: Vec<u8>, records: &[u8]) -> Vec<u8> {
         let le = 0x40usize;
         let fpagetab = 0xDCu32;
         let frectab = 0xE4u32;
@@ -1160,24 +1225,59 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn identity_pages_are_not_expanded_and_still_translate() {
-        // The synthetic image's own page is flag 0: expand_iterated is a
-        // no-op on it and translate keeps working.
+    fn identity_pages_stay_untouched_by_the_zero_expansion() {
+        // The synthetic image's own page is flag 0: neither expansion pass
+        // rewrites it, and translate keeps serving its page bytes.
         let mut b = synthetic();
-        let img = LeImage::parse(&b).unwrap();
+        let mut img = LeImage::parse(&b).unwrap();
         assert_eq!(img.expand_iterated(&mut b).unwrap(), 0);
+        assert_eq!(img.expand_zero_filled(&mut b).unwrap(), 0);
         assert_eq!(img.pages.translate(0x400000), Some(0x140));
         assert_eq!(&b[0x140..0x144], &[0x55, 0x89, 0xe5, 0xc3]);
     }
 
+    /// Rewrite the synthetic image so page 1 is zero-filled (page-map
+    /// flag 3): the page carries no file bytes, and `expand_zero_filled`
+    /// fills the object's 16-byte remainder with zeros over its slot.
+    pub(crate) fn zero_filled() -> Vec<u8> {
+        let mut b = synthetic();
+        let map = 0x40usize + 0xD8;
+        b[map..map + 4].copy_from_slice(&((1u32 << 16) | 3).to_le_bytes());
+        b
+    }
+
+    /// `zero_filled` plus one internal type-7 fixup writing the linear
+    /// address of object 1 + 0x8 at source offset 0x8, so the loader test
+    /// can watch a fixup site patch the zeros.
+    pub(crate) fn zero_filled_with_fixup() -> Vec<u8> {
+        with_fixup_records_on(zero_filled(), &[0x07, 0x00, 0x08, 0x00, 0x01, 0x08, 0x00])
+    }
+
     #[test]
-    fn a_zero_filled_page_flag_does_not_translate() {
-        // Flag 3 (zero-filled) carries no bytes in the file: translate
-        // refuses it instead of computing a bogus offset.
+    fn a_zero_filled_page_expands_to_zeros_and_then_translates() {
+        // Flag 3 (zero-filled) carries no bytes in the file: before the
+        // expansion translate refuses it; after expand_zero_filled fills
+        // the object's 16-byte remainder, translate serves zeros — the
+        // synthetic slot's own 55 89 e5 c3 bytes included.
+        let mut b = zero_filled();
+        let mut img = LeImage::parse(&b).unwrap();
+        assert_eq!(img.pages.translate(0x400000), None);
+        assert_eq!(img.expand_zero_filled(&mut b).unwrap(), 1);
+        assert_eq!(img.pages.translate(0x400000), Some(0x140));
+        assert_eq!(img.pages.translate(0x40000f), Some(0x14f));
+        assert_eq!(&b[0x140..0x150], &[0u8; 16]);
+    }
+
+    #[test]
+    fn a_page_flag_past_zero_filled_is_neither_expanded_nor_translated() {
+        // Any flag value past 3 stays invalid: expand_zero_filled touches
+        // nothing and translate keeps refusing it.
         let mut b = synthetic();
         let map = 0x40 + 0xD8;
-        b[map..map + 4].copy_from_slice(&((1u32 << 16) | 3).to_le_bytes());
-        let img = LeImage::parse(&b).unwrap();
+        b[map..map + 4].copy_from_slice(&((1u32 << 16) | 5).to_le_bytes());
+        let mut img = LeImage::parse(&b).unwrap();
+        assert_eq!(img.expand_zero_filled(&mut b).unwrap(), 0);
         assert_eq!(img.pages.translate(0x400000), None);
+        assert_eq!(&b[0x140..0x144], &[0x55, 0x89, 0xe5, 0xc3]);
     }
 }

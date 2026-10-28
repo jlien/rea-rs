@@ -102,16 +102,19 @@ fn load_sqlite(bytes: Vec<u8>, path: String) -> Result<Target> {
 }
 
 fn load_le(bytes: Vec<u8>, path: String) -> Result<Target> {
-    let img = LeImage::parse(&bytes)?;
+    let mut img = LeImage::parse(&bytes)?;
     let entry = img.entry;
     let arch = img.arch();
     let sections = img.sections();
     // Apply internal fixups so analysis sees relocated pointers (the file
     // stores unrelocated values; DOS/4GW patches them at load time).
     // Iterated pages expand first so fixup sites on them patch page bytes,
-    // not the records; the identity pages and the fixup pass are unchanged.
+    // not the records; zero-filled pages fill with zeros next, so translate
+    // serves them and a fixup site on one patches the zeros. The identity
+    // pages and the fixup pass are unchanged.
     let mut patched = bytes;
     img.expand_iterated(&mut patched)?;
+    img.expand_zero_filled(&mut patched)?;
     img.apply_fixups(&mut patched)?;
     let page_map = img.pages;
     Ok(Target {
@@ -949,6 +952,31 @@ mod tests {
 
     fn put_le64(file: &mut [u8], at: usize, v: u64) {
         file[at..at + 8].copy_from_slice(&v.to_le_bytes());
+    }
+
+    #[test]
+    fn zero_filled_pages_expand_through_the_real_load_path() {
+        // The fixture rides load_arch, not just LeImage::parse: the loader
+        // fills the zero-filled page with zeros before fixups, so
+        // `translate` serves those zeros and a fixup site on the page
+        // patches them.
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("rea-le-zero-{}.exe", std::process::id()));
+        std::fs::write(&path, crate::le::tests::zero_filled_with_fixup()).unwrap();
+        let target = super::load_arch(&path, None).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        let off = target.vaddr_to_offset(0x400000).unwrap() as usize;
+        assert_eq!(off, 0x140);
+        // The first 8 bytes are zeros — including the synthetic slot's own
+        // 55 89 e5 c3 — and the fixup site at object offset 0x8 patched
+        // the zeros with the target's linear address.
+        assert_eq!(&target.bytes[off..off + 8], &[0u8; 8][..]);
+        let word = u32::from_le_bytes(
+            target.bytes[off + 8..off + 12].try_into().unwrap(),
+        );
+        assert_eq!(word, 0x400008);
+        assert_eq!(&target.bytes[off + 12..off + 16], &[0u8; 4][..]);
     }
 
     #[test]
