@@ -97,6 +97,8 @@ pub struct ClrHeader {
     pub member_ref_signatures: Vec<Option<String>>,
     /// One element text per `TypeSpec` row — what `sig_type` returns for that row's blob payload: a primitive, `ptr`, `byref`, `szarray`, or `class` / `valuetype` with a coded index. Blob index 0, or a blob `sig_type` rejects, is `None`.
     pub typespec_signatures: Vec<Option<String>>,
+    /// One text per `StandAloneSig` row — what `method_sig` returns for that row's blob: a `field` signature or a `ret(params)` method signature. Blob index 0, or a blob `method_sig` rejects, is `None`.
+    pub standalone_sigs: Vec<Option<String>>,
     /// Resolved `MemberRefParent` for each `member_refs` entry. TypeDef and TypeRef parents become names when that row is in the name lists; `ModuleRef`, `MethodDef`, and `TypeSpec` stay as `ModuleRef#N`, `MethodDef#N`, and `TypeSpec#N`. Empty when the parent row does not fit.
     pub member_ref_parents: Vec<String>,
     /// One `ClrAssembly` per `Assembly` row, in table order.
@@ -455,6 +457,7 @@ fn parse_clr(header: &[u8], file: &[u8], metadata_off: Option<usize>) -> Option<
         member_ref_parents: meta.member_ref_parents,
         member_ref_signatures: meta.member_ref_signatures,
         typespec_signatures: meta.typespec_signatures,
+        standalone_sigs: meta.standalone_sigs,
         assemblies: meta.assemblies,
         assembly_refs: meta.assembly_refs,
         module_refs: meta.module_refs,
@@ -699,6 +702,7 @@ struct MetaRead {
     member_ref_parents: Vec<String>,
     member_ref_signatures: Vec<Option<String>>,
     typespec_signatures: Vec<Option<String>>,
+    standalone_sigs: Vec<Option<String>>,
     assemblies: Vec<ClrAssembly>,
     assembly_refs: Vec<ClrAssembly>,
     module_refs: Vec<String>,
@@ -716,6 +720,7 @@ impl MetaRead {
             member_ref_parents,
             member_ref_signatures: Vec::new(),
             typespec_signatures: Vec::new(),
+            standalone_sigs: Vec::new(),
             assemblies: Vec::new(),
             assembly_refs: Vec::new(),
             module_refs: Vec::new(),
@@ -725,7 +730,7 @@ impl MetaRead {
 
 /// `Module`, `TypeRef`, and `TypeDef` names, plus `Field` and `MethodDef` names on each `TypeDef`, `Param` names on each method, `MemberRef` names, and `InterfaceImpl` names on each `TypeDef`.
 ///
-/// `FieldPtr`, `MethodPtr`, and `ParamPtr` rows are read by row size and reorder the `Field`, `MethodDef`, and `Param` names through their one index per row; a pointer table shorter than its list, or an index past the list, leaves the row order in place and does not fail the parse. `InterfaceImpl` rows are read, which keeps later tables aligned the same way a skip does. String, blob, and coded-index widths follow the `#~` heap-size byte and the row counts. A row that does not fit ends the list and keeps the names already read. Each `MemberRef` row also records its `MemberRefParent` coded index resolved against the name lists; a parent that does not resolve leaves the field empty. `Assembly` and `AssemblyRef` rows carry their version numbers, culture, public-key blob, and flags word through `enrich_metadata`; `Assembly` rows also carry the hash-algorithm id, and `AssemblyRef` rows also carry the `HashValue` blob, rendered length-plus-hex. Signatures, RVAs, and IL are not read.
+/// `FieldPtr`, `MethodPtr`, and `ParamPtr` rows are read by row size and reorder the `Field`, `MethodDef`, and `Param` names through their one index per row; a pointer table shorter than its list, or an index past the list, leaves the row order in place and does not fail the parse. `InterfaceImpl` rows are read, which keeps later tables aligned the same way a skip does. String, blob, and coded-index widths follow the `#~` heap-size byte and the row counts. A row that does not fit ends the list and keeps the names already read. Each `MemberRef` row also records its `MemberRefParent` coded index resolved against the name lists; a parent that does not resolve leaves the field empty. `Assembly` and `AssemblyRef` rows carry their version numbers, culture, public-key blob, and flags word through `enrich_metadata`; `Assembly` rows also carry the hash-algorithm id, and `AssemblyRef` rows also carry the `HashValue` blob, rendered length-plus-hex. Each `StandAloneSig` row records the `method_sig` text of its blob in `standalone_sigs`. Signatures, RVAs, and IL are not read.
 fn read_metadata_names(
     file: &[u8],
     metadata_off: Option<usize>,
@@ -1062,7 +1067,7 @@ fn read_metadata_names(
     }
     attach_interfaces(&mut out, &typedefs, &interfaces);
     let blobs = stream_bytes(file, root, streams, "#Blob");
-    let (member_ref_signatures, assemblies, assembly_refs, module_refs, typespec_signatures) =
+    let (member_ref_signatures, assemblies, assembly_refs, module_refs, typespec_signatures, standalone_sigs) =
         enrich_metadata(&mut out, &member_refs, blobs, blob, strings, &field_ptrs, &method_ptrs);
     MetaRead {
         types: out,
@@ -1070,13 +1075,14 @@ fn read_metadata_names(
         member_ref_parents: member_parents,
         member_ref_signatures,
         typespec_signatures,
+        standalone_sigs,
         assemblies,
         assembly_refs,
         module_refs,
     }
 }
 
-/// Field and method signatures, assembly, assembly-ref, and module-ref rows, properties, and events. A row that does not fit keeps what was already read. `field_ptrs` and `method_ptrs` reorder the signature and RVA records the same way the names were reordered, so each record stays on its row.
+/// Field and method signatures, assembly, assembly-ref, and module-ref rows, properties, events, and `StandAloneSig` blobs. A row that does not fit keeps what was already read. `field_ptrs` and `method_ptrs` reorder the signature and RVA records the same way the names were reordered, so each record stays on its row.
 fn enrich_metadata(
     types: &mut [ClrType],
     member_refs: &[String],
@@ -1091,18 +1097,19 @@ fn enrich_metadata(
     Vec<ClrAssembly>,
     Vec<String>,
     Vec<Option<String>>,
+    Vec<Option<String>>,
 ) {
     let none_sigs = vec![None; member_refs.len()];
     if tilde.len() < 24 {
-        return (none_sigs, Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        return (none_sigs, Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     }
     let valid = u64::from_le_bytes(tilde[8..16].try_into().unwrap());
     let count = valid.count_ones() as usize;
     let Some(header_end) = count.checked_mul(4).and_then(|n| n.checked_add(24)) else {
-        return (none_sigs, Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        return (none_sigs, Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     };
     if tilde.len() < header_end {
-        return (none_sigs, Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        return (none_sigs, Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     }
     let str_w = if tilde[6] & 1 != 0 { 4 } else { 2 };
     let guid_w = if tilde[6] & 2 != 0 { 4 } else { 2 };
@@ -1218,6 +1225,8 @@ fn enrich_metadata(
     let mut module_refs = Vec::new();
     // One decoded element text per TypeSpec row, from `sig_type`.
     let mut typespec_sigs = Vec::new();
+    // One method-signature text per StandAloneSig row, from `method_sig`.
+    let mut standalone_sigs = Vec::new();
     let mut event_maps = Vec::new();
     let mut property_maps = Vec::new();
     // Name and signature from the blob, per Event row.
@@ -1280,6 +1289,14 @@ fn enrich_metadata(
                         )
                     });
                     member_sigs.push(sig);
+                }
+                17 => {
+                    // A StandAloneSig blob is the `MethodSig` text `method_sig`
+                    // already parses; index 0 or a rejected blob stays empty.
+                    let sig = blobs.and_then(|heap| {
+                        crate::clr_sig::method_sig(heap, read_index(row, 0, blob_w))
+                    });
+                    standalone_sigs.push(sig);
                 }
                 18 => event_maps.push((
                     read_index(row, 0, typedef_w),
@@ -1421,7 +1438,7 @@ fn enrich_metadata(
     } else {
         none_sigs
     };
-    (signatures, assemblies, assembly_refs, module_refs, typespec_sigs)
+    (signatures, assemblies, assembly_refs, module_refs, typespec_sigs, standalone_sigs)
 }
 
 fn attach_mapped(
@@ -2879,6 +2896,63 @@ mod tests {
         );
     }
 
+    #[test]
+    fn clr_standalonesig_rows_decode_method_sigs() {
+        // Five StandAloneSig rows: a default-call method sig, a field sig
+        // (`field int32` via `method_sig`), a blob `method_sig` rejects
+        // (truncated), blob index 0, and an index past the heap.
+        let mut tilde = tilde_header(1u64 << 17, &[5]);
+        for index in [1u16, 6, 9, 0, 50] {
+            tilde.extend_from_slice(&index.to_le_bytes());
+        }
+        let names = vec![0u8];
+        let mut blobs = vec![0u8];
+        // index 1: len 4, default call, void ret, one int32 param.
+        blobs.extend_from_slice(&[0x04, 0x00, 0x01, 0x01, 0x08]);
+        // index 6: len 2, field calling convention 0x06, int32.
+        blobs.extend_from_slice(&[0x02, 0x06, 0x08]);
+        // index 9: len 1, conv 0x00, then no param count — rejected.
+        blobs.extend_from_slice(&[0x01, 0x00]);
+        let (file, streams) = with_blobs(&tilde, &names, &blobs);
+        let meta = read_metadata_names(&file, Some(0), &streams);
+        assert_eq!(
+            meta.standalone_sigs,
+            vec![
+                Some("void(int32)".to_string()),
+                Some("field int32".to_string()),
+                None,
+                None,
+                None,
+            ]
+        );
+    }
+
+    #[test]
+    fn clr_standalonesig_width_stays_one_blob_index() {
+        // A StandAloneSig row next to an Assembly row: the 17 => blob_w width
+        // is unchanged, so the Assembly row parses on its expected layout.
+        let mut tilde = tilde_header((1u64 << 17) | (1u64 << 32), &[1, 1]);
+        // StandAloneSig: blob index 1.
+        tilde.extend_from_slice(&1u16.to_le_bytes());
+        // Assembly: hash alg id, four version numbers, flags, public key blob
+        // index 0, name, culture.
+        tilde.extend_from_slice(&0u32.to_le_bytes());
+        tilde.extend_from_slice(&[1u8, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0]);
+        tilde.extend_from_slice(&0u32.to_le_bytes());
+        tilde.extend_from_slice(&0u16.to_le_bytes());
+        tilde.extend_from_slice(&0u16.to_le_bytes());
+        let names = vec![0u8];
+        let mut blobs = vec![0u8];
+        blobs.extend_from_slice(&[0x04, 0x00, 0x01, 0x01, 0x08]);
+        let (file, streams) = with_blobs(&tilde, &names, &blobs);
+        let meta = read_metadata_names(&file, Some(0), &streams);
+        assert_eq!(meta.standalone_sigs, vec![Some("void(int32)".to_string())]);
+        assert_eq!(meta.assemblies.len(), 1);
+        assert_eq!(meta.assemblies[0].name, "");
+        assert_eq!(meta.assemblies[0].major_version, 1);
+        assert_eq!(meta.assemblies[0].flags, 5);
+    }
+
     fn clr_method(name: &str, params: &[(&str, u16)]) -> ClrMethod {
         ClrMethod {
             name: name.to_string(),
@@ -3726,4 +3800,5 @@ mod tests {
         assert_eq!(meta.assemblies[0].name, "Demo");
         assert_eq!(meta.assemblies[1].name, "Demo");
     }
+
 }
