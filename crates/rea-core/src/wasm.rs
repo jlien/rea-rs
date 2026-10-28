@@ -769,10 +769,11 @@ fn ref_name(byte: u8) -> String {
 
 /// Reads the global section. A global whose valtype is `i32` and whose
 /// initializer is `i32.const N end` is stored with its constant. A global
-/// with any other valtype or initializer form is skipped but still occupies
-/// its position, which `WasmGlobal::index` counts; once an initializer of
-/// unknown length is met the rest of the section is left unread. A
-/// truncated section yields what parsed so far.
+/// with another valtype and an `i32.const N end` initializer is skipped but
+/// still occupies its position, which `WasmGlobal::index` counts. An
+/// initializer that is not `i32.const N end`, including a wrong end byte,
+/// stops the section with the rest left unread; a truncated section yields
+/// what parsed so far.
 fn decode_globals(payload: &[u8]) -> Result<Vec<WasmGlobal>> {
     let mut r = Reader::new(payload);
     let count = r.read_u32_leb()?;
@@ -786,12 +787,16 @@ fn decode_globals(payload: &[u8]) -> Result<Vec<WasmGlobal>> {
             let mutable = r.read_u8().ok()? == 1;
             let op = r.read_u8().ok()?;
             if op != 0x41 {
-                return Some(None);
+                // An initializer of unknown length: the rest of the section
+                // is left unread.
+                return None;
             }
             let init = r.read_i32_leb().ok()?;
             let end = r.read_u8().ok()?;
             if end != 0x0b {
-                return Some(None);
+                // A wrong end byte stops the section the way a truncated
+                // initializer does, keeping the globals that parsed.
+                return None;
             }
             if valtype == 0x7f {
                 return Some(Some(WasmGlobal {
@@ -1969,11 +1974,26 @@ mod tests {
     #[test]
     fn a_global_beyond_i32_const_init_stores_nothing_and_does_not_fail() {
         // Two globals: the first is i32 with a global.get initializer (0x23,
-        // index 0, end); the second is a plain i32.const. Neither the unknown
-        // form nor anything after it is stored, and the inspect succeeds.
+        // index 0, end); the second is a plain i32.const. An initializer of
+        // unknown length stops the section: neither the unknown form nor the
+        // following i32.const is stored, and the inspect succeeds.
         let m = inspect(&hex("0061736d01000000060b027f0023000b7f0041050b")).unwrap();
         assert_eq!(m.sections, vec![6]);
         assert!(m.globals.is_empty());
+
+        // A wrong end byte stops the section too: the complete first global
+        // stays, and the global after it is not stored.
+        let m = inspect(&hex("0061736d010000000610037f00410b0b7f004101007f0041090b")).unwrap();
+        assert_eq!(m.sections, vec![6]);
+        assert_eq!(
+            m.globals,
+            vec![WasmGlobal {
+                valtype: "i32".into(),
+                mutable: false,
+                init: 11,
+                index: 0,
+            }]
+        );
 
         // An i64 global with an i32.const initializer stores nothing; the
         // valtype, not the initializer, is the gate.

@@ -361,10 +361,10 @@ mod tests {
         );
         // A truncated immediate stops the listing the way a truncated
         // `ldc.i4` does: nothing after it, no partial operand. The body
-        // must END inside the immediate — codesize 2 holding only
-        // `FE 0C` — for the stop to be reached; a longer body keeps the
-        // `ldloc`.
-        assert!(il_ops(&[0x08, 0xfe, 0x0c]).is_empty());
+        // must END inside the immediate — a codesize-2 tiny body holding
+        // only `FE 0C` (header `0x0A`) — for the stop to be reached; a
+        // longer body keeps the `ldloc`.
+        assert!(il_ops(&[0x0a, 0xfe, 0x0c]).is_empty());
         assert!(il_ops(&[0x0e, 0xfe, 0x0c, 0x05]).is_empty());
         // The same shape with the full immediate keeps the `ldloc`.
         assert_eq!(
