@@ -107,6 +107,8 @@ pub struct ClrHeader {
     pub assembly_refs: Vec<ClrAssembly>,
     /// `ModuleRef` names, in table order.
     pub module_refs: Vec<String>,
+    /// One `ClrConstant` per `Constant` row, in table order. Empty when the table is absent or a row does not fit.
+    pub constants: Vec<ClrConstant>,
 }
 
 /// A metadata blob: its byte length plus hex of at most the first 32 bytes.
@@ -116,6 +118,17 @@ pub struct ClrBlob {
     pub len: usize,
     /// Lowercase hex of the first 32 bytes.
     pub hex: String,
+}
+
+/// One `Constant` row: the element-type name, the `HasConstant` parent, and the value blob. The value is not evaluated.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ClrConstant {
+    /// The element-type byte as `sig_type` names that tag (`int32`, `string`, and the rest of its match). A tag the single byte cannot name stays empty.
+    pub kind: String,
+    /// `Field#N`, `Param#N`, or `Property#N` from the `HasConstant` coded index. Any other tag stays empty.
+    pub parent: String,
+    /// The value blob: length plus hex of at most the first 32 bytes. `None` for blob index 0 or a blob that does not fit.
+    pub value: Option<ClrBlob>,
 }
 
 /// Version numbers, name, culture, public-key blob, hash-algorithm id, flags word, and hash-value blob from one `Assembly` or `AssemblyRef` row.
@@ -461,6 +474,7 @@ fn parse_clr(header: &[u8], file: &[u8], metadata_off: Option<usize>) -> Option<
         assemblies: meta.assemblies,
         assembly_refs: meta.assembly_refs,
         module_refs: meta.module_refs,
+        constants: meta.constants,
     })
 }
 
@@ -706,6 +720,7 @@ struct MetaRead {
     assemblies: Vec<ClrAssembly>,
     assembly_refs: Vec<ClrAssembly>,
     module_refs: Vec<String>,
+    constants: Vec<ClrConstant>,
 }
 
 impl MetaRead {
@@ -724,13 +739,14 @@ impl MetaRead {
             assemblies: Vec::new(),
             assembly_refs: Vec::new(),
             module_refs: Vec::new(),
+            constants: Vec::new(),
         }
     }
 }
 
 /// `Module`, `TypeRef`, and `TypeDef` names, plus `Field` and `MethodDef` names on each `TypeDef`, `Param` names on each method, `MemberRef` names, and `InterfaceImpl` names on each `TypeDef`.
 ///
-/// `FieldPtr`, `MethodPtr`, and `ParamPtr` rows are read by row size and reorder the `Field`, `MethodDef`, and `Param` names through their one index per row; a pointer table shorter than its list, or an index past the list, leaves the row order in place and does not fail the parse. `InterfaceImpl` rows are read, which keeps later tables aligned the same way a skip does. String, blob, and coded-index widths follow the `#~` heap-size byte and the row counts. A row that does not fit ends the list and keeps the names already read. Each `MemberRef` row also records its `MemberRefParent` coded index resolved against the name lists; a parent that does not resolve leaves the field empty. `Assembly` and `AssemblyRef` rows carry their version numbers, culture, public-key blob, and flags word through `enrich_metadata`; `Assembly` rows also carry the hash-algorithm id, and `AssemblyRef` rows also carry the `HashValue` blob, rendered length-plus-hex. Each `StandAloneSig` row records the `method_sig` text of its blob in `standalone_sigs`. Signatures, RVAs, and IL are not read.
+/// `FieldPtr`, `MethodPtr`, and `ParamPtr` rows are read by row size and reorder the `Field`, `MethodDef`, and `Param` names through their one index per row; a pointer table shorter than its list, or an index past the list, leaves the row order in place and does not fail the parse. `InterfaceImpl` rows are read, which keeps later tables aligned the same way a skip does. String, blob, and coded-index widths follow the `#~` heap-size byte and the row counts. A row that does not fit ends the list and keeps the names already read. Each `MemberRef` row also records its `MemberRefParent` coded index resolved against the name lists; a parent that does not resolve leaves the field empty. `Assembly` and `AssemblyRef` rows carry their version numbers, culture, public-key blob, and flags word through `enrich_metadata`; `Assembly` rows also carry the hash-algorithm id, and `AssemblyRef` rows also carry the `HashValue` blob, rendered length-plus-hex. Each `StandAloneSig` row records the `method_sig` text of its blob in `standalone_sigs`. Each `Constant` row records the `sig_type` name of its element-type byte, its `HasConstant` parent as `Field#N` / `Param#N` / `Property#N`, and its value blob rendered length-plus-hex; the value is not evaluated. Signatures, RVAs, and IL are not read.
 fn read_metadata_names(
     file: &[u8],
     metadata_off: Option<usize>,
@@ -1067,7 +1083,7 @@ fn read_metadata_names(
     }
     attach_interfaces(&mut out, &typedefs, &interfaces);
     let blobs = stream_bytes(file, root, streams, "#Blob");
-    let (member_ref_signatures, assemblies, assembly_refs, module_refs, typespec_signatures, standalone_sigs) =
+    let (member_ref_signatures, assemblies, assembly_refs, module_refs, typespec_signatures, standalone_sigs, constants) =
         enrich_metadata(&mut out, &member_refs, blobs, blob, strings, &field_ptrs, &method_ptrs);
     MetaRead {
         types: out,
@@ -1079,10 +1095,11 @@ fn read_metadata_names(
         assemblies,
         assembly_refs,
         module_refs,
+        constants,
     }
 }
 
-/// Field and method signatures, assembly, assembly-ref, and module-ref rows, properties, events, and `StandAloneSig` blobs. A row that does not fit keeps what was already read. `field_ptrs` and `method_ptrs` reorder the signature and RVA records the same way the names were reordered, so each record stays on its row.
+/// Field and method signatures, assembly, assembly-ref, and module-ref rows, properties, events, `StandAloneSig` blobs, and `Constant` rows. A row that does not fit keeps what was already read. `field_ptrs` and `method_ptrs` reorder the signature and RVA records the same way the names were reordered, so each record stays on its row.
 fn enrich_metadata(
     types: &mut [ClrType],
     member_refs: &[String],
@@ -1098,18 +1115,19 @@ fn enrich_metadata(
     Vec<String>,
     Vec<Option<String>>,
     Vec<Option<String>>,
+    Vec<ClrConstant>,
 ) {
     let none_sigs = vec![None; member_refs.len()];
     if tilde.len() < 24 {
-        return (none_sigs, Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        return (none_sigs, Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     }
     let valid = u64::from_le_bytes(tilde[8..16].try_into().unwrap());
     let count = valid.count_ones() as usize;
     let Some(header_end) = count.checked_mul(4).and_then(|n| n.checked_add(24)) else {
-        return (none_sigs, Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        return (none_sigs, Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     };
     if tilde.len() < header_end {
-        return (none_sigs, Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        return (none_sigs, Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     }
     let str_w = if tilde[6] & 1 != 0 { 4 } else { 2 };
     let guid_w = if tilde[6] & 2 != 0 { 4 } else { 2 };
@@ -1227,6 +1245,8 @@ fn enrich_metadata(
     let mut typespec_sigs = Vec::new();
     // One method-signature text per StandAloneSig row, from `method_sig`.
     let mut standalone_sigs = Vec::new();
+    // One row per Constant row: element-type name, HasConstant parent, value blob.
+    let mut constants = Vec::new();
     let mut event_maps = Vec::new();
     let mut property_maps = Vec::new();
     // Name and signature from the blob, per Event row.
@@ -1289,6 +1309,29 @@ fn enrich_metadata(
                         )
                     });
                     member_sigs.push(sig);
+                }
+                11 => {
+                    // A `Constant` row: the element-type byte is named by
+                    // `sig_type`'s own match on the single byte; a tag whose
+                    // name needs more bytes stays empty. `HasConstant` is a
+                    // two-bit coded index over Field, Param, and Property.
+                    // The value blob is length-plus-hex; index 0 or a blob
+                    // that does not fit stays empty. The value is not
+                    // evaluated.
+                    let kind = crate::clr_sig::sig_type(&row[..1], 0, 0)
+                        .map(|(text, _)| text)
+                        .unwrap_or_default();
+                    let coded = read_index(row, 2, has_constant_w);
+                    let parent = match (coded & 0x3, coded >> 2) {
+                        (0, n) if n != 0 => format!("Field#{n}"),
+                        (1, n) if n != 0 => format!("Param#{n}"),
+                        (2, n) if n != 0 => format!("Property#{n}"),
+                        _ => String::new(),
+                    };
+                    let value = blobs
+                        .and_then(|heap| heap_blob(heap, read_index(row, 2 + has_constant_w, blob_w)))
+                        .map(render_blob);
+                    constants.push(ClrConstant { kind, parent, value });
                 }
                 17 => {
                     // A StandAloneSig blob is the `MethodSig` text `method_sig`
@@ -1438,7 +1481,7 @@ fn enrich_metadata(
     } else {
         none_sigs
     };
-    (signatures, assemblies, assembly_refs, module_refs, typespec_sigs, standalone_sigs)
+    (signatures, assemblies, assembly_refs, module_refs, typespec_sigs, standalone_sigs, constants)
 }
 
 fn attach_mapped(
@@ -2965,6 +3008,99 @@ mod tests {
         assert_eq!(meta.assemblies[0].flags, 5);
     }
 
+    #[test]
+    fn clr_constant_rows_decode_type_parent_and_blob() {
+        // Five Constant rows: an int32 on Field#1, a string on Param#2, a
+        // float64 on Property#3 with blob index 0, an unknown type byte with
+        // parent tag 3 and a blob that does not fit, and a class-tagged row
+        // (the single byte names nothing) with an index past the heap.
+        let mut tilde = tilde_header(1u64 << 11, &[5]);
+        for (tag, parent, blob) in
+            [(0x08u8, 4u16, 1u16), (0x0e, 9, 6), (0x0d, 14, 0), (0x55, 19, 9), (0x12, 0, 50)]
+        {
+            tilde.push(tag);
+            tilde.push(0);
+            tilde.extend_from_slice(&parent.to_le_bytes());
+            tilde.extend_from_slice(&blob.to_le_bytes());
+        }
+        let names = vec![0u8];
+        let mut blobs = vec![0u8];
+        // index 1: length 4, four payload bytes.
+        blobs.extend_from_slice(&[0x04, 0xAA, 0xBB, 0xCC, 0xDD]);
+        // index 6: length 1, one payload byte.
+        blobs.extend_from_slice(&[0x01, 0x2A]);
+        // index 9: claims 5 bytes but carries 1 — does not fit.
+        blobs.extend_from_slice(&[0x05, 0x01]);
+        let (file, streams) = with_blobs(&tilde, &names, &blobs);
+        let meta = read_metadata_names(&file, Some(0), &streams);
+        assert_eq!(
+            meta.constants,
+            vec![
+                ClrConstant {
+                    kind: "int32".into(),
+                    parent: "Field#1".into(),
+                    value: Some(ClrBlob { len: 4, hex: "aabbccdd".into() }),
+                },
+                ClrConstant {
+                    kind: "string".into(),
+                    parent: "Param#2".into(),
+                    value: Some(ClrBlob { len: 1, hex: "2a".into() }),
+                },
+                ClrConstant {
+                    kind: "float64".into(),
+                    parent: "Property#3".into(),
+                    value: None,
+                },
+                ClrConstant {
+                    kind: String::new(),
+                    parent: String::new(),
+                    value: None,
+                },
+                ClrConstant {
+                    kind: String::new(),
+                    parent: String::new(),
+                    value: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn clr_constant_width_stays_type_byte_parent_and_blob() {
+        // A Constant row next to an Assembly row: the 11 => 2 + has_constant_w
+        // + blob_w width is unchanged, so the Assembly row parses on its own
+        // layout. A parent coded row of 0 stays empty.
+        let mut tilde = tilde_header((1u64 << 11) | (1u64 << 32), &[1, 1]);
+        // Constant: type int32, pad, parent coded 0 (tag 0, row 0), blob index 1.
+        tilde.extend_from_slice(&[0x08, 0x00]);
+        tilde.extend_from_slice(&0u16.to_le_bytes());
+        tilde.extend_from_slice(&1u16.to_le_bytes());
+        // Assembly: hash alg id, four version numbers, flags, public key blob
+        // index 0, name, culture.
+        tilde.extend_from_slice(&0u32.to_le_bytes());
+        tilde.extend_from_slice(&[1u8, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0]);
+        tilde.extend_from_slice(&0u32.to_le_bytes());
+        tilde.extend_from_slice(&0u16.to_le_bytes());
+        tilde.extend_from_slice(&0u16.to_le_bytes());
+        let names = vec![0u8];
+        let mut blobs = vec![0u8];
+        blobs.extend_from_slice(&[0x04, 0x00, 0x01, 0x01, 0x08]);
+        let (file, streams) = with_blobs(&tilde, &names, &blobs);
+        let meta = read_metadata_names(&file, Some(0), &streams);
+        assert_eq!(
+            meta.constants,
+            vec![ClrConstant {
+                kind: "int32".into(),
+                parent: String::new(),
+                value: Some(ClrBlob { len: 4, hex: "00010108".into() }),
+            }]
+        );
+        assert_eq!(meta.assemblies.len(), 1);
+        assert_eq!(meta.assemblies[0].name, "");
+        assert_eq!(meta.assemblies[0].major_version, 1);
+        assert_eq!(meta.assemblies[0].flags, 5);
+    }
+
     fn clr_method(name: &str, params: &[(&str, u16)]) -> ClrMethod {
         ClrMethod {
             name: name.to_string(),
@@ -3087,6 +3223,7 @@ mod tests {
             assemblies: Vec::new(),
             assembly_refs: Vec::new(),
             module_refs: Vec::new(),
+            constants: Vec::new(),
         };
         attach_il(&mut header, &file, &[section]);
         let types = &header.types;
