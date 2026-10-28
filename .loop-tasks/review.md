@@ -1,17 +1,15 @@
-# Iteration 9 review
+# Iteration 10 review
 
-Commits `3ca1d94`..`08767cb` on `tasks-loop-9`. A clean rebuild (`cargo clean -p rea-core -p rea-cli -p rea-mcp`, then `cargo test --workspace --offline`) printed no rustc warnings and passed: rea-core 311, rea-mcp 15, rea-cli 5. Those counts match `docs/rea-rs-review.html` line 157. `rea strings /bin/ls --xrefs --min-length 6` is 20 and `rea callgraph /bin/ls` is 143 functions / 499 edges, matching the `561efd3` row. A 2466-input probe of short global sections, tiny IL bodies, Swift names, and hostile xref windows did not panic.
-
-Task 1. `demangle::swift` renders `module.name()` only when the tail is exactly `yyF` (`demangle.rs:55`). `$s4main3fooyyFy` stays `main.foo`, so a prefix check would fail the test. `swift_path` strips the parentheses; headers print `/* main.foo */` and ObjC `module_name` stays `main.foo` (`macho_meta.rs:305`, `headers.rs:17`).
-
-Task 2. `0xFE` `0x09`–`0x0E` take a little-endian `u16` and the walk continues (`clr_sig.rs:114`). `il_ops(&[0x0a, 0xfe, 0x0c])` is a codesize-2 tiny body that reaches `at + 2 > code.len()`; deleting the guard panics. `ldftn` stays `op-fe-06`. The 48-opcode cap is unchanged.
-
-Task 3. Defined `i32` / `i32.const N end` globals are stored with section index, and `--wat-full` prints `(global $n …)` (`wasm.rs:557`). A skipped non-`i32` still occupies its index (`a_skipped_global_still_occupies_its_wasm_index`). An opcode other than `0x41`, and a wrong end byte, stop the section (`wasm.rs:789`, `wasm.rs:796`). The unknown-opcode fixture `02 7f 00 23 7f 00 41 05 0b` ends in a real `i32.const` global, so continuing past `0x23` would store init 5 and fail the empty assertion. A truncated initializer keeps the globals already parsed. A second global section is `duplicate wasm global section`. `execute` does not read the global.
-
-Task 4. `der_slot_is_a_size_only` feeds `30 82 04 10 02 01 01`, a SEQUENCE around an INTEGER, not UTF8String pairs. The speculative stop applies. `macho_meta.rs:370` stores only `entitlements_der_size`. The `rea macho` Reads cell, Stops-before cell, measured row, and coverage cell say the payload stays unparsed.
-
-Task 5. On a 64-bit target, `data_xrefs` adds a 4-byte aligned low-32 hit when `addr` fits in a `u32` and that `from` is not already an 8-byte hit (`analysis.rs:733`). The aligned fixture `08 10 00 00 ff ff ff ff` at VA `0x1000` fails if the low-32 path is removed. The unaligned fixture has `08 10 00 00` at VA `0x1001` and fails if `from % 4 == 0` is removed. `0x1_0000_0001` fails if the `u32` guard is removed. The 8-byte, 32-bit, and PC-relative paths are unchanged.
+`cargo test --workspace --offline` exited 0: rea-core 322 passed, rea-mcp 15 passed, rea-cli 5 passed (2+1+1+1), 0 ignored. A clean `cargo build -p rea-core --offline --tests` printed no warnings. The banner and the Done rows match the `#[test]` counts at those commits: `6ba1dbe` 317, `e0de3aa` 319, `354a128` 321, `43d943e` 322. Base was 311.
 
 No blocking findings.
+
+- Task 1. `parse_gnu_properties` names `0xc0000000` as `aarch64 feature 1` with bit 0 `BTI` and bit 1 `PAC`, joined `" and "` the same way as `IBT and SHSTK` (`elf_meta.rs:219-237`). Zero named bits are skipped; other types stay hex. `aarch64_feature_1_names_bti_and_pac` and the standing ELF fixture fail if that arm is removed. Slices use `get`.
+- Task 2. `read_i32_offset` accepts `i32.const` and `global.get` (`wasm.rs:1056-1067`). A third opcode, or flags other than 0, still errors and `inspect` drops the section (`wasm.rs:256-269`). `--wat-full` prints `(global.get N)` only when `offset_is_global` is set. `execute` does not read the segment. `a_global_get_offset_stores_the_global_index_and_wat_full_prints_it` indexes `elements[0]` and fails if the section is dropped.
+- Task 3. `call`, `callvirt`, `ldstr`, and `newobj` print a 4-byte little-endian token as `0x{token:08x}` and keep walking; `at + 4 > code.len()` stops with no partial operand (`clr_sig.rs:149-156`). `calli` (`0x29`) and `ldftn` (`FE 06`) still stop. The 48-opcode cap is unchanged (`clr_sig.rs:84`). Tokens are not resolved.
+- Task 4. Table 27 stays `blob_w` (`pe_meta.rs:1190`). Each row stores `sig_type` text or `None` (`pe_meta.rs:1320-1328`); index 0, a short blob, and `0x15` stay empty and do not fail the parse. `InterfaceImpl` / `MemberRef` labels stay `typespec-N` / `TypeSpec#N`. Generic inst is not added. `heap_blob` and `sig_type` use `get`; depth still caps at 64.
+- Task 5. `expand_zero_filled` runs after iterated expansion and before fixups (`loader.rs:114-116`). Flag 3 fills only the object's remainder (`le.rs:533-546`); flag 0, flag 1, page 0, and any other flag are not filled. `translate` serves a flag-3 page only after the slot is marked (`le.rs:91-93`). `zero_filled_expansion_stops_at_the_object_remainder` fails if the fill uses the page size: the object is 16 bytes at `0x140` and `b[0x150]` is `0xAA`. The loader test fails if the load path skips the fill or the fixup. No decompressor and no `rea funcs` seed.
+
+README and `docs/rea-rs-review.html` name the same limits: four token opcodes as unresolved hex, one `sig_type` string per TypeSpec row, `global.get` offsets only, `aarch64 feature 1` for this property type, and zero-filled pages with other flags still refused.
 
 VERDICT: PASS
