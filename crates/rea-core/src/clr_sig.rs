@@ -72,7 +72,9 @@ pub fn property_sig(heap: &[u8], index: u32) -> Option<String> {
 /// Two-byte `0xFE` opcodes that take no operand are named, and `0xFE`
 /// second bytes `0x09`–`0x0E` take a little-endian `u16` immediate; any
 /// other unknown byte, including an unmapped `0xFE` second byte, stops the
-/// listing. An unmapped or truncated body is empty.
+/// listing. The one-byte token opcodes `call` (`0x28`), `callvirt` (`0x6F`),
+/// `ldstr` (`0x72`), and `newobj` (`0x73`) print their 4-byte little-endian
+/// metadata token as hex. An unmapped or truncated body is empty.
 pub fn il_ops(bytes: &[u8]) -> Vec<String> {
     let Some((code, _size)) = il_code(bytes) else {
         return Vec::new();
@@ -144,6 +146,15 @@ pub fn il_ops(bytes: &[u8]) -> Vec<String> {
             out.push(format!("{name} {imm}"));
             continue;
         }
+        if matches!(name, "call" | "callvirt" | "ldstr" | "newobj") {
+            if at + 4 > code.len() {
+                break;
+            }
+            let token = u32::from_le_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]]);
+            at += 4;
+            out.push(format!("{name} 0x{token:08x}"));
+            continue;
+        }
         out.push(name.to_string());
         if name == "ret" {
             break;
@@ -200,6 +211,8 @@ fn opcode(op: u8) -> Option<&'static str> {
         0x1f => "ldc.i4.m1",
         0x20 => "ldc.i4.s",
         0x21 => "ldc.i4",
+        // Token opcodes: a 4-byte little-endian metadata token follows.
+        0x28 => "call",
         0x2a => "ret",
         0x25 => "dup",
         0x26 => "pop",
@@ -214,6 +227,9 @@ fn opcode(op: u8) -> Option<&'static str> {
         0x65 => "neg",
         0x66 => "not",
         0x69 => "conv.i4",
+        0x6f => "callvirt",
+        0x72 => "ldstr",
+        0x73 => "newobj",
         // ECMA-335: ckfinite is the one-byte opcode 0xC3, not a 0xFE prefix.
         0xc3 => "ckfinite",
         0x7a => "throw",
@@ -238,7 +254,9 @@ fn compressed(bytes: &[u8], at: usize) -> Option<(u32, usize)> {
     None
 }
 
-fn sig_type(bytes: &[u8], at: usize, depth: u32) -> Option<(String, usize)> {
+/// One signature-type node at `at`, as `sig_type` renders it. `pub(crate)` so
+/// `pe_meta` can decode TypeSpec blob payloads with the same element parser.
+pub(crate) fn sig_type(bytes: &[u8], at: usize, depth: u32) -> Option<(String, usize)> {
     // Nested ptr/byref/szarray wrappers recurse; cap the depth so a hostile
     // blob of thousands of `0x0f` bytes cannot overflow the stack.
     if depth > 64 {
@@ -403,6 +421,57 @@ mod tests {
         // the walk the way `ret` does — bytes after it in a malformed body
         // keep being walked under the same rules.
         assert_eq!(il_ops(&[0x06, 0x27]), vec!["op-27".to_string()]);
+        assert_eq!(il_ops(&[0x0a, 0xfe, 0x06]), vec!["op-fe-06".to_string()]);
+    }
+
+    #[test]
+    fn token_opcodes_print_their_token_as_hex() {
+        // Each one-byte token opcode takes a 4-byte little-endian metadata
+        // token, printed as 8 lowercase hex digits, and keeps walking.
+        // codesize 6: call 0x06000001 (MethodDef row 1), then ret.
+        assert_eq!(
+            il_ops(&[0x1a, 0x28, 0x01, 0x00, 0x00, 0x06, 0x2a]),
+            vec!["call 0x06000001".to_string(), "ret".to_string()]
+        );
+        for (byte, name) in [
+            (0x28u8, "call"),
+            (0x6f, "callvirt"),
+            (0x72, "ldstr"),
+            (0x73, "newobj"),
+        ] {
+            // codesize 5: the opcode, token 0x7a000001 (MemberRef row 1... any
+            // token prints as its hex), nothing else.
+            let body = [byte, 0x01, 0x00, 0x00, 0x7a];
+            let mut fixture = vec![((5u8) << 2) | 0x02];
+            fixture.extend_from_slice(&body);
+            assert_eq!(
+                il_ops(&fixture),
+                vec![format!("{name} 0x7a000001")],
+                "opcode {:#04x}", byte
+            );
+        }
+        // A truncated token stops the listing the way a truncated `ldc.i4`
+        // does: nothing after it, no partial operand. The body must END
+        // inside the immediate — a codesize-2 tiny body holding only `28 01`
+        // (header `0x0A`).
+        assert!(il_ops(&[0x0a, 0x28, 0x01]).is_empty());
+        // Truncation after earlier instructions keeps them: codesize 4 —
+        // dup, then a `newobj` whose token is cut at two of four bytes.
+        assert_eq!(
+            il_ops(&[0x12, 0x25, 0x73, 0x01, 0x00]),
+            vec!["dup".to_string()]
+        );
+        // A full token after a walked-on instruction keeps both: codesize 7 —
+        // dup, newobj 0x0a000001, ret.
+        assert_eq!(
+            il_ops(&[0x1e, 0x25, 0x73, 0x01, 0x00, 0x00, 0x0a, 0x2a]),
+            vec!["dup".to_string(), "newobj 0x0a000001".to_string(), "ret".to_string()]
+        );
+        // Any other token-taking opcode not in the named set still stops at
+        // the marker: `calli` (0x29) takes a signature token but is not
+        // named here, so it stops instead of printing one.
+        assert_eq!(il_ops(&[0x0a, 0x29, 0x01]), vec!["op-29".to_string()]);
+        // The `0xFE` token opcodes, including `ldftn` (0x06), still stop.
         assert_eq!(il_ops(&[0x0a, 0xfe, 0x06]), vec!["op-fe-06".to_string()]);
     }
 

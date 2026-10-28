@@ -1,5 +1,6 @@
 //! WebAssembly binary inspector. Parses imports, exports, type signatures, function
-//! bodies as opcode names, element and data segments, defined `i32` globals whose
+//! bodies as opcode names, element and data segments (offsets of `i32.const` or
+//! `global.get`), defined `i32` globals whose
 //! initializer is `i32.const`, and a capped custom payload.
 //! Memory limits carry the shared flag, and imported memories keep their limits.
 //! `execute` runs an exported function that stays inside i32 locals, with a step cap.
@@ -66,15 +67,23 @@ pub struct WasmBody {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct WasmElem {
-    /// Offset from the segment's leading `i32.const`.
+    /// Offset from the segment's leading `i32.const`, or the global index
+    /// when the offset expression is `global.get`.
     pub offset: i32,
+    /// True when the offset expression is `global.get X end`: `offset` is
+    /// then the global index, not a constant.
+    pub offset_is_global: bool,
     pub functions: Vec<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct WasmData {
-    /// Offset from the segment's leading `i32.const`.
+    /// Offset from the segment's leading `i32.const`, or the global index
+    /// when the offset expression is `global.get`.
     pub offset: i32,
+    /// True when the offset expression is `global.get X end`: `offset` is
+    /// then the global index, not a constant.
+    pub offset_is_global: bool,
     /// Segment bytes, at most 256.
     pub bytes: Vec<u8>,
 }
@@ -120,7 +129,7 @@ pub struct WasmModule {
     pub functions: u32,
     /// Opcode listing of each code-section body. A body that does not fit is omitted.
     pub bodies: Vec<WasmBody>,
-    /// Active element segments whose offset is `i32.const`. A segment that does not fit is omitted.
+    /// Active element segments whose offset is `i32.const` or `global.get`. A segment that does not fit is omitted.
     pub elements: Vec<WasmElem>,
     /// Active data segments. Bytes are capped. A segment that does not fit is omitted.
     pub data: Vec<WasmData>,
@@ -468,8 +477,10 @@ pub fn wat(module: &WasmModule) -> String {
 /// element and data segments carry their offsets, and function bodies are
 /// `(func $i ...)` with local groups and mnemonic instructions. An unknown opcode degrades to an inline `(; opcode 0xNN ;)`
 /// comment, so the nesting stays balanced. Still not a writer for undecoded
-/// things: global initializers that are not `i32.const`, non-`i32.const`
-/// segment offsets, and memory-init forms stay unrecovered.
+/// things: global initializers that are not `i32.const`
+/// and memory-init forms stay unrecovered. An offset expression that is
+/// neither `i32.const` nor `global.get` drops its whole section, so nothing
+/// of it is emitted.
 pub fn wat_full(module: &WasmModule) -> String {
     let mut out = String::from("(module\n");
     let imported_funcs = module
@@ -593,9 +604,13 @@ pub fn wat_full(module: &WasmModule) -> String {
             9 => {
                 for (i, elem) in module.elements.iter().enumerate() {
                     let funcs: Vec<String> = elem.functions.iter().map(|f| f.to_string()).collect();
+                    let offset = if elem.offset_is_global {
+                        format!("(global.get {})", elem.offset)
+                    } else {
+                        format!("(i32.const {})", elem.offset)
+                    };
                     out.push_str(&format!(
-                        "  (elem (;{i};) (i32.const {}) func {})\n",
-                        elem.offset,
+                        "  (elem (;{i};) {offset} func {})\n",
                         funcs.join(" ")
                     ));
                 }
@@ -628,9 +643,13 @@ pub fn wat_full(module: &WasmModule) -> String {
                 for (i, segment) in module.data.iter().enumerate() {
                     let bytes: Vec<String> =
                         segment.bytes.iter().map(|b| format!("\\{b:02x}")).collect();
+                    let offset = if segment.offset_is_global {
+                        format!("(global.get {})", segment.offset)
+                    } else {
+                        format!("(i32.const {})", segment.offset)
+                    };
                     out.push_str(&format!(
-                        "  (data (;{i};) (i32.const {}) \"{}\")\n",
-                        segment.offset,
+                        "  (data (;{i};) {offset} \"{}\")\n",
                         bytes.join("")
                     ));
                 }
@@ -987,13 +1006,17 @@ fn decode_elements(payload: &[u8]) -> Result<Vec<WasmElem>> {
         if flags != 0 {
             return Err(Error::Parse("wasm element flags are unread".into()));
         }
-        let offset = read_i32_offset(&mut r)?;
+        let (offset, offset_is_global) = read_i32_offset(&mut r)?;
         let n = r.read_u32_leb()?;
         let mut functions = Vec::new();
         for _ in 0..n {
             functions.push(r.read_u32_leb()?);
         }
-        out.push(WasmElem { offset, functions });
+        out.push(WasmElem {
+            offset,
+            offset_is_global,
+            functions,
+        });
     }
     if !r.eof() {
         return Err(Error::Parse("trailing bytes in wasm element section".into()));
@@ -1010,12 +1033,13 @@ fn decode_data(payload: &[u8]) -> Result<Vec<WasmData>> {
         if flags != 0 {
             return Err(Error::Parse("wasm data flags are unread".into()));
         }
-        let offset = read_i32_offset(&mut r)?;
+        let (offset, offset_is_global) = read_i32_offset(&mut r)?;
         let n = r.read_u32_leb()? as usize;
         let bytes = r.read_bytes(n)?;
         let cap = bytes.len().min(256);
         out.push(WasmData {
             offset,
+            offset_is_global,
             bytes: bytes[..cap].to_vec(),
         });
     }
@@ -1025,18 +1049,22 @@ fn decode_data(payload: &[u8]) -> Result<Vec<WasmData>> {
     Ok(out)
 }
 
-/// Reads the segment's `i32.const N end` offset expression and returns `N`.
-fn read_i32_offset(r: &mut Reader<'_>) -> Result<i32> {
+/// Reads the segment's offset expression and returns the value and whether it
+/// came from `global.get`: either `i32.const N end` (a constant) or
+/// `global.get X end` (`0x23`, a u32 leb global index, `0x0b`). Any other
+/// expression is an error and drops the section.
+fn read_i32_offset(r: &mut Reader<'_>) -> Result<(i32, bool)> {
     let op = r.read_u8()?;
-    if op != 0x41 {
-        return Err(Error::Parse("wasm offset is not i32.const".into()));
-    }
-    let value = r.read_i32_leb()?;
+    let offset = match op {
+        0x41 => r.read_i32_leb()?,
+        0x23 => r.read_u32_leb()? as i32,
+        _ => return Err(Error::Parse("wasm offset is not i32.const".into())),
+    };
     let end = r.read_u8()?;
     if end != 0x0b {
         return Err(Error::Parse("wasm offset expression does not end".into()));
     }
-    Ok(value)
+    Ok((offset, op == 0x23))
 }
 
 fn interpret(ops: &[Op], args: &[i32], all: &[Vec<Op>], imports: &[String]) -> Result<Vec<i32>> {
@@ -1865,6 +1893,64 @@ mod tests {
         assert_eq!(data.data[0].bytes, vec![0xab, 0xcd]);
         let ignored = inspect(&hex("0061736d010000000903010000")).unwrap();
         assert!(ignored.elements.is_empty());
+    }
+
+    #[test]
+    fn a_global_get_offset_stores_the_global_index_and_wat_full_prints_it() {
+        // Element: flags 0, global.get 1 end, one function 2.
+        let elems = inspect(&hex("0061736d010000000907010023010b0102")).unwrap();
+        assert_eq!(elems.elements[0].offset, 1);
+        assert!(elems.elements[0].offset_is_global);
+        let text = wat_full(&elems);
+        assert!(parens_balanced(&text));
+        assert!(text.contains("  (elem (;0;) (global.get 1) func 2)\n"));
+
+        // Data: flags 0, global.get 3 end, bytes ab cd.
+        let data = inspect(&hex("0061736d010000000b08010023030b02abcd")).unwrap();
+        assert_eq!(data.data[0].offset, 3);
+        assert!(data.data[0].offset_is_global);
+        let text = wat_full(&data);
+        assert!(parens_balanced(&text));
+        assert!(text.contains("  (data (;0;) (global.get 3) \"\\ab\\cd\")\n"));
+    }
+
+    #[test]
+    fn an_offset_that_is_neither_form_drops_the_section() {
+        // Element offset expression `unreachable end`: neither i32.const nor
+        // global.get. The section is dropped and the inspect still succeeds.
+        let elems = inspect(&hex("0061736d0100000009060100000b0102")).unwrap();
+        assert!(elems.elements.is_empty());
+        assert_eq!(elems.sections, vec![9]);
+
+        // The same shape on the data section.
+        let data = inspect(&hex("0061736d010000000b060100000b01ab")).unwrap();
+        assert!(data.data.is_empty());
+        assert_eq!(data.sections, vec![11]);
+    }
+
+    #[test]
+    fn element_and_data_flags_other_than_zero_stay_unread() {
+        // One segment with flags 1.
+        let err = decode_elements(&hex("010101")).unwrap_err();
+        assert!(matches!(&err, Error::Parse(msg) if msg == "wasm element flags are unread"));
+
+        let err = decode_data(&hex("010101")).unwrap_err();
+        assert!(matches!(&err, Error::Parse(msg) if msg == "wasm data flags are unread"));
+    }
+
+    #[test]
+    fn execute_ignores_a_global_get_segment() {
+        // Type () -> i32, one defined function, export "f" func 0, body
+        // i32.const 7 end, and an element segment offset by global.get 0.
+        let bytes = hex(
+            "0061736d01000000\
+             0105016000017f\
+             03020100\
+             07050101660000\
+             0a0601040041070b\
+             0907010023000b0100",
+        );
+        assert!(matches!(&execute(&bytes, "f", &[]), Ok(v) if v == &[7]));
     }
 
     #[test]
