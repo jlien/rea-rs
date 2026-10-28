@@ -109,6 +109,8 @@ pub struct ClrHeader {
     pub module_refs: Vec<String>,
     /// One `ClrConstant` per `Constant` row, in table order. Empty when the table is absent or a row does not fit.
     pub constants: Vec<ClrConstant>,
+    /// One `ClrCustomAttribute` per `CustomAttribute` row, in table order. Empty when the table is absent or a row does not fit.
+    pub custom_attributes: Vec<ClrCustomAttribute>,
 }
 
 /// A metadata blob: its byte length plus hex of at most the first 32 bytes.
@@ -127,6 +129,18 @@ pub struct ClrConstant {
     pub kind: String,
     /// `Field#N`, `Param#N`, or `Property#N` from the `HasConstant` coded index. Any other tag stays empty.
     pub parent: String,
+    /// The value blob: length plus hex of at most the first 32 bytes. `None` for blob index 0 or a blob that does not fit.
+    pub value: Option<ClrBlob>,
+}
+
+/// One `CustomAttribute` row: the `HasCustomAttribute` parent, the constructor, and the value blob. The blob prolog and the named arguments are not read.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ClrCustomAttribute {
+    /// `Table#N` from the five-bit `HasCustomAttribute` coded index, the table named by that tag's `custom_bits` entry. A tag past the array, or a coded row of 0, stays empty.
+    pub parent: String,
+    /// `MethodDef#N` or `MemberRef#N` from the MethodDefOrRef coded index, or the stored name when that row is already in the name lists. A tag this width does not name, or a coded row of 0, stays empty.
+    #[serde(rename = "type")]
+    pub ty: String,
     /// The value blob: length plus hex of at most the first 32 bytes. `None` for blob index 0 or a blob that does not fit.
     pub value: Option<ClrBlob>,
 }
@@ -475,6 +489,7 @@ fn parse_clr(header: &[u8], file: &[u8], metadata_off: Option<usize>) -> Option<
         assembly_refs: meta.assembly_refs,
         module_refs: meta.module_refs,
         constants: meta.constants,
+        custom_attributes: meta.custom_attributes,
     })
 }
 
@@ -721,6 +736,7 @@ struct MetaRead {
     assembly_refs: Vec<ClrAssembly>,
     module_refs: Vec<String>,
     constants: Vec<ClrConstant>,
+    custom_attributes: Vec<ClrCustomAttribute>,
 }
 
 impl MetaRead {
@@ -740,6 +756,7 @@ impl MetaRead {
             assembly_refs: Vec::new(),
             module_refs: Vec::new(),
             constants: Vec::new(),
+            custom_attributes: Vec::new(),
         }
     }
 }
@@ -1083,7 +1100,7 @@ fn read_metadata_names(
     }
     attach_interfaces(&mut out, &typedefs, &interfaces);
     let blobs = stream_bytes(file, root, streams, "#Blob");
-    let (member_ref_signatures, assemblies, assembly_refs, module_refs, typespec_signatures, standalone_sigs, constants) =
+    let (member_ref_signatures, assemblies, assembly_refs, module_refs, typespec_signatures, standalone_sigs, constants, custom_attributes) =
         enrich_metadata(&mut out, &member_refs, blobs, blob, strings, &field_ptrs, &method_ptrs);
     MetaRead {
         types: out,
@@ -1096,10 +1113,11 @@ fn read_metadata_names(
         assembly_refs,
         module_refs,
         constants,
+        custom_attributes,
     }
 }
 
-/// Field and method signatures, assembly, assembly-ref, and module-ref rows, properties, events, `StandAloneSig` blobs, and `Constant` rows. A row that does not fit keeps what was already read. `field_ptrs` and `method_ptrs` reorder the signature and RVA records the same way the names were reordered, so each record stays on its row.
+/// Field and method signatures, assembly, assembly-ref, and module-ref rows, properties, events, `StandAloneSig` blobs, `Constant` rows, and `CustomAttribute` rows. A row that does not fit keeps what was already read. `field_ptrs` and `method_ptrs` reorder the signature and RVA records the same way the names were reordered, so each record stays on its row.
 fn enrich_metadata(
     types: &mut [ClrType],
     member_refs: &[String],
@@ -1116,18 +1134,46 @@ fn enrich_metadata(
     Vec<Option<String>>,
     Vec<Option<String>>,
     Vec<ClrConstant>,
+    Vec<ClrCustomAttribute>,
 ) {
     let none_sigs = vec![None; member_refs.len()];
     if tilde.len() < 24 {
-        return (none_sigs, Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        return (
+            none_sigs,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
     }
     let valid = u64::from_le_bytes(tilde[8..16].try_into().unwrap());
     let count = valid.count_ones() as usize;
     let Some(header_end) = count.checked_mul(4).and_then(|n| n.checked_add(24)) else {
-        return (none_sigs, Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        return (
+            none_sigs,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
     };
     if tilde.len() < header_end {
-        return (none_sigs, Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        return (
+            none_sigs,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
     }
     let str_w = if tilde[6] & 1 != 0 { 4 } else { 2 };
     let guid_w = if tilde[6] & 2 != 0 { 4 } else { 2 };
@@ -1247,6 +1293,8 @@ fn enrich_metadata(
     let mut standalone_sigs = Vec::new();
     // One row per Constant row: element-type name, HasConstant parent, value blob.
     let mut constants = Vec::new();
+    // One row per CustomAttribute row: HasCustomAttribute parent, constructor, value blob.
+    let mut custom_attributes = Vec::new();
     let mut event_maps = Vec::new();
     let mut property_maps = Vec::new();
     // Name and signature from the blob, per Event row.
@@ -1269,6 +1317,20 @@ fn enrich_metadata(
         .filter(|(_, ty)| ty.table == "TypeRef")
         .map(|(index, _)| index)
         .collect();
+    // Only a present CustomAttribute table needs the display names: the
+    // table name for each HasCustomAttribute tag in `custom_bits` order,
+    // and the MethodDef names in row order for the constructor tag.
+    let (custom_names, method_names) = if valid & (1u64 << 12) != 0 {
+        (
+            custom_bits.iter().map(|bit| table_name(*bit)).collect::<Vec<_>>(),
+            types
+                .iter()
+                .flat_map(|ty| ty.methods.iter().map(|m| m.name.clone()))
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
     for bit in 0..45u32 {
         if valid & (1u64 << bit) == 0 {
             continue;
@@ -1332,6 +1394,45 @@ fn enrich_metadata(
                         .and_then(|heap| heap_blob(heap, read_index(row, 2 + has_constant_w, blob_w)))
                         .map(render_blob);
                     constants.push(ClrConstant { kind, parent, value });
+                }
+                12 => {
+                    // A `CustomAttribute` row: the parent is the five-bit
+                    // `HasCustomAttribute` coded index over the tables
+                    // `custom_bits` lists, the constructor a MethodDefOrRef
+                    // coded index, the value a blob index. A tag past the
+                    // names, or a coded row of 0, leaves the field empty.
+                    // The blob prolog and the named arguments stay unread.
+                    let coded = read_index(row, 0, custom_parent_w);
+                    let parent = match (coded & 0x1F, coded >> 5) {
+                        (tag, n) if n != 0 => custom_names
+                            .get(tag as usize)
+                            .map(|name| format!("{name}#{n}"))
+                            .unwrap_or_default(),
+                        _ => String::new(),
+                    };
+                    let coded = read_index(row, custom_parent_w, custom_type_w);
+                    let ty = match (coded & 0x7, coded >> 3) {
+                        (0, n) if n != 0 => method_names
+                            .get(n as usize - 1)
+                            .cloned()
+                            .unwrap_or_else(|| format!("MethodDef#{n}")),
+                        (1, n) if n != 0 => member_refs
+                            .get(n as usize - 1)
+                            .cloned()
+                            .unwrap_or_else(|| format!("MemberRef#{n}")),
+                        _ => String::new(),
+                    };
+                    let value = blobs.and_then(|heap| {
+                        heap_blob(
+                            heap,
+                            read_index(row, custom_parent_w + custom_type_w, blob_w),
+                        )
+                    });
+                    custom_attributes.push(ClrCustomAttribute {
+                        parent,
+                        ty,
+                        value: value.map(render_blob),
+                    });
                 }
                 17 => {
                     // A StandAloneSig blob is the `MethodSig` text `method_sig`
@@ -1481,7 +1582,7 @@ fn enrich_metadata(
     } else {
         none_sigs
     };
-    (signatures, assemblies, assembly_refs, module_refs, typespec_sigs, standalone_sigs, constants)
+    (signatures, assemblies, assembly_refs, module_refs, typespec_sigs, standalone_sigs, constants, custom_attributes)
 }
 
 fn attach_mapped(
@@ -3101,6 +3202,127 @@ mod tests {
         assert_eq!(meta.assemblies[0].flags, 5);
     }
 
+    #[test]
+    fn clr_customattribute_rows_decode_parent_type_and_blob() {
+        // Five CustomAttribute rows after TypeDef, MethodDef, and MemberRef:
+        // a MethodDef parent with a constructor naming its stored MethodDef
+        // row, a Field parent with a constructor naming its stored MemberRef
+        // row, a Module parent with an unnamed constructor tag and blob
+        // index 0, a parent tag past the array with a constructor row past
+        // the name lists and a blob that does not fit, and a MethodDef
+        // parent row 2 with a constructor row past the stored MethodDef
+        // names. Blob index 9 claims five bytes but carries one.
+        let mut tilde = tilde_header((1 << 2) | (1 << 6) | (1 << 10) | (1 << 12), &[2, 3, 1, 5]);
+        for (name, namespace, methods) in [(1u16, 5u16, 1u16), (17u16, 0u16, 3u16)] {
+            tilde.extend_from_slice(&0u32.to_le_bytes());
+            tilde.extend_from_slice(&name.to_le_bytes());
+            tilde.extend_from_slice(&namespace.to_le_bytes());
+            tilde.extend_from_slice(&0u16.to_le_bytes());
+            tilde.extend_from_slice(&1u16.to_le_bytes());
+            tilde.extend_from_slice(&methods.to_le_bytes());
+        }
+        for name in [8u16, 12u16, 17u16] {
+            tilde.extend_from_slice(&0u32.to_le_bytes());
+            tilde.extend_from_slice(&0u16.to_le_bytes());
+            tilde.extend_from_slice(&0u16.to_le_bytes());
+            tilde.extend_from_slice(&name.to_le_bytes());
+            tilde.extend_from_slice(&0u16.to_le_bytes());
+            tilde.extend_from_slice(&1u16.to_le_bytes());
+        }
+        // MemberRef row 1: TypeDef-tagged parent, name Add, blob index 0.
+        tilde.extend_from_slice(&8u16.to_le_bytes());
+        tilde.extend_from_slice(&22u16.to_le_bytes());
+        tilde.extend_from_slice(&0u16.to_le_bytes());
+        // Parent coded: tag in the low five bits, row above. Constructor
+        // coded: tag in the low three bits, row above.
+        for (parent, constructor, blob) in
+            [(32u16, 8u16, 1u16), (33, 9, 6), (39, 18, 0), (54, 17, 9), (64, 40, 9)]
+        {
+            tilde.extend_from_slice(&parent.to_le_bytes());
+            tilde.extend_from_slice(&constructor.to_le_bytes());
+            tilde.extend_from_slice(&blob.to_le_bytes());
+        }
+        let mut strings = vec![0u8];
+        strings.extend_from_slice(b"App\0Ns\0Run\0Stop\0Done\0Add\0");
+        let mut blobs = vec![0u8];
+        // index 1: length 4, four payload bytes.
+        blobs.extend_from_slice(&[0x04, 0xAA, 0xBB, 0xCC, 0xDD]);
+        // index 6: length 1, one payload byte.
+        blobs.extend_from_slice(&[0x01, 0x2A]);
+        // index 9: claims 5 bytes but carries 1 — does not fit.
+        blobs.extend_from_slice(&[0x05, 0x01]);
+        let (file, streams) = with_blobs(&tilde, &strings, &blobs);
+        let meta = read_metadata_names(&file, Some(0), &streams);
+        assert_eq!(
+            meta.custom_attributes,
+            vec![
+                ClrCustomAttribute {
+                    parent: "MethodDef#1".into(),
+                    ty: "Run".into(),
+                    value: Some(ClrBlob { len: 4, hex: "aabbccdd".into() }),
+                },
+                ClrCustomAttribute {
+                    parent: "Field#1".into(),
+                    ty: "Add".into(),
+                    value: Some(ClrBlob { len: 1, hex: "2a".into() }),
+                },
+                ClrCustomAttribute {
+                    parent: "Module#1".into(),
+                    ty: String::new(),
+                    value: None,
+                },
+                ClrCustomAttribute {
+                    parent: String::new(),
+                    ty: "MemberRef#2".into(),
+                    value: None,
+                },
+                ClrCustomAttribute {
+                    parent: "MethodDef#2".into(),
+                    ty: "MethodDef#5".into(),
+                    value: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn clr_customattribute_width_stays_parent_type_and_blob() {
+        // A CustomAttribute row next to an Assembly row: the 12 =>
+        // custom_parent_w + custom_type_w + blob_w width is unchanged, so
+        // the Assembly row parses on its own layout. A coded row of 0 on
+        // both tags stays empty.
+        let mut tilde = tilde_header((1u64 << 12) | (1u64 << 32), &[1, 1]);
+        // CustomAttribute: parent coded 0 (tag 0, row 0), constructor coded
+        // 0 (tag 0, row 0), blob index 1.
+        tilde.extend_from_slice(&0u16.to_le_bytes());
+        tilde.extend_from_slice(&0u16.to_le_bytes());
+        tilde.extend_from_slice(&1u16.to_le_bytes());
+        // Assembly: hash alg id, four version numbers, flags, public key blob
+        // index 0, name, culture.
+        tilde.extend_from_slice(&0u32.to_le_bytes());
+        tilde.extend_from_slice(&[1u8, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0]);
+        tilde.extend_from_slice(&0u32.to_le_bytes());
+        tilde.extend_from_slice(&0u16.to_le_bytes());
+        tilde.extend_from_slice(&0u16.to_le_bytes());
+        let names = vec![0u8];
+        let mut blobs = vec![0u8];
+        blobs.extend_from_slice(&[0x04, 0x00, 0x01, 0x01, 0x08]);
+        let (file, streams) = with_blobs(&tilde, &names, &blobs);
+        let meta = read_metadata_names(&file, Some(0), &streams);
+        assert_eq!(
+            meta.custom_attributes,
+            vec![ClrCustomAttribute {
+                parent: String::new(),
+                ty: String::new(),
+                value: Some(ClrBlob { len: 4, hex: "00010108".into() }),
+            }]
+        );
+        assert_eq!(meta.assemblies.len(), 1);
+        assert_eq!(meta.assemblies[0].name, "");
+        assert_eq!(meta.assemblies[0].major_version, 1);
+        assert_eq!(meta.assemblies[0].flags, 5);
+    }
+
     fn clr_method(name: &str, params: &[(&str, u16)]) -> ClrMethod {
         ClrMethod {
             name: name.to_string(),
@@ -3224,6 +3446,7 @@ mod tests {
             assembly_refs: Vec::new(),
             module_refs: Vec::new(),
             constants: Vec::new(),
+            custom_attributes: Vec::new(),
         };
         attach_il(&mut header, &file, &[section]);
         let types = &header.types;
