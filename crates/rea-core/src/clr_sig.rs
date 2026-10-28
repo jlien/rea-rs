@@ -76,6 +76,21 @@ pub fn property_sig(heap: &[u8], index: u32) -> Option<String> {
 /// `ldstr` (`0x72`), and `newobj` (`0x73`) print their 4-byte little-endian
 /// metadata token as hex. An unmapped or truncated body is empty.
 pub fn il_ops(bytes: &[u8]) -> Vec<String> {
+    il_ops_resolved(bytes, &[], &[])
+}
+
+/// `il_ops` with the stored MethodDef and MemberRef names. On `call`,
+/// `callvirt`, and `newobj`, a token whose high byte is MethodDef (`0x06`)
+/// or MemberRef (`0x0A`) and whose 1-based row sits in `method_defs` or
+/// `member_refs` prints the name beside the hex (`call 0x06000001 Run`). A
+/// row of 0, a row past the list, or any other token table stays hex.
+/// `ldstr` always stays hex: the user-string heap is not read. A missing
+/// name does not fail the parse.
+pub fn il_ops_resolved(
+    bytes: &[u8],
+    method_defs: &[String],
+    member_refs: &[String],
+) -> Vec<String> {
     let Some((code, _size)) = il_code(bytes) else {
         return Vec::new();
     };
@@ -152,7 +167,7 @@ pub fn il_ops(bytes: &[u8]) -> Vec<String> {
             }
             let token = u32::from_le_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]]);
             at += 4;
-            out.push(format!("{name} 0x{token:08x}"));
+            out.push(token_text(name, token, method_defs, member_refs));
             continue;
         }
         out.push(name.to_string());
@@ -161,6 +176,28 @@ pub fn il_ops(bytes: &[u8]) -> Vec<String> {
         }
     }
     out
+}
+
+/// `name 0xtttttttt`, with the row's name appended when the token's table is
+/// MethodDef (`0x06`) or MemberRef (`0x0A`) and the 1-based row is in the
+/// stored names. `ldstr` stays hex: the user-string heap is not read.
+fn token_text(name: &str, token: u32, method_defs: &[String], member_refs: &[String]) -> String {
+    let hex = format!("{name} 0x{token:08x}");
+    if name == "ldstr" {
+        return hex;
+    }
+    let names = match token >> 24 {
+        0x06 => method_defs,
+        0x0a => member_refs,
+        _ => return hex,
+    };
+    match token & 0x00ff_ffff {
+        0 => hex,
+        row => match names.get(row as usize - 1) {
+            Some(text) => format!("{hex} {text}"),
+            None => hex,
+        },
+    }
 }
 
 fn il_code(bytes: &[u8]) -> Option<(&[u8], usize)> {
@@ -308,7 +345,7 @@ pub(crate) fn sig_type(bytes: &[u8], at: usize, depth: u32) -> Option<(String, u
 
 #[cfg(test)]
 mod tests {
-    use super::{il_ops, method_sig, property_sig};
+    use super::{il_ops, il_ops_resolved, method_sig, property_sig};
 
     #[test]
     fn method_signature_is_return_and_params() {
@@ -473,6 +510,67 @@ mod tests {
         assert_eq!(il_ops(&[0x0a, 0x29, 0x01]), vec!["op-29".to_string()]);
         // The `0xFE` token opcodes, including `ldftn` (0x06), still stop.
         assert_eq!(il_ops(&[0x0a, 0xfe, 0x06]), vec!["op-fe-06".to_string()]);
+    }
+
+    #[test]
+    fn methoddef_and_memberref_tokens_print_the_stored_name() {
+        let methods = vec!["Run".to_string(), "Jump".to_string()];
+        let members = vec!["Add".to_string()];
+        // codesize 6: call MethodDef row 1 — the name joins the hex, and the
+        // walk continues to `ret`.
+        assert_eq!(
+            il_ops_resolved(
+                &[0x1a, 0x28, 0x01, 0x00, 0x00, 0x06, 0x2a],
+                &methods,
+                &members
+            ),
+            vec!["call 0x06000001 Run".to_string(), "ret".to_string()]
+        );
+        // callvirt MethodDef row 2, then newobj MemberRef row 1. Codesize 10
+        // (header 0x2a).
+        assert_eq!(
+            il_ops_resolved(
+                &[0x2a, 0x6f, 0x02, 0x00, 0x00, 0x06, 0x73, 0x01, 0x00, 0x00, 0x0a],
+                &methods,
+                &members
+            ),
+            vec![
+                "callvirt 0x06000002 Jump".to_string(),
+                "newobj 0x0a000001 Add".to_string()
+            ]
+        );
+        // Row 3 is past the two stored MethodDef names: hex only. Codesize 5
+        // (header 0x16).
+        assert_eq!(
+            il_ops_resolved(&[0x16, 0x28, 0x03, 0x00, 0x00, 0x06], &methods, &members),
+            vec!["call 0x06000003".to_string()]
+        );
+        // Row 0 is not a row: hex only.
+        assert_eq!(
+            il_ops_resolved(&[0x16, 0x28, 0x00, 0x00, 0x00, 0x06], &methods, &members),
+            vec!["call 0x06000000".to_string()]
+        );
+        // A token table other than MethodDef or MemberRef stays hex.
+        assert_eq!(
+            il_ops_resolved(&[0x16, 0x28, 0x01, 0x00, 0x00, 0x02], &methods, &members),
+            vec!["call 0x02000001".to_string()]
+        );
+        // `ldstr` stays hex even when a row number is stored: the
+        // user-string heap is not read.
+        assert_eq!(
+            il_ops_resolved(&[0x16, 0x72, 0x01, 0x00, 0x00, 0x70], &methods, &members),
+            vec!["ldstr 0x70000001".to_string()]
+        );
+        // An empty name list leaves every token hex and does not fail.
+        assert_eq!(
+            il_ops_resolved(&[0x16, 0x28, 0x01, 0x00, 0x00, 0x06], &[], &[]),
+            vec!["call 0x06000001".to_string()]
+        );
+        // The plain `il_ops` keeps the bare hex: no names are passed.
+        assert_eq!(
+            il_ops(&[0x16, 0x28, 0x01, 0x00, 0x00, 0x06]),
+            vec!["call 0x06000001".to_string()]
+        );
     }
 
     #[test]
