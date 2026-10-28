@@ -1973,11 +1973,11 @@ mod tests {
 
     #[test]
     fn a_global_beyond_i32_const_init_stores_nothing_and_does_not_fail() {
-        // Two globals: the first is i32 with a global.get initializer (0x23,
-        // index 0, end); the second is a plain i32.const. An initializer of
-        // unknown length stops the section: neither the unknown form nor the
-        // following i32.const is stored, and the inspect succeeds.
-        let m = inspect(&hex("0061736d01000000060b027f0023000b7f0041050b")).unwrap();
+        // Two globals: the first is i32 with a global.get initializer (0x23);
+        // its unread tail is itself a valid i32.const global. An initializer
+        // of unknown length stops the section, so the tail is not reread as
+        // a global and nothing is stored; the inspect succeeds.
+        let m = inspect(&hex("0061736d010000000609027f00237f0041050b")).unwrap();
         assert_eq!(m.sections, vec![6]);
         assert!(m.globals.is_empty());
 
