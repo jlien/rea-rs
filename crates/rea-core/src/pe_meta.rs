@@ -748,9 +748,10 @@ impl MetaRead {
         types: Vec<ClrType>,
         member_refs: Vec<String>,
         member_ref_parents: Vec<String>,
+        method_def_rows: Vec<String>,
     ) -> Self {
         Self {
-            method_def_rows: Vec::new(),
+            method_def_rows,
             types,
             member_refs,
             member_ref_parents,
@@ -775,26 +776,26 @@ fn read_metadata_names(
     streams: &[ClrStream],
 ) -> MetaRead {
     let Some(root) = metadata_off else {
-        return MetaRead::partial(Vec::new(), Vec::new(), Vec::new());
+        return MetaRead::partial(Vec::new(), Vec::new(), Vec::new(), Vec::new());
     };
     let Some(blob) = stream_bytes(file, root, streams, "#~")
         .or_else(|| stream_bytes(file, root, streams, "#-"))
     else {
-        return MetaRead::partial(Vec::new(), Vec::new(), Vec::new());
+        return MetaRead::partial(Vec::new(), Vec::new(), Vec::new(), Vec::new());
     };
     let Some(strings) = stream_bytes(file, root, streams, "#Strings") else {
-        return MetaRead::partial(Vec::new(), Vec::new(), Vec::new());
+        return MetaRead::partial(Vec::new(), Vec::new(), Vec::new(), Vec::new());
     };
     if blob.len() < 24 {
-        return MetaRead::partial(Vec::new(), Vec::new(), Vec::new());
+        return MetaRead::partial(Vec::new(), Vec::new(), Vec::new(), Vec::new());
     }
     let valid = u64::from_le_bytes(blob[8..16].try_into().unwrap());
     let count = valid.count_ones() as usize;
     let Some(header_end) = count.checked_mul(4).and_then(|n| n.checked_add(24)) else {
-        return MetaRead::partial(Vec::new(), Vec::new(), Vec::new());
+        return MetaRead::partial(Vec::new(), Vec::new(), Vec::new(), Vec::new());
     };
     if blob.len() < header_end {
-        return MetaRead::partial(Vec::new(), Vec::new(), Vec::new());
+        return MetaRead::partial(Vec::new(), Vec::new(), Vec::new(), Vec::new());
     }
     let str_w = if blob[6] & 0x01 != 0 { 4 } else { 2 };
     let guid_w = if blob[6] & 0x02 != 0 { 4 } else { 2 };
@@ -871,10 +872,10 @@ fn read_metadata_names(
                 };
                 for _ in 0..rows {
                     let Some(end) = cursor.checked_add(size) else {
-                        return MetaRead::partial(out, member_refs, member_parents);
+                        return MetaRead::partial(out, member_refs, member_parents, method_def_rows.clone());
                     };
                     if end > blob.len() {
-                        return MetaRead::partial(out, member_refs, member_parents);
+                        return MetaRead::partial(out, member_refs, member_parents, method_def_rows.clone());
                     }
                     let row = &blob[cursor..end];
                     let (namespace, name) = match bit {
@@ -932,7 +933,7 @@ fn read_metadata_names(
                     cursor = end;
                 }
                 if !fit {
-                    return MetaRead::partial(out, member_refs, member_parents);
+                    return MetaRead::partial(out, member_refs, member_parents, method_def_rows.clone());
                 }
                 if bit == 3 {
                     field_ptrs = ptrs;
@@ -945,11 +946,11 @@ fn read_metadata_names(
                 for _ in 0..field_rows {
                     let Some(end) = cursor.checked_add(field_size) else {
                         attach_field_names(&mut out, &typedefs, &names);
-                        return MetaRead::partial(out, member_refs, member_parents);
+                        return MetaRead::partial(out, member_refs, member_parents, method_def_rows.clone());
                     };
                     if end > blob.len() {
                         attach_field_names(&mut out, &typedefs, &names);
-                        return MetaRead::partial(out, member_refs, member_parents);
+                        return MetaRead::partial(out, member_refs, member_parents, method_def_rows.clone());
                     }
                     let row = &blob[cursor..end];
                     names.push(heap_string(strings, read_index(row, 2, str_w)));
@@ -964,11 +965,11 @@ fn read_metadata_names(
                 for _ in 0..method_rows {
                     let Some(end) = cursor.checked_add(method_size) else {
                         attach_methods(&mut out, &typedefs, &method_recs, &[]);
-                        return MetaRead::partial(out, member_refs, member_parents);
+                        return MetaRead::partial(out, member_refs, member_parents, method_def_rows.clone());
                     };
                     if end > blob.len() {
                         attach_methods(&mut out, &typedefs, &method_recs, &[]);
-                        return MetaRead::partial(out, member_refs, member_parents);
+                        return MetaRead::partial(out, member_refs, member_parents, method_def_rows.clone());
                     }
                     let row = &blob[cursor..end];
                     method_recs.push((
@@ -1001,7 +1002,7 @@ fn read_metadata_names(
                 }
                 if !fit {
                     attach_methods(&mut out, &typedefs, &method_recs, &[]);
-                    return MetaRead::partial(out, member_refs, member_parents);
+                    return MetaRead::partial(out, member_refs, member_parents, method_def_rows.clone());
                 }
                 param_ptrs = ptrs;
             }
@@ -1010,11 +1011,11 @@ fn read_metadata_names(
                 for _ in 0..param_rows {
                     let Some(end) = cursor.checked_add(param_size) else {
                         attach_methods(&mut out, &typedefs, &method_recs, &names);
-                        return MetaRead::partial(out, member_refs, member_parents);
+                        return MetaRead::partial(out, member_refs, member_parents, method_def_rows.clone());
                     };
                     if end > blob.len() {
                         attach_methods(&mut out, &typedefs, &method_recs, &names);
-                        return MetaRead::partial(out, member_refs, member_parents);
+                        return MetaRead::partial(out, member_refs, member_parents, method_def_rows.clone());
                     }
                     let row = &blob[cursor..end];
                     names.push((
@@ -1037,14 +1038,14 @@ fn read_metadata_names(
                         if !params_attached {
                             attach_methods(&mut out, &typedefs, &method_recs, &[]);
                         }
-                        return MetaRead::partial(out, member_refs, member_parents);
+                        return MetaRead::partial(out, member_refs, member_parents, method_def_rows.clone());
                     };
                     if end > blob.len() {
                         attach_interfaces(&mut out, &typedefs, &interfaces);
                         if !params_attached {
                             attach_methods(&mut out, &typedefs, &method_recs, &[]);
                         }
-                        return MetaRead::partial(out, member_refs, member_parents);
+                        return MetaRead::partial(out, member_refs, member_parents, method_def_rows.clone());
                     }
                     let row = &blob[cursor..end];
                     let owner = read_index(row, 0, typedef_w);
@@ -1079,13 +1080,13 @@ fn read_metadata_names(
                         if !params_attached {
                             attach_methods(&mut out, &typedefs, &method_recs, &[]);
                         }
-                        return MetaRead::partial(out, member_refs, member_parents);
+                        return MetaRead::partial(out, member_refs, member_parents, method_def_rows.clone());
                     };
                     if end > blob.len() {
                         if !params_attached {
                             attach_methods(&mut out, &typedefs, &method_recs, &[]);
                         }
-                        return MetaRead::partial(out, member_refs, member_parents);
+                        return MetaRead::partial(out, member_refs, member_parents, method_def_rows.clone());
                     }
                     let row = &blob[cursor..end];
                     member_refs.push(heap_string(
@@ -1109,7 +1110,16 @@ fn read_metadata_names(
     attach_interfaces(&mut out, &typedefs, &interfaces);
     let blobs = stream_bytes(file, root, streams, "#Blob");
     let (member_ref_signatures, assemblies, assembly_refs, module_refs, typespec_signatures, standalone_sigs, constants, custom_attributes) =
-        enrich_metadata(&mut out, &member_refs, blobs, blob, strings, &field_ptrs, &method_ptrs);
+        enrich_metadata(
+            &mut out,
+            &member_refs,
+            blobs,
+            blob,
+            strings,
+            &field_ptrs,
+            &method_ptrs,
+            &method_def_rows,
+        );
     MetaRead {
         method_def_rows: method_def_rows,
         types: out,
@@ -1135,6 +1145,7 @@ fn enrich_metadata(
     strings: &[u8],
     field_ptrs: &[u32],
     method_ptrs: &[u32],
+    method_def_rows: &[String],
 ) -> (
     Vec<Option<String>>,
     Vec<ClrAssembly>,
@@ -1329,13 +1340,12 @@ fn enrich_metadata(
     // Only a present CustomAttribute table needs the display names: the
     // table name for each HasCustomAttribute tag in `custom_bits` order,
     // and the MethodDef names in row order for the constructor tag.
+    // Constructor names index MethodDef RID order: the physical row names
+    // captured before any MethodPtr reorder, like the IL tokens.
     let (custom_names, method_names) = if valid & (1u64 << 12) != 0 {
         (
             custom_bits.iter().map(|bit| table_name(*bit)).collect::<Vec<_>>(),
-            types
-                .iter()
-                .flat_map(|ty| ty.methods.iter().map(|m| m.name.clone()))
-                .collect::<Vec<_>>(),
+            method_def_rows.to_vec(),
         )
     } else {
         (Vec::new(), Vec::new())
@@ -2918,8 +2928,8 @@ mod tests {
         }
         tilde.extend_from_slice(&2u16.to_le_bytes());
         tilde.extend_from_slice(&1u16.to_le_bytes());
-        for name in [8u16, 18u16] {
-            tilde.extend_from_slice(&0u32.to_le_bytes());
+        for (name, rva) in [(8u16, 0x1000u32), (18u16, 0u32)] {
+            tilde.extend_from_slice(&rva.to_le_bytes());
             tilde.extend_from_slice(&0u16.to_le_bytes());
             tilde.extend_from_slice(&0u16.to_le_bytes());
             tilde.extend_from_slice(&name.to_le_bytes());
@@ -2931,8 +2941,60 @@ mod tests {
         let (file, streams) = with_strings(&tilde, &strings);
         let meta = read_metadata_names(&file, Some(0), &streams);
         assert_eq!(meta.method_def_rows, vec!["Run".to_string(), "Done".to_string()]);
-        assert_eq!(meta.types[0].methods, vec![clr_method("Done", &[])]);
-        assert_eq!(meta.types[1].methods, vec![clr_method("Run", &[])]);
+        assert_eq!(
+            meta.types[0].methods,
+            vec![ClrMethod {
+                name: "Done".into(),
+                params: Vec::new(),
+                signature: None,
+                il: Vec::new(),
+                rva: 0,
+            }]
+        );
+        assert_eq!(
+            meta.types[1].methods,
+            vec![ClrMethod {
+                name: "Run".into(),
+                params: Vec::new(),
+                signature: None,
+                il: Vec::new(),
+                rva: 0x1000,
+            }]
+        );
+        // Token 0x06000001 names physical row 1 (Run) even though the
+        // per-type list is reordered: a tiny `call` body on Done resolves
+        // through the RID list.
+        let mut file_il = vec![0u8; 0x600];
+        file_il[0x400..0x407].copy_from_slice(&[0x1a, 0x28, 0x01, 0x00, 0x00, 0x06, 0x2a]);
+        let section = il_section();
+        let mut header = ClrHeader {
+            major_runtime: 2,
+            minor_runtime: 5,
+            metadata_rva: 0,
+            metadata_size: 0,
+            flags: 1,
+            entry_point: 0,
+            version: None,
+            streams: Vec::new(),
+            tables: Vec::new(),
+            method_def_rows: meta.method_def_rows.clone(),
+            types: meta.types.clone(),
+            member_refs: meta.member_refs.clone(),
+            member_ref_signatures: Vec::new(),
+            member_ref_parents: Vec::new(),
+            typespec_signatures: Vec::new(),
+            standalone_sigs: Vec::new(),
+            assemblies: Vec::new(),
+            assembly_refs: Vec::new(),
+            module_refs: Vec::new(),
+            constants: Vec::new(),
+            custom_attributes: Vec::new(),
+        };
+        attach_il(&mut header, &file_il, &[section]);
+        assert_eq!(
+            header.types[1].methods[0].il,
+            vec!["call 0x06000001 Run".to_string(), "ret".to_string()]
+        );
     }
 
     #[test]
@@ -3334,6 +3396,55 @@ mod tests {
                     value: None,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn customattribute_methoddef_constructor_names_the_physical_row() {
+        // Same shape as the rows test plus a MethodPtr that swaps the two
+        // MethodDef rows: the per-type list becomes [Done, Stop-adjacent].
+        // Constructor row 1 (tag 2, coded 10) must name physical row 1 —
+        // Run — even though the reordered list starts with Done.
+        let mut tilde = tilde_header(
+            (1 << 2) | (1 << 5) | (1 << 6) | (1 << 10) | (1 << 12),
+            &[2, 2, 2, 0, 1],
+        );
+        for (name, namespace, methods) in [(1u16, 5u16, 1u16), (17u16, 0u16, 2u16)] {
+            tilde.extend_from_slice(&0u32.to_le_bytes());
+            tilde.extend_from_slice(&name.to_le_bytes());
+            tilde.extend_from_slice(&namespace.to_le_bytes());
+            tilde.extend_from_slice(&0u16.to_le_bytes());
+            tilde.extend_from_slice(&1u16.to_le_bytes());
+            tilde.extend_from_slice(&methods.to_le_bytes());
+        }
+        // MethodPtr rows [2, 1]: the stored names move to [Done, Run].
+        tilde.extend_from_slice(&2u16.to_le_bytes());
+        tilde.extend_from_slice(&1u16.to_le_bytes());
+        for name in [8u16, 12u16] {
+            tilde.extend_from_slice(&0u32.to_le_bytes());
+            tilde.extend_from_slice(&0u16.to_le_bytes());
+            tilde.extend_from_slice(&0u16.to_le_bytes());
+            tilde.extend_from_slice(&name.to_le_bytes());
+            tilde.extend_from_slice(&0u16.to_le_bytes());
+            tilde.extend_from_slice(&1u16.to_le_bytes());
+        }
+        // CustomAttribute row 1: MethodDef-tagged parent, MethodDef
+        // constructor row 1, blob index 0.
+        tilde.extend_from_slice(&32u16.to_le_bytes());
+        tilde.extend_from_slice(&10u16.to_le_bytes());
+        tilde.extend_from_slice(&0u16.to_le_bytes());
+        let mut strings = vec![0u8];
+        strings.extend_from_slice(b"App\0Ns\0Run\0Done\0");
+        let (file, streams) = with_strings(&tilde, &strings);
+        let meta = read_metadata_names(&file, Some(0), &streams);
+        assert_eq!(meta.method_def_rows, vec!["Run".to_string(), "Done".to_string()]);
+        assert_eq!(
+            meta.custom_attributes,
+            vec![ClrCustomAttribute {
+                parent: "MethodDef#1".into(),
+                ty: "Run".into(),
+                value: None,
+            }]
         );
     }
 
