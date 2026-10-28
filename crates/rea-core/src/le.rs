@@ -1254,6 +1254,19 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn zero_filled_expansion_stops_at_the_object_remainder() {
+        // The object is 16 bytes in a 4096-byte page. Only the object's
+        // remainder fills: bytes past it in the page (here 0x150) survive
+        // the expansion untouched.
+        let mut b = zero_filled();
+        b[0x150] = 0xAA;
+        let mut img = LeImage::parse(&b).unwrap();
+        assert_eq!(img.expand_zero_filled(&mut b).unwrap(), 1);
+        assert_eq!(&b[0x140..0x150], &[0u8; 16]);
+        assert_eq!(b[0x150], 0xAA);
+    }
+
+    #[test]
     fn a_zero_filled_page_expands_to_zeros_and_then_translates() {
         // Flag 3 (zero-filled) carries no bytes in the file: before the
         // expansion translate refuses it; after expand_zero_filled fills

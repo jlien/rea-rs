@@ -468,8 +468,9 @@ mod tests {
             vec!["dup".to_string(), "newobj 0x0a000001".to_string(), "ret".to_string()]
         );
         // Any other token-taking opcode not in the named set still stops at
-        // the marker: `ldc.i8` (0x22) takes an 8-byte immediate, not named.
-        assert_eq!(il_ops(&[0x0a, 0x22, 0x01]), vec!["op-22".to_string()]);
+        // the marker: `calli` (0x29) takes a signature token but is not
+        // named here, so it stops instead of printing one.
+        assert_eq!(il_ops(&[0x0a, 0x29, 0x01]), vec!["op-29".to_string()]);
         // The `0xFE` token opcodes, including `ldftn` (0x06), still stop.
         assert_eq!(il_ops(&[0x0a, 0xfe, 0x06]), vec!["op-fe-06".to_string()]);
     }
