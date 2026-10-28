@@ -91,6 +91,8 @@ pub struct ClrHeader {
     pub tables: Vec<ClrTable>,
     /// Names from `Module`, `TypeRef`, and `TypeDef`, with `Field` and `MethodDef` names on each `TypeDef` and `Param` names on each method.
     pub types: Vec<ClrType>,
+    /// MethodDef names in RID (physical row) order — before any `MethodPtr` reorder. Tokens index this list.
+    pub method_def_rows: Vec<String>,
     /// `MemberRef` names, in table order. Empty when that table or the string heap is missing.
     pub member_refs: Vec<String>,
     /// Method or field signature for each `member_refs` entry. `None` when the blob is missing or does not fit.
@@ -138,7 +140,7 @@ pub struct ClrConstant {
 pub struct ClrCustomAttribute {
     /// `Table#N` from the five-bit `HasCustomAttribute` coded index, the table named by that tag's `custom_bits` entry. A tag past the array, or a coded row of 0, stays empty.
     pub parent: String,
-    /// `MethodDef#N` or `MemberRef#N` from the MethodDefOrRef coded index, or the stored name when that row is already in the name lists. A tag this width does not name, or a coded row of 0, stays empty.
+    /// `MethodDef#N` or `MemberRef#N` from the CustomAttributeType coded index (ECMA-335 II.24.2.6: 3-bit tag, 2 = MethodDef, 3 = MemberRef), or the stored name when that row is already in the name lists. A tag this width does not name, or a coded row of 0, stays empty.
     #[serde(rename = "type")]
     pub ty: String,
     /// The value blob: length plus hex of at most the first 32 bytes. `None` for blob index 0 or a blob that does not fit.
@@ -480,6 +482,7 @@ fn parse_clr(header: &[u8], file: &[u8], metadata_off: Option<usize>) -> Option<
         streams,
         tables,
         types: meta.types,
+        method_def_rows: meta.method_def_rows,
         member_refs: meta.member_refs,
         member_ref_parents: meta.member_ref_parents,
         member_ref_signatures: meta.member_ref_signatures,
@@ -726,6 +729,7 @@ fn table_name(index: u32) -> String {
 }
 
 struct MetaRead {
+    method_def_rows: Vec<String>,
     types: Vec<ClrType>,
     member_refs: Vec<String>,
     member_ref_parents: Vec<String>,
@@ -746,6 +750,7 @@ impl MetaRead {
         member_ref_parents: Vec<String>,
     ) -> Self {
         Self {
+            method_def_rows: Vec::new(),
             types,
             member_refs,
             member_ref_parents,
@@ -847,6 +852,7 @@ fn read_metadata_names(
     let mut interfaces: Vec<(u32, String)> = Vec::new();
     // Method name and its 1-based ParamList, in MethodDef order.
     let mut method_recs: Vec<(String, u32)> = Vec::new();
+    let mut method_def_rows: Vec<String> = Vec::new();
     let mut params_attached = false;
     // One index per Field, MethodDef, or Param row, read from the pointer tables.
     let mut field_ptrs: Vec<u32> = Vec::new();
@@ -971,6 +977,8 @@ fn read_metadata_names(
                     ));
                     cursor = end;
                 }
+                // Tokens index MethodDef RID order: the names before any MethodPtr reorder.
+                method_def_rows = method_recs.iter().map(|(n, _)| n.clone()).collect();
                 if let Some(ordered) = ptr_order(&method_recs, &method_ptrs) {
                     method_recs = ordered;
                 }
@@ -1103,6 +1111,7 @@ fn read_metadata_names(
     let (member_ref_signatures, assemblies, assembly_refs, module_refs, typespec_signatures, standalone_sigs, constants, custom_attributes) =
         enrich_metadata(&mut out, &member_refs, blobs, blob, strings, &field_ptrs, &method_ptrs);
     MetaRead {
+        method_def_rows: method_def_rows,
         types: out,
         member_refs,
         member_ref_parents: member_parents,
@@ -1398,8 +1407,9 @@ fn enrich_metadata(
                 12 => {
                     // A `CustomAttribute` row: the parent is the five-bit
                     // `HasCustomAttribute` coded index over the tables
-                    // `custom_bits` lists, the constructor a MethodDefOrRef
-                    // coded index, the value a blob index. A tag past the
+                    // `custom_bits` lists, the constructor a
+                    // CustomAttributeType coded index (3-bit tag:
+                    // 2 = MethodDef, 3 = MemberRef), the value a blob index. A tag past the
                     // names, or a coded row of 0, leaves the field empty.
                     // The blob prolog and the named arguments stay unread.
                     let coded = read_index(row, 0, custom_parent_w);
@@ -1411,12 +1421,14 @@ fn enrich_metadata(
                         _ => String::new(),
                     };
                     let coded = read_index(row, custom_parent_w, custom_type_w);
+                    // ECMA-335 II.24.2.6 CustomAttributeType: a 3-bit tag —
+                    // 2 = MethodDef, 3 = MemberRef; 0 and 1 are unused.
                     let ty = match (coded & 0x7, coded >> 3) {
-                        (0, n) if n != 0 => method_names
+                        (2, n) if n != 0 => method_names
                             .get(n as usize - 1)
                             .cloned()
                             .unwrap_or_else(|| format!("MethodDef#{n}")),
-                        (1, n) if n != 0 => member_refs
+                        (3, n) if n != 0 => member_refs
                             .get(n as usize - 1)
                             .cloned()
                             .unwrap_or_else(|| format!("MemberRef#{n}")),
@@ -1947,16 +1959,20 @@ fn attach_il(
     file: &[u8],
     sections: &[goblin::pe::section_table::SectionTable],
 ) {
-    // MethodDef names in table order: each TypeDef's method list is
-    // contiguous and ascending, so the stored names across the TypeDefs are
-    // the MethodDef rows. `call`, `callvirt`, and `newobj` MethodDef and
+    // Token resolution indexes MethodDef RID order: the physical row names
+    // captured before any `MethodPtr` reorder (the stored per-type names are
+    // the reordered ones). `call`, `callvirt`, and `newobj` MethodDef and
     // MemberRef tokens print the row name beside the hex when it is stored.
-    let method_defs: Vec<String> = header
-        .types
-        .iter()
-        .filter(|ty| ty.table == "TypeDef")
-        .flat_map(|ty| ty.methods.iter().map(|m| m.name.clone()))
-        .collect();
+    let method_defs: Vec<String> = if header.method_def_rows.is_empty() {
+        header
+            .types
+            .iter()
+            .filter(|ty| ty.table == "TypeDef")
+            .flat_map(|ty| ty.methods.iter().map(|m| m.name.clone()))
+            .collect()
+    } else {
+        header.method_def_rows.clone()
+    };
     let member_refs = header.member_refs.clone();
     for ty in &mut header.types {
         for method in &mut ty.methods {
@@ -2885,6 +2901,41 @@ mod tests {
     }
 
     #[test]
+    fn method_def_rows_keep_rid_order_while_the_names_reorder() {
+        // Same MethodPtr fixture as above: the stored per-type names move
+        // (App owns Done, Other owns Run), but the token list stays in
+        // MethodDef RID order — Run is row 1, Done is row 2.
+        let mut tilde = tilde_header((1 << 2) | (1 << 5) | (1 << 6), &[2, 2, 2]);
+        for (name, namespace, fields, methods) in
+            [(1u16, 5u16, 0u16, 1u16), (12u16, 0u16, 0u16, 2u16)]
+        {
+            tilde.extend_from_slice(&0u32.to_le_bytes());
+            tilde.extend_from_slice(&name.to_le_bytes());
+            tilde.extend_from_slice(&namespace.to_le_bytes());
+            tilde.extend_from_slice(&0u16.to_le_bytes());
+            tilde.extend_from_slice(&fields.to_le_bytes());
+            tilde.extend_from_slice(&methods.to_le_bytes());
+        }
+        tilde.extend_from_slice(&2u16.to_le_bytes());
+        tilde.extend_from_slice(&1u16.to_le_bytes());
+        for name in [8u16, 18u16] {
+            tilde.extend_from_slice(&0u32.to_le_bytes());
+            tilde.extend_from_slice(&0u16.to_le_bytes());
+            tilde.extend_from_slice(&0u16.to_le_bytes());
+            tilde.extend_from_slice(&name.to_le_bytes());
+            tilde.extend_from_slice(&0u16.to_le_bytes());
+            tilde.extend_from_slice(&1u16.to_le_bytes());
+        }
+        let mut strings = vec![0u8];
+        strings.extend_from_slice(b"App\0Ns\0Run\0Other\0Done\0");
+        let (file, streams) = with_strings(&tilde, &strings);
+        let meta = read_metadata_names(&file, Some(0), &streams);
+        assert_eq!(meta.method_def_rows, vec!["Run".to_string(), "Done".to_string()]);
+        assert_eq!(meta.types[0].methods, vec![clr_method("Done", &[])]);
+        assert_eq!(meta.types[1].methods, vec![clr_method("Run", &[])]);
+    }
+
+    #[test]
     fn clr_param_ptr_orders_the_param_names() {
         // ParamPtr row 1 points at Param 2 and row 2 at Param 1; the sequences move with the names.
         let mut tilde = tilde_header((1 << 2) | (1 << 6) | (1 << 7) | (1 << 8), &[1, 2, 3, 3]);
@@ -3234,9 +3285,10 @@ mod tests {
         tilde.extend_from_slice(&22u16.to_le_bytes());
         tilde.extend_from_slice(&0u16.to_le_bytes());
         // Parent coded: tag in the low five bits, row above. Constructor
-        // coded: tag in the low three bits, row above.
+        // coded: ECMA-335 II.24.2.6 CustomAttributeType — 3-bit tag, 2 =
+        // MethodDef, 3 = MemberRef; 0 and 1 are unused and stay empty.
         for (parent, constructor, blob) in
-            [(32u16, 8u16, 1u16), (33, 9, 6), (39, 18, 0), (54, 17, 9), (64, 40, 9)]
+            [(32u16, 10u16, 1u16), (33, 11, 6), (39, 18, 0), (54, 17, 9), (64, 40, 9)]
         {
             tilde.extend_from_slice(&parent.to_le_bytes());
             tilde.extend_from_slice(&constructor.to_le_bytes());
@@ -3268,17 +3320,17 @@ mod tests {
                 },
                 ClrCustomAttribute {
                     parent: "Module#1".into(),
-                    ty: String::new(),
+                    ty: "Stop".into(),
                     value: None,
                 },
                 ClrCustomAttribute {
                     parent: String::new(),
-                    ty: "MemberRef#2".into(),
+                    ty: String::new(),
                     value: None,
                 },
                 ClrCustomAttribute {
                     parent: "MethodDef#2".into(),
-                    ty: "MethodDef#5".into(),
+                    ty: String::new(),
                     value: None,
                 },
             ]
@@ -3387,6 +3439,7 @@ mod tests {
             version: None,
             streams: Vec::new(),
             tables: Vec::new(),
+            method_def_rows: Vec::new(),
             types: vec![
                 ClrType {
                     table: "TypeDef".into(),
