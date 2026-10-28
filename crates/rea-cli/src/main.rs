@@ -39,7 +39,7 @@ enum Command {
         #[arg(long)]
         arch: Option<String>,
     },
-    /// List symbols, optionally filtered. Mach-O stabs are omitted. Itanium, Rust v0, and MSVC names are also shown demangled; the raw name stays. A clang `__Z` or `__R` name drops one ABI underscore first. A Swift `_$s` name drops it too and reads two length-prefixed identifiers as `module.name`; other Swift stays raw.
+    /// List symbols, optionally filtered. Mach-O stabs are omitted. Itanium, Rust v0, and MSVC names are also shown demangled; the raw name stays. A clang `__Z` or `__R` name drops one ABI underscore first. A Swift `_$s` name drops it too and reads two length-prefixed identifiers as `module.name`; a trailing `yyF` renders `module.name()`; other Swift stays raw.
     Symbols {
         path: String,
         #[arg(value_enum, default_value_t = SymKind::All)]

@@ -713,9 +713,13 @@ fn collect_arm_pc_rel(
 }
 
 /// Find locations that reference `addr`. The needle is 8 little-endian bytes
-/// when `bits >= 64`, otherwise the 4-byte little-endian value. This
-/// over-matches (any byte pattern equal to the address). A 4-byte prefix is
-/// not a hit on a 64-bit target. Text also contributes PC-relative hits on
+/// when `bits >= 64`, otherwise the 4-byte little-endian value. On a 64-bit
+/// target an `addr` that fits in a `u32` is additionally matched as a 4-byte
+/// little-endian low-32 value at 4-byte-aligned virtual addresses, unless
+/// those four bytes are the leading half of an 8-byte hit already recorded at
+/// the same `from`. This over-matches (any byte pattern equal to the
+/// address); it is not a relocation pass. A section whose clamped file range
+/// is empty contributes nothing. Text also contributes PC-relative hits on
 /// arm64, x86_64, 32-bit x86, and ARM/Thumb. Results are sorted by `from` and deduped.
 pub fn data_xrefs(target: &Target, addr: u64) -> Vec<XRef> {
     let needle8 = addr.to_le_bytes();
@@ -726,6 +730,7 @@ pub fn data_xrefs(target: &Target, addr: u64) -> Vec<XRef> {
         &needle4
     };
     let width = needle.len();
+    let low32 = target.bits >= 64 && addr <= u32::MAX as u64;
     let mut out = Vec::new();
     for sec in code_sections(target) {
         let start = sec.file_offset as usize;
@@ -733,15 +738,30 @@ pub fn data_xrefs(target: &Target, addr: u64) -> Vec<XRef> {
         if start >= end {
             continue;
         }
+        let mut eight: BTreeSet<u64> = BTreeSet::new();
         let mut i = start;
         while i + width <= end {
             if &target.bytes[i..i + width] == needle {
-                out.push(XRef {
-                    from: sec.addr.saturating_add((i - start) as u64),
-                    to: addr,
-                });
+                let from = sec.addr.saturating_add((i - start) as u64);
+                if low32 {
+                    eight.insert(from);
+                }
+                out.push(XRef { from, to: addr });
             }
             i += 1;
+        }
+        if low32 {
+            let mut i = start;
+            while i + 4 <= end {
+                let from = sec.addr.saturating_add((i - start) as u64);
+                if from % 4 == 0
+                    && !eight.contains(&from)
+                    && target.bytes[i..i + 4] == needle4
+                {
+                    out.push(XRef { from, to: addr });
+                }
+                i += 1;
+            }
         }
     }
     let pcrel = pc_relative_index(target);
@@ -1248,8 +1268,52 @@ mod tests {
         let target = pointer_target(Arch::Arm64, 64, &bytes);
         assert_eq!(data_xrefs(&target, 0x1008).len(), 1);
 
-        let short = pointer_target(Arch::Arm64, 64, &[0x08, 0x10, 0x00, 0x00]);
-        assert!(data_xrefs(&short, 0x1008).is_empty());
+        // A 4-byte low-32 value at a 4-byte-aligned virtual address is also a
+        // hit when it is not the leading half of an 8-byte match at the same
+        // `from`. Here the upper half is 0xffffffff, so the 8-byte value is
+        // not 0x1008 and the aligned 4-byte hit stands.
+        let low32 = pointer_target(
+            Arch::Arm64,
+            64,
+            &[0x08, 0x10, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff],
+        );
+        let hits = data_xrefs(&low32, 0x1008);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].from, 0x1000);
+
+        // Unaligned: the 4-byte needle 08 10 00 00 sits at offset 1 (VA
+        // 0x1001, not 4-aligned), so the alignment check rejects it.
+        let unaligned = pointer_target(
+            Arch::Arm64,
+            64,
+            &[0x00, 0x08, 0x10, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff],
+        );
+        assert!(data_xrefs(&unaligned, 0x1008).is_empty());
+
+        // An address above u32::MAX never matches a 4-byte needle.
+        let wide_addr = pointer_target(Arch::Arm64, 64, &[0x01, 0x00, 0x00, 0x00]);
+        assert!(data_xrefs(&wide_addr, 0x1_0000_0001).is_empty());
+    }
+
+    #[test]
+    fn four_byte_prefix_of_an_eight_byte_hit_is_not_double_reported() {
+        // bytes[0..8] are exactly 0x1008 little-endian, so the 8-byte path
+        // hits at 0x1000. Its low 4 bytes would also match at the same
+        // aligned `from`; only one xref is recorded.
+        let bytes = [0x08, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let target = pointer_target(Arch::Arm64, 64, &bytes);
+        let hits = data_xrefs(&target, 0x1008);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].from, 0x1000);
+    }
+
+    #[test]
+    fn data_xref_on_32bit_is_four_bytes_unchanged() {
+        let bytes = [0x08, 0x10, 0x00, 0x00];
+        let target = pointer_target(Arch::Arm, 32, &bytes);
+        let hits = data_xrefs(&target, 0x1008);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].from, 0x1000);
     }
 
     #[test]

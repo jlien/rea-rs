@@ -14,16 +14,18 @@ pub fn emit(target: &Target) -> String {
             continue;
         }
         if let Some(demangled) = &sym.demangled {
-            if !demangled.contains('(') {
-                // A Swift demangle (`module.name`) is a path with `.`, which
-                // is not callable C syntax, so it is a comment only. No
-                // parameter list is invented and no declaration is emitted
-                // for a path containing `.`.
-                if crate::demangle::swift(&sym.name).is_some() {
-                    out.push_str("/* ");
-                    out.push_str(demangled);
-                    out.push_str(" */\n");
-                }
+            if let Some(path) = crate::demangle::swift_path(&sym.name) {
+                // A Swift demangle (`module.name`, or `module.name()` when the
+                // unread tail is exactly `yyF`) is a path with `.`, which is
+                // not callable C syntax, so it is a comment only. The comment
+                // prints the two-identifier `module.name` — never the `()` —
+                // and the name does not go through `decl_from_demangled` even
+                // when the demangled text carries `()`. No parameter list is
+                // invented in the header.
+                out.push_str("/* ");
+                out.push_str(&path);
+                out.push_str(" */\n");
+            } else if !demangled.contains('(') {
                 // A demangled path with no parameter list (a Rust path, for
                 // example) is not callable syntax, so it is a comment only.
                 if demangled.contains("::") {

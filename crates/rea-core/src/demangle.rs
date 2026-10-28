@@ -43,14 +43,29 @@ pub fn rust_v0(name: &str) -> Option<String> {
 /// identifiers (module, then name) are read: a decimal length, then that many
 /// bytes. Bytes after the second identifier (a type suffix, a generic
 /// signature) stay unread and do not reject the match, and the demangled text
-/// does not include them. Punycode, a length that does not fit, and a first
-/// byte that is not a digit return `None`.
+/// does not include them — except an unread tail of exactly `yyF`, the
+/// empty-parameter-list function marker, which renders `module.name()`. Any
+/// other tail keeps `module.name`. Punycode, a length that does not fit, and a
+/// first byte that is not a digit return `None`.
 pub fn swift(name: &str) -> Option<String> {
     let rest = name.strip_prefix('_').unwrap_or(name);
     let rest = rest.strip_prefix("$s")?;
     let (module, rest) = parse_swift_ident(rest)?;
-    let (item, _) = parse_swift_ident(rest)?;
+    let (item, rest) = parse_swift_ident(rest)?;
+    if rest == "yyF" {
+        return Some(format!("{module}.{item}()"));
+    }
     Some(format!("{module}.{item}"))
+}
+
+/// The two-identifier `module.name` result of [`swift`], without the `()` a
+/// trailing `yyF` adds — the form the header comment and the ObjC section
+/// strings print.
+pub fn swift_path(name: &str) -> Option<String> {
+    swift(name).map(|demangled| match demangled.strip_suffix("()") {
+        Some(path) => path.to_string(),
+        None => demangled,
+    })
 }
 
 /// A Swift identifier: a decimal length, then that many bytes. A byte that is
@@ -326,18 +341,31 @@ fn parse_type(input: &str) -> Option<(&'static str, &str)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{any, itanium, msvc, rust_v0, swift};
+    use super::{any, itanium, msvc, rust_v0, swift, swift_path};
 
     #[test]
     fn swift_reads_two_identifiers_and_stops() {
-        assert_eq!(swift("$s4main3fooyyF").as_deref(), Some("main.foo"));
-        assert_eq!(swift("_$s4main3fooyyF").as_deref(), Some("main.foo"));
-        assert_eq!(any("$s4main3fooyyF").as_deref(), Some("main.foo"));
-        assert_eq!(any("_$s4main3fooyyF").as_deref(), Some("main.foo"));
+        assert_eq!(swift("$s4main3fooyyF").as_deref(), Some("main.foo()"));
+        assert_eq!(swift("_$s4main3fooyyF").as_deref(), Some("main.foo()"));
+        assert_eq!(any("$s4main3fooyyF").as_deref(), Some("main.foo()"));
+        assert_eq!(any("_$s4main3fooyyF").as_deref(), Some("main.foo()"));
         // A generic signature or type suffix after the second identifier stays
         // unread and does not reject the match.
         assert_eq!(swift("$s4main3fooS2i_S2itSfE").as_deref(), Some("main.foo"));
         assert_eq!(swift("$s4main3foo3barVyXEfU_").as_deref(), Some("main.foo"));
+    }
+
+    #[test]
+    fn a_trailing_yyf_makes_an_empty_parameter_list() {
+        // An unread tail of exactly `yyF` renders `module.name()`.
+        assert_eq!(swift("$s4main3fooyyF").as_deref(), Some("main.foo()"));
+        assert_eq!(any("$s4main3fooyyF").as_deref(), Some("main.foo()"));
+        // Any other tail — even one beginning with `yyF` — keeps
+        // `module.name`, and the two-identifier path never carries `()`.
+        assert_eq!(swift("$s4main3fooyyFy").as_deref(), Some("main.foo"));
+        assert_eq!(swift_path("$s4main3fooyyF").as_deref(), Some("main.foo"));
+        assert_eq!(swift_path("$s4main3fooS2i_S2itSfE").as_deref(), Some("main.foo"));
+        assert_eq!(swift_path("$s4main9"), None);
     }
 
     #[test]
