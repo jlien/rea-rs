@@ -181,7 +181,7 @@ pub struct ClrMethod {
     /// Method signature such as `void(int32)`. `None` when the blob index is 0 or the blob does not fit.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
-    /// IL opcode names. Empty when the RVA is 0 or the body does not fit. At most 48 instructions.
+    /// IL opcode names. Empty when the RVA is 0 or the body does not fit. At most 48 instructions. A `call`, `callvirt`, or `newobj` token in the MethodDef (`0x06`) or MemberRef (`0x0A`) table prints the stored row name beside the hex when that row exists; `ldstr` and unstored rows stay hex.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub il: Vec<String>,
     /// Method RVA. Zero when the row has no body.
@@ -1803,6 +1803,17 @@ fn attach_il(
     file: &[u8],
     sections: &[goblin::pe::section_table::SectionTable],
 ) {
+    // MethodDef names in table order: each TypeDef's method list is
+    // contiguous and ascending, so the stored names across the TypeDefs are
+    // the MethodDef rows. `call`, `callvirt`, and `newobj` MethodDef and
+    // MemberRef tokens print the row name beside the hex when it is stored.
+    let method_defs: Vec<String> = header
+        .types
+        .iter()
+        .filter(|ty| ty.table == "TypeDef")
+        .flat_map(|ty| ty.methods.iter().map(|m| m.name.clone()))
+        .collect();
+    let member_refs = header.member_refs.clone();
     for ty in &mut header.types {
         for method in &mut ty.methods {
             if method.rva == 0 {
@@ -1814,7 +1825,7 @@ fn attach_il(
             let Some(bytes) = file.get(off..) else {
                 continue;
             };
-            method.il = crate::clr_sig::il_ops(bytes);
+            method.il = crate::clr_sig::il_ops_resolved(bytes, &method_defs, &member_refs);
         }
     }
 }
@@ -1947,6 +1958,7 @@ fn guid_string(b: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clr_sig::il_ops_resolved;
 
     #[test]
     fn root_id_entries() {
@@ -2974,6 +2986,135 @@ mod tests {
             name: name.to_string(),
             signature: None,
         }
+    }
+
+    fn il_section() -> goblin::pe::section_table::SectionTable {
+        goblin::pe::section_table::SectionTable {
+            name: *b".text\0\0\0",
+            real_name: None,
+            virtual_size: 0x200,
+            virtual_address: 0x1000,
+            size_of_raw_data: 0x200,
+            pointer_to_raw_data: 0x400,
+            pointer_to_relocations: 0,
+            pointer_to_linenumbers: 0,
+            number_of_relocations: 0,
+            number_of_linenumbers: 0,
+            characteristics: 0x4000_0040,
+        }
+    }
+
+    #[test]
+    fn attach_il_resolves_methoddef_and_memberref_tokens() {
+        // MethodDef rows in table order: Run (row 1), Jump (row 2), from two
+        // TypeDefs. MemberRef row 1 is Add.
+        let mut file = vec![0u8; 0x600];
+        // RVA 0x1000: tiny body, codesize 6 — call MethodDef row 1, ret.
+        file[0x400..0x407].copy_from_slice(&[0x1a, 0x28, 0x01, 0x00, 0x00, 0x06, 0x2a]);
+        // RVA 0x1010: tiny body, codesize 10 — callvirt MemberRef row 1,
+        // ldstr (stays hex).
+        file[0x410..0x41b].copy_from_slice(&[
+            0x2a, 0x6f, 0x01, 0x00, 0x00, 0x0a, 0x72, 0x01, 0x00, 0x00, 0x70,
+        ]);
+        // RVA 0x1020: tiny body, codesize 6 — call MethodDef row 2, ret.
+        file[0x420..0x427].copy_from_slice(&[0x1a, 0x28, 0x02, 0x00, 0x00, 0x06, 0x2a]);
+        let section = il_section();
+        let mut header = ClrHeader {
+            major_runtime: 2,
+            minor_runtime: 5,
+            metadata_rva: 0,
+            metadata_size: 0,
+            flags: 1,
+            entry_point: 0,
+            version: None,
+            streams: Vec::new(),
+            tables: Vec::new(),
+            types: vec![
+                ClrType {
+                    table: "TypeDef".into(),
+                    namespace: String::new(),
+                    name: "A".into(),
+                    fields: Vec::new(),
+                    methods: vec![
+                        ClrMethod {
+                            name: "Run".into(),
+                            params: Vec::new(),
+                            signature: None,
+                            il: Vec::new(),
+                            rva: 0x1000,
+                        },
+                        ClrMethod {
+                            name: "Unmapped".into(),
+                            params: Vec::new(),
+                            signature: None,
+                            il: Vec::new(),
+                            rva: 0,
+                        },
+                        ClrMethod {
+                            name: "Offmap".into(),
+                            params: Vec::new(),
+                            signature: None,
+                            il: Vec::new(),
+                            rva: 0x9000,
+                        },
+                    ],
+                    properties: Vec::new(),
+                    events: Vec::new(),
+                    interfaces: Vec::new(),
+                },
+                ClrType {
+                    table: "TypeDef".into(),
+                    namespace: String::new(),
+                    name: "B".into(),
+                    fields: Vec::new(),
+                    methods: vec![ClrMethod {
+                        name: "Jump".into(),
+                        params: Vec::new(),
+                        signature: None,
+                        il: Vec::new(),
+                        rva: 0x1020,
+                    }],
+                    properties: Vec::new(),
+                    events: Vec::new(),
+                    interfaces: Vec::new(),
+                },
+            ],
+            member_refs: vec!["Add".to_string()],
+            member_ref_signatures: Vec::new(),
+            member_ref_parents: Vec::new(),
+            typespec_signatures: Vec::new(),
+            standalone_sigs: Vec::new(),
+            assemblies: Vec::new(),
+            assembly_refs: Vec::new(),
+            module_refs: Vec::new(),
+        };
+        attach_il(&mut header, &file, &[section]);
+        let types = &header.types;
+        assert_eq!(
+            types[0].methods[0].il,
+            vec!["call 0x06000001 Run".to_string(), "ret".to_string()]
+        );
+        // RVA 0 and an RVA no section maps leave the listing empty.
+        assert!(types[0].methods[1].il.is_empty());
+        assert!(types[0].methods[2].il.is_empty());
+        assert_eq!(
+            types[1].methods[0].il,
+            vec!["call 0x06000002 Unmapped".to_string(), "ret".to_string()]
+        );
+        // Jump is MethodDef row 3: the body-less `Unmapped` still occupies
+        // its row in the flat list.
+        assert_eq!(
+            il_ops_resolved(
+                &[0x16, 0x28, 0x03, 0x00, 0x00, 0x06],
+                &[
+                    "Run".to_string(),
+                    "Unmapped".to_string(),
+                    "Jump".to_string()
+                ],
+                &[]
+            ),
+            vec!["call 0x06000003 Jump".to_string()]
+        );
     }
 
     #[test]
