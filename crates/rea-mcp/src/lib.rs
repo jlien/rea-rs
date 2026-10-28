@@ -7,21 +7,27 @@ use rea_core::{analysis, loader, strings};
 #[cfg(feature = "disasm")]
 use rea_core::disasm;
 use serde_json::{json, Value};
-use std::io::{BufRead, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 const SERVER_NAME: &str = "rea-rs";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Serve MCP over stdio until EOF. Returns the number of requests handled.
-pub fn serve(input: impl BufRead, output: impl Write) -> std::io::Result<usize> {
-    serve_internal(input, output)
+pub fn serve(input: impl Read, output: impl Write) -> std::io::Result<usize> {
+    serve_internal(BufReader::new(input), output)
 }
 
-fn serve_internal(input: impl BufRead, mut output: impl Write) -> std::io::Result<usize> {
+fn serve_internal<R: Read>(
+    mut input: BufReader<R>,
+    mut output: impl Write,
+) -> std::io::Result<usize> {
     let mut handled = 0usize;
-    for line in input.lines() {
-        let line = line?;
+    loop {
+        let mut line = String::new();
+        if input.read_line(&mut line)? == 0 {
+            break;
+        }
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -47,7 +53,7 @@ fn serve_internal(input: impl BufRead, mut output: impl Write) -> std::io::Resul
                 "serverInfo": { "name": SERVER_NAME, "version": SERVER_VERSION },
             })),
             "tools/list" => Ok(json!({ "tools": tool_definitions() })),
-            "tools/call" => handle_tool_call(&msg, &mut output),
+            "tools/call" => handle_tool_call(&msg, &mut input, &mut output),
             _ => Err(format!("method not found: {method}")),
         };
 
@@ -110,18 +116,54 @@ fn write_progress(
     writeln!(output, "{note}")
 }
 
-fn handle_tool_call(msg: &Value, output: &mut dyn Write) -> Result<Value, String> {
+/// The result of a staged tool call: the payload, or a stop because a
+/// `notifications/cancelled` for the in-flight request id was already
+/// buffered on stdin at a stage boundary.
+enum ToolResult {
+    Done(Value),
+    Cancelled,
+}
+
+/// Peek the `BufRead` buffer without blocking. If it already holds a full
+/// next line that is `notifications/cancelled` whose `params.requestId`
+/// equals `request_id`, consume that line and return true. Any other
+/// buffered line stays put for the next read; an empty or partial buffer
+/// neither blocks nor cancels.
+fn buffered_cancel<R: Read>(input: &mut BufReader<R>, request_id: Option<&Value>) -> bool {
+    let buf = input.buffer();
+    let Some(end) = buf.iter().position(|&b| b == b'\n') else {
+        return false;
+    };
+    let line = std::str::from_utf8(&buf[..end]).unwrap_or("");
+    let Ok(msg) = serde_json::from_str::<Value>(line.trim()) else {
+        return false;
+    };
+    let matches = msg.get("method").and_then(Value::as_str) == Some("notifications/cancelled")
+        && msg.get("params").and_then(|p| p.get("requestId")) == request_id;
+    if matches {
+        input.consume(end + 1);
+    }
+    matches
+}
+
+fn handle_tool_call<R: Read>(
+    msg: &Value,
+    input: &mut BufReader<R>,
+    output: &mut dyn Write,
+) -> Result<Value, String> {
     let params = msg.get("params").cloned().unwrap_or(json!({}));
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
+    let request_id = msg.get("id").cloned().filter(|v| !v.is_null());
 
     let progress_token = params
         .get("_meta")
         .and_then(|m| m.get("progressToken"))
         .filter(|v| !v.is_null())
         .cloned();
+    let stages = progress_total(name, &args);
     let total = if progress_token.is_some() {
-        progress_total(name, &args)
+        stages
     } else {
         None
     };
@@ -194,19 +236,25 @@ fn handle_tool_call(msg: &Value, output: &mut dyn Write) -> Result<Value, String
         .get("arch")
         .and_then(Value::as_str)
         .filter(|name| !name.is_empty());
-    let result: Result<Value, String> = (|| {
+    let result: Result<ToolResult, String> = (|| {
         let target = if matches!(name, "rea_sections" | "rea_disasm" | "rea_decompile") {
             loader::load_arch(path, arch).map_err(|e| e.to_string())?
         } else {
             loader::load(path).map_err(|e| e.to_string())?
         };
-        let mut notify = |stage: u64| {
+        // Each stage boundary also peeks stdin for a cancellation that is
+        // already buffered; a peek never blocks and never consumes a line
+        // that is not a matching cancellation.
+        let mut stage = |n: u64| -> bool {
             if let (Some(token), Some(total)) = (&progress_token, total) {
-                let _ = write_progress(output, token, stage, total);
+                let _ = write_progress(output, token, n, total);
             }
+            buffered_cancel(input, request_id.as_ref())
         };
-        if total.is_some() {
-            notify(1);
+        if stages.is_some() {
+            if stage(1) {
+                return Ok(ToolResult::Cancelled);
+            }
         }
         // Native-code commands do not read a WASM target; the deep view is
         // `rea_wasm`.
@@ -216,7 +264,7 @@ fn handle_tool_call(msg: &Value, output: &mut dyn Write) -> Result<Value, String
         ) {
             target.require_native().map_err(|e| e.to_string())?;
         }
-        Ok(match name {
+        Ok(ToolResult::Done(match name {
             "rea_info" => {
                 let mut value = json!({
                     "path": target.path,
@@ -275,8 +323,10 @@ fn handle_tool_call(msg: &Value, output: &mut dyn Write) -> Result<Value, String
                     .unwrap_or(4) as usize;
                 let with_xrefs = args.get("xrefs").and_then(Value::as_bool).unwrap_or(false);
                 if with_xrefs {
+                    if stage(2) {
+                        return Ok(ToolResult::Cancelled);
+                    }
                     let hits = analysis::strings_with_xrefs(&target, min);
-                    notify(2);
                     json!({ "count": hits.len(), "strings": hits })
                 } else {
                     let hits = strings::extract(&target.bytes, min);
@@ -315,7 +365,9 @@ fn handle_tool_call(msg: &Value, output: &mut dyn Write) -> Result<Value, String
             }
             "rea_funcs" => {
                 let funcs = analysis::discover_functions(&target);
-                notify(2);
+                if stage(2) {
+                    return Ok(ToolResult::Cancelled);
+                }
                 json!({ "count": funcs.len(), "functions": funcs })
             }
             "rea_xrefs" => {
@@ -328,9 +380,13 @@ fn handle_tool_call(msg: &Value, output: &mut dyn Write) -> Result<Value, String
             }
             "rea_call_graph" => {
                 let functions = analysis::discover_functions(&target);
-                notify(2);
+                if stage(2) {
+                    return Ok(ToolResult::Cancelled);
+                }
                 let graph = analysis::call_graph(&functions);
-                notify(3);
+                // The graph is built; the last stage reports, and a buffered
+                // cancellation arrives too late to matter.
+                stage(3);
                 json!({
                     "functions": functions.len(),
                     "edges": graph.edges.len(),
@@ -365,11 +421,12 @@ fn handle_tool_call(msg: &Value, output: &mut dyn Write) -> Result<Value, String
                 value
             }
             other => return Err(format!("unknown tool: {other}")),
-        })
+        }))
     })();
 
     match result {
-        Ok(v) => Ok(text_result(v.to_string())),
+        Ok(ToolResult::Cancelled) => Ok(text_result("cancelled")),
+        Ok(ToolResult::Done(v)) => Ok(text_result(v.to_string())),
         Err(e) => Ok(text_result(format!("error: {e}"))),
     }
 }
@@ -652,7 +709,7 @@ mod tests {
                 "arguments": { "path": exe.to_str().unwrap() }
             }
         });
-        let result = handle_tool_call(&msg, &mut Vec::new()).unwrap();
+        let result = handle_tool_call(&msg, &mut BufReader::new(&[][..]), &mut Vec::new()).unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.starts_with("#ifndef REA_RECOVERED_H\n"), "{text}");
         assert!(text.ends_with("#endif\n"), "{text}");
@@ -711,7 +768,7 @@ mod tests {
                 "arguments": { "path": path.to_str().unwrap() }
             }
         });
-        let result = handle_tool_call(&msg, &mut Vec::new()).unwrap();
+        let result = handle_tool_call(&msg, &mut BufReader::new(&[][..]), &mut Vec::new()).unwrap();
         let v: Value =
             serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(v["format"], "wasm");
@@ -736,7 +793,7 @@ mod tests {
                 "arguments": { "path": path.to_str().unwrap() }
             }
         });
-        let result = handle_tool_call(&msg, &mut Vec::new()).unwrap();
+        let result = handle_tool_call(&msg, &mut BufReader::new(&[][..]), &mut Vec::new()).unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("no native code view"), "{text}");
         let _ = std::fs::remove_file(&path);
@@ -785,7 +842,7 @@ mod tests {
                 "arguments": { "path": path.to_str().unwrap() }
             }
         });
-        let result = handle_tool_call(&msg, &mut Vec::new()).unwrap();
+        let result = handle_tool_call(&msg, &mut BufReader::new(&[][..]), &mut Vec::new()).unwrap();
         let v: Value =
             serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(v["format"], "sqlite");
@@ -809,7 +866,7 @@ mod tests {
                 "arguments": { "path": path.to_str().unwrap() }
             }
         });
-        let result = handle_tool_call(&msg, &mut Vec::new()).unwrap();
+        let result = handle_tool_call(&msg, &mut BufReader::new(&[][..]), &mut Vec::new()).unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("no native code view"), "{text}");
         let _ = std::fs::remove_file(&path);
@@ -889,7 +946,7 @@ mod tests {
             }
         });
         let mut sink: Vec<u8> = Vec::new();
-        handle_tool_call(&msg, &mut sink).unwrap();
+        handle_tool_call(&msg, &mut BufReader::new(&[][..]), &mut sink).unwrap();
         let text = String::from_utf8_lossy(&sink).into_owned();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 3, "{text}");
@@ -917,7 +974,7 @@ mod tests {
             }
         });
         let mut sink: Vec<u8> = Vec::new();
-        handle_tool_call(&msg, &mut sink).unwrap();
+        handle_tool_call(&msg, &mut BufReader::new(&[][..]), &mut sink).unwrap();
         let text = String::from_utf8_lossy(&sink).into_owned();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 4, "{text}");
@@ -946,7 +1003,7 @@ mod tests {
             }
         });
         let mut sink: Vec<u8> = Vec::new();
-        handle_tool_call(&msg, &mut sink).unwrap();
+        handle_tool_call(&msg, &mut BufReader::new(&[][..]), &mut sink).unwrap();
         assert!(sink.is_empty(), "{sink:?}");
 
         // xrefs with a token: start, load, sweep.
@@ -961,7 +1018,7 @@ mod tests {
             }
         });
         let mut sink: Vec<u8> = Vec::new();
-        handle_tool_call(&msg, &mut sink).unwrap();
+        handle_tool_call(&msg, &mut BufReader::new(&[][..]), &mut sink).unwrap();
         let text = String::from_utf8_lossy(&sink).into_owned();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 3, "{text}");
@@ -986,7 +1043,7 @@ mod tests {
             }
         });
         let mut sink: Vec<u8> = Vec::new();
-        handle_tool_call(&msg, &mut sink).unwrap();
+        handle_tool_call(&msg, &mut BufReader::new(&[][..]), &mut sink).unwrap();
         assert!(sink.is_empty(), "{sink:?}");
         let _ = std::fs::remove_file(&path);
     }
@@ -1010,6 +1067,86 @@ mod tests {
         let last: Value = serde_json::from_str(&lines[3]).unwrap();
         assert_eq!(last["id"], 36);
         assert!(last["result"]["content"][0]["text"].is_string(), "{last}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn call_with_token(tag: &str, id: u64) -> (std::path::PathBuf, String) {
+        let path = tiny_elf_path(tag);
+        let request = format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"rea_funcs","arguments":{{"path":"{}"}},"_meta":{{"progressToken":"tok-cancel"}}}}}}"#,
+            path.to_str().unwrap()
+        );
+        (path, request)
+    }
+
+    #[test]
+    fn buffered_cancellation_stops_the_call_with_text_cancelled() {
+        let (path, request) = call_with_token("cancel", 41);
+        let cancel = r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":41}}"#;
+        let input = format!("{request}\n{cancel}\n");
+        let (lines, handled) = exchange(&input);
+        // The load boundary saw the cancel: the start and load progress
+        // lines, then the result, and the notification itself is never
+        // answered. The sweep stage never fires.
+        assert_eq!(handled, 1);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        for (stage, line) in lines.iter().take(2).enumerate() {
+            let v: Value = serde_json::from_str(line).unwrap();
+            assert_eq!(v["method"], "notifications/progress", "{line}");
+            assert_eq!(v["params"]["progress"], stage as u64, "{line}");
+        }
+        let last: Value = serde_json::from_str(&lines[2]).unwrap();
+        assert_eq!(last["id"], 41);
+        assert_eq!(last["result"]["content"][0]["text"], "cancelled");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_cancelled_call_consumes_the_line_and_the_next_request_still_reads() {
+        let (path, request) = call_with_token("cancel-consume", 41);
+        let cancel = r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":41}}"#;
+        let next = r#"{"jsonrpc":"2.0","id":42,"method":"tools/list"}"#;
+        let input = format!("{request}\n{cancel}\n{next}\n");
+        let (lines, handled) = exchange(&input);
+        assert_eq!(handled, 2, "{lines:?}");
+        let last: Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+        assert_eq!(last["id"], 42);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_cancellation_with_a_different_id_is_not_an_answer_and_not_consumed() {
+        let (path, request) = call_with_token("cancel-mismatch", 41);
+        let cancel = r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":99}}"#;
+        let input = format!("{request}\n{cancel}\n");
+        let (lines, handled) = exchange(&input);
+        // The call runs to completion; the mismatched notification is read
+        // afterwards and stays unanswered.
+        assert_eq!(handled, 1);
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        let last: Value = serde_json::from_str(&lines[3]).unwrap();
+        assert_eq!(last["id"], 41);
+        let text = last["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("\"count\""), "{text}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_buffered_line_that_is_not_a_cancellation_stays_for_the_next_read() {
+        let (path, request) = call_with_token("cancel-other-line", 41);
+        let next = r#"{"jsonrpc":"2.0","id":42,"method":"tools/list"}"#;
+        let input = format!("{request}\n{next}\n");
+        let (lines, handled) = exchange(&input);
+        // The peek at the load boundary saw tools/list, left it alone, and
+        // rea_funcs completed; tools/list is answered after the result.
+        assert_eq!(handled, 2, "{lines:?}");
+        assert_eq!(lines.len(), 5, "{lines:?}");
+        let result: Value = serde_json::from_str(&lines[3]).unwrap();
+        assert_eq!(result["id"], 41);
+        let text = result["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("\"count\""), "{text}");
+        let last: Value = serde_json::from_str(&lines[4]).unwrap();
+        assert_eq!(last["id"], 42);
         let _ = std::fs::remove_file(&path);
     }
 }

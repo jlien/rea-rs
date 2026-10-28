@@ -6,7 +6,6 @@
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
 use rea_core::{analysis, disasm, loader, strings};
-use std::io::BufReader;
 
 #[derive(Parser)]
 #[command(
@@ -193,7 +192,7 @@ fn main() -> anyhow::Result<()> {
 
     match &cli.command {
         Command::Mcp => {
-            rea_mcp::serve(BufReader::new(std::io::stdin()), std::io::stdout())
+            rea_mcp::serve(std::io::stdin(), std::io::stdout())
                 .context("mcp server terminated")?;
             Ok(())
         }
