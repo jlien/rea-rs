@@ -254,7 +254,9 @@ fn compressed(bytes: &[u8], at: usize) -> Option<(u32, usize)> {
     None
 }
 
-fn sig_type(bytes: &[u8], at: usize, depth: u32) -> Option<(String, usize)> {
+/// One signature-type node at `at`, as `sig_type` renders it. `pub(crate)` so
+/// `pe_meta` can decode TypeSpec blob payloads with the same element parser.
+pub(crate) fn sig_type(bytes: &[u8], at: usize, depth: u32) -> Option<(String, usize)> {
     // Nested ptr/byref/szarray wrappers recurse; cap the depth so a hostile
     // blob of thousands of `0x0f` bytes cannot overflow the stack.
     if depth > 64 {

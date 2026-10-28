@@ -95,6 +95,8 @@ pub struct ClrHeader {
     pub member_refs: Vec<String>,
     /// Method or field signature for each `member_refs` entry. `None` when the blob is missing or does not fit.
     pub member_ref_signatures: Vec<Option<String>>,
+    /// One element text per `TypeSpec` row — what `sig_type` returns for that row's blob payload: a primitive, `ptr`, `byref`, `szarray`, or `class` / `valuetype` with a coded index. Blob index 0, or a blob `sig_type` rejects, is `None`.
+    pub typespec_signatures: Vec<Option<String>>,
     /// Resolved `MemberRefParent` for each `member_refs` entry. TypeDef and TypeRef parents become names when that row is in the name lists; `ModuleRef`, `MethodDef`, and `TypeSpec` stay as `ModuleRef#N`, `MethodDef#N`, and `TypeSpec#N`. Empty when the parent row does not fit.
     pub member_ref_parents: Vec<String>,
     /// One `ClrAssembly` per `Assembly` row, in table order.
@@ -452,6 +454,7 @@ fn parse_clr(header: &[u8], file: &[u8], metadata_off: Option<usize>) -> Option<
         member_refs: meta.member_refs,
         member_ref_parents: meta.member_ref_parents,
         member_ref_signatures: meta.member_ref_signatures,
+        typespec_signatures: meta.typespec_signatures,
         assemblies: meta.assemblies,
         assembly_refs: meta.assembly_refs,
         module_refs: meta.module_refs,
@@ -695,6 +698,7 @@ struct MetaRead {
     member_refs: Vec<String>,
     member_ref_parents: Vec<String>,
     member_ref_signatures: Vec<Option<String>>,
+    typespec_signatures: Vec<Option<String>>,
     assemblies: Vec<ClrAssembly>,
     assembly_refs: Vec<ClrAssembly>,
     module_refs: Vec<String>,
@@ -711,6 +715,7 @@ impl MetaRead {
             member_refs,
             member_ref_parents,
             member_ref_signatures: Vec::new(),
+            typespec_signatures: Vec::new(),
             assemblies: Vec::new(),
             assembly_refs: Vec::new(),
             module_refs: Vec::new(),
@@ -1057,13 +1062,14 @@ fn read_metadata_names(
     }
     attach_interfaces(&mut out, &typedefs, &interfaces);
     let blobs = stream_bytes(file, root, streams, "#Blob");
-    let (member_ref_signatures, assemblies, assembly_refs, module_refs) =
+    let (member_ref_signatures, assemblies, assembly_refs, module_refs, typespec_signatures) =
         enrich_metadata(&mut out, &member_refs, blobs, blob, strings, &field_ptrs, &method_ptrs);
     MetaRead {
         types: out,
         member_refs,
         member_ref_parents: member_parents,
         member_ref_signatures,
+        typespec_signatures,
         assemblies,
         assembly_refs,
         module_refs,
@@ -1084,18 +1090,19 @@ fn enrich_metadata(
     Vec<ClrAssembly>,
     Vec<ClrAssembly>,
     Vec<String>,
+    Vec<Option<String>>,
 ) {
     let none_sigs = vec![None; member_refs.len()];
     if tilde.len() < 24 {
-        return (none_sigs, Vec::new(), Vec::new(), Vec::new());
+        return (none_sigs, Vec::new(), Vec::new(), Vec::new(), Vec::new());
     }
     let valid = u64::from_le_bytes(tilde[8..16].try_into().unwrap());
     let count = valid.count_ones() as usize;
     let Some(header_end) = count.checked_mul(4).and_then(|n| n.checked_add(24)) else {
-        return (none_sigs, Vec::new(), Vec::new(), Vec::new());
+        return (none_sigs, Vec::new(), Vec::new(), Vec::new(), Vec::new());
     };
     if tilde.len() < header_end {
-        return (none_sigs, Vec::new(), Vec::new(), Vec::new());
+        return (none_sigs, Vec::new(), Vec::new(), Vec::new(), Vec::new());
     }
     let str_w = if tilde[6] & 1 != 0 { 4 } else { 2 };
     let guid_w = if tilde[6] & 2 != 0 { 4 } else { 2 };
@@ -1209,6 +1216,8 @@ fn enrich_metadata(
     let mut assemblies = Vec::new();
     let mut assembly_refs = Vec::new();
     let mut module_refs = Vec::new();
+    // One decoded element text per TypeSpec row, from `sig_type`.
+    let mut typespec_sigs = Vec::new();
     let mut event_maps = Vec::new();
     let mut property_maps = Vec::new();
     // Name and signature from the blob, per Event row.
@@ -1308,6 +1317,16 @@ fn enrich_metadata(
                     ));
                 }
                 26 => module_refs.push(heap_string(strings, read_index(row, 0, str_w))),
+                27 => {
+                    // The blob payload is one element the `sig_type` parser
+                    // accepts; index 0 or a rejected blob stays empty.
+                    let sig = blobs
+                        .and_then(|heap| heap_blob(heap, read_index(row, 0, blob_w)))
+                        .and_then(|payload| {
+                            crate::clr_sig::sig_type(payload, 0, 0).map(|(text, _)| text)
+                        });
+                    typespec_sigs.push(sig);
+                }
                 32 => {
                     let public_key = blobs
                         .and_then(|heap| heap_blob(heap, read_index(row, 16, blob_w)))
@@ -1402,7 +1421,7 @@ fn enrich_metadata(
     } else {
         none_sigs
     };
-    (signatures, assemblies, assembly_refs, module_refs)
+    (signatures, assemblies, assembly_refs, module_refs, typespec_sigs)
 }
 
 fn attach_mapped(
@@ -2803,6 +2822,60 @@ mod tests {
                 String::new(),
                 String::new(),
             ]
+        );
+    }
+
+    #[test]
+    fn clr_typespec_blobs_decode_one_element_each() {
+        // Five TypeSpec rows: a primitive, a ptr wrapper, a class with a coded
+        // index, a blob sig_type rejects, blob index 0, and an index past the heap.
+        let mut tilde = tilde_header(1u64 << 27, &[6]);
+        for index in [1u16, 3, 6, 9, 0, 50] {
+            tilde.extend_from_slice(&index.to_le_bytes());
+        }
+        let names = vec![0u8];
+        let mut blobs = vec![0u8];
+        blobs.extend_from_slice(&[0x01, 0x08]);
+        blobs.extend_from_slice(&[0x02, 0x0f, 0x08]);
+        blobs.extend_from_slice(&[0x02, 0x12, 0x05]);
+        blobs.extend_from_slice(&[0x01, 0x15]);
+        let (file, streams) = with_blobs(&tilde, &names, &blobs);
+        let meta = read_metadata_names(&file, Some(0), &streams);
+        assert_eq!(
+            meta.typespec_signatures,
+            vec![
+                Some("int32".to_string()),
+                Some("ptr int32".to_string()),
+                Some("class typeref-1".to_string()),
+                None,
+                None,
+                None,
+            ]
+        );
+    }
+
+    #[test]
+    fn clr_typespec_rows_keep_labels_and_align_member_refs() {
+        // One MemberRef row whose TypeSpec parent stays the TypeSpec#1 label
+        // even though a TypeSpec table with a decodable blob now exists, and
+        // two TypeSpec rows that decode beside it.
+        let mut tilde = tilde_header((1 << 10) | (1 << 27), &[1, 2]);
+        // MemberRef: coded parent tag 4 (TypeSpec) row 1, name, blob index 0.
+        tilde.extend_from_slice(&((1u16 << 3) | 4u16).to_le_bytes());
+        tilde.extend_from_slice(&1u16.to_le_bytes());
+        tilde.extend_from_slice(&0u16.to_le_bytes());
+        // TypeSpec rows: blob index 1, then index 0.
+        tilde.extend_from_slice(&1u16.to_le_bytes());
+        tilde.extend_from_slice(&0u16.to_le_bytes());
+        let names = vec![0u8];
+        let mut blobs = vec![0u8];
+        blobs.extend_from_slice(&[0x01, 0x08]);
+        let (file, streams) = with_blobs(&tilde, &names, &blobs);
+        let meta = read_metadata_names(&file, Some(0), &streams);
+        assert_eq!(meta.member_ref_parents, vec!["TypeSpec#1".to_string()]);
+        assert_eq!(
+            meta.typespec_signatures,
+            vec![Some("int32".to_string()), None]
         );
     }
 
