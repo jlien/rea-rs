@@ -1,0 +1,11 @@
+# Iteration 9 review
+
+`cargo test --workspace --offline` passed: rea-core 311, rea-mcp 15, rea-cli 5. A rebuild of the three crates printed no rustc warnings. `rea strings /bin/ls --xrefs --min-length 6` is 20 and `rea callgraph /bin/ls` is 143 functions / 499 edges. Short global-section payloads, tiny IL bodies, Swift names, hostile xref windows, and garbage Mach-O bytes did not panic. The `yyF` demangle, the header comment `/* main.foo */`, the ObjC `swift_path` result, the aligned low-32 hit, the unaligned miss, and the `u16` listing match their briefs.
+
+## Blocking
+
+1. `docs/rea-rs-review.html:285` — the `rea macho` Stops-before cell says DER entitlement keys are read for the UTF8String-key / UTF8String-or-boolean pair shape, and that any other pair reads nothing from that payload. `crates/rea-core/src/macho_meta.rs:370` only stores `entitlements_der_size`. On `main` this cell said "The DER entitlements payload stays unparsed: a size only." Task 4's speculative stop required keeping that clause: `der_slot_is_a_size_only` feeds `30 82 04 10 02 01 01`, a SEQUENCE around an INTEGER, which is not a sequence of UTF8String pairs. The Reads half of the same row, the measured row at `:340`, and the coverage cell at `:582` say the payload stays unparsed. The Done row at `:165` says every living claim, including the command cell, says that. The Stops-before sentence describes the parser `01206c6` removed, and it deletes a clause the brief said to keep.
+
+2. `crates/rea-core/src/wasm.rs:789` and `:1976` — an initializer opcode other than `0x41` stops the section (`return None` breaks). `inspect` of payload `02 7f 00 23 7f 00 41 05 0b` stores no globals. `a_global_beyond_i32_const_init_stores_nothing_and_does_not_fail` feeds `02 7f 00 23 00 0b 7f 00 41 05 0b` and asserts the list is empty. Changing that arm to `return Some(None)` (continue after the opcode byte) still leaves this fixture empty: the bytes after `0x23` are `00 0b 7f …`, which are not an `i32.const` global, so the assertion stays green. `docs/rea-rs-review.html:165` says this test pins that stop, including that an unknown opcode's tail is not reread. The wrong-end fixture at `:1986` does discriminate its own branch.
+
+VERDICT: FAIL
